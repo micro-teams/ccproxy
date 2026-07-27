@@ -1,0 +1,22 @@
+version: 2
+updates:
+  - package-ecosystem: 'maven'
+    directory: '/backend'
+    schedule:
+      interval: 'daily'
+    ignore:
+      # Both require migrating the project to Kotlin 2.3 (the project pins Kotlin 2.1.10 via the
+      # Spring Boot 3.4 line); skip until that migration is done deliberately.
+      - dependency-name: 'org.springframework.boot:spring-boot-starter-parent'
+        update-types: ['version-update:semver-major']
+      - dependency-name: 'io.ktor:*'
+
+  - package-ecosystem: 'github-actions'
+    directory: '/'
+    schedule:
+      interval: 'daily'
+
+  - package-ecosystem: 'npm'
+    directory: '/frontend'
+    schedule:
+      interval: 'daily'

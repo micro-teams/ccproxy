@@ -1,0 +1,122 @@
+# CCProxy deployment — stock images + bind-mounted build artifacts and code, no custom images.
+#
+#   nginx         the domain-independent gateway (SPA + /ccproxy -> backend)
+#   backend       this app's jar, run on a stock JRE image (+ ssh client for provisioning)
+#   proxy-engine  the MITM data plane (Python, stdlib): :3128 machines' HTTPS_PROXY, :9000 control
+#   egress-proxy  the default upstream proxy accounts point at (:7890, host network egress)
+#   postgres      CCProxy's DB (schema "ccproxy")
+#
+# Secrets come from .env (generate it with `bash gen-env.sh`). All state lives in ./app_data/ as
+# plain host directories. gen-env.sh also generates ./keys/ (operator SSH keypair + MITM CA).
+
+services:
+  postgres:
+    image: postgres:16.2
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ./app_data/postgresql:/var/lib/postgresql/data
+      - ./init/01-ccproxy-schema.sql:/docker-entrypoint-initdb.d/01-ccproxy-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    # Stock JRE + an ssh client (for provisioning/login over SSH). Public image.
+    image: ghcr.io/micro-teams/eclipse-temurin:21-jre
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    working_dir: /app
+    command: ["java", "-jar", "/app/backend.jar"]
+    environment:
+      SPRING_APPLICATION_JSON: >-
+        {"spring.datasource.url":"jdbc:postgresql://postgres:5432/${POSTGRES_DB}",
+        "spring.datasource.username":"${POSTGRES_USER}",
+        "spring.datasource.password":"${POSTGRES_PASSWORD}",
+        "spring.jpa.hibernate.ddl-auto":"update",
+        "application.jwt-secret":"${JWT_SECRET}",
+        "ccproxy.superadmin-password":"${SUPERADMIN_PASSWORD}",
+        "ccproxy.engine.control-url":"http://proxy-engine:9000",
+        "ccproxy.engine.control-secret":"${ENGINE_SECRET}",
+        "ccproxy.engine.proxy-endpoint":"${ENGINE_PROXY_ENDPOINT:-proxy-engine:3128}",
+        "ccproxy.engine.default-account-proxy":"http://egress-proxy:7890",
+        "ccproxy.provisioning.ssh-private-key-path":"/keys/operator",
+        "ccproxy.ca.cert-path":"/keys/ca.crt"}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/actuator/health/readiness || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+    volumes:
+      - ./backend/backend.jar:/app/backend.jar:ro
+      # Operator SSH keys + MITM CA (gen-env.sh creates ./keys/).
+      - ./keys:/keys:ro
+
+  proxy-engine:
+    # The MITM data plane. Stock Python image, bind-mounted stdlib-only code — no custom image.
+    image: python:3.12-slim
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      CCPROXY_ENGINE_SECRET: ${ENGINE_SECRET}
+      CCPROXY_BACKEND_URL: http://backend:8080
+      CCPROXY_CA_CERT: /keys/ca.crt
+      CCPROXY_CA_KEY: /keys/ca.key
+    volumes:
+      - ./proxy-engine:/app:ro
+      - ./keys:/keys:ro
+    # Publish the MITM proxy so machines outside the compose network can reach it. It is not an open
+    # proxy — every request needs the machine's own proxy-auth. For such machines, also set
+    # ENGINE_PROXY_ENDPOINT in .env to a host:port they can reach (e.g. this host's LAN address).
+    ports:
+      - "${ENGINE_PROXY_PORT:-3128}:3128"
+    # openssl is needed to sign per-domain leaf certs from the CA.
+    entrypoint:
+      ["/bin/sh", "-c", "apt-get update -qq && apt-get install -y -qq openssl >/dev/null && exec python3 /app/ccproxy_engine.py"]
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:9000/health')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  egress-proxy:
+    image: python:3.12-slim
+    restart: unless-stopped
+    command: ["python3", "/app/egress.py"]
+    volumes:
+      - ./proxy-engine:/app:ro
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket;socket.create_connection(('localhost',7890),3)\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./frontend/dist:/usr/share/nginx/html:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s

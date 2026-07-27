@@ -1,0 +1,20 @@
+# transient agent worktrees
+.claude/worktrees/
+
+# deploy runtime state + secrets (created by deploy/gen-env.sh)
+deploy/.env
+deploy/app_data/
+
+# frontend
+frontend/node_modules/
+frontend/dist/
+
+# backend build output
+backend/target/
+
+# python bytecode
+__pycache__/
+*.pyc
+
+# generated at build time from entity metadata (shipped in the bundle, not versioned)
+backend/CREATE.sql
