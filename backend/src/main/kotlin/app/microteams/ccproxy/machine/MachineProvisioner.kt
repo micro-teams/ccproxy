@@ -118,17 +118,24 @@ class MachineProvisioner(
         set -euo pipefail
         echo "$caB64" | base64 -d > /usr/local/share/ca-certificates/ccproxy-ca.crt
         update-ca-certificates
-        # Point all HTTPS traffic at the proxy-engine for every login shell.
+        # Route HTTPS at the proxy-engine and point Node/Claude Code at our CA. /etc/environment is
+        # read by PAM (interactive ssh/login) only; a process started by a bash LOGIN shell — e.g. an
+        # agent runner doing `bash -lc "... claude"` — does NOT read it. So ALSO drop a profile.d
+        # script, which /etc/profile sources for every login shell, or such a Claude Code would run
+        # with no proxy, send its (fake) ccproxy token straight to the real API, and get logged out.
         grep -q '^HTTPS_PROXY=' /etc/environment && sed -i '/^HTTPS_PROXY=/d' /etc/environment || true
         grep -q '^HTTP_PROXY=' /etc/environment && sed -i '/^HTTP_PROXY=/d' /etc/environment || true
         echo "HTTPS_PROXY=$httpsProxyUrl" >> /etc/environment
         echo "HTTP_PROXY=$httpsProxyUrl" >> /etc/environment
         echo "https_proxy=$httpsProxyUrl" >> /etc/environment
         echo "http_proxy=$httpsProxyUrl" >> /etc/environment
-        # Node (Claude Code) ignores the system CA store; point it at our CA explicitly so it
-        # trusts the proxy-engine's MITM leaf certs.
         grep -q '^NODE_EXTRA_CA_CERTS=' /etc/environment && sed -i '/^NODE_EXTRA_CA_CERTS=/d' /etc/environment || true
         echo "NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/ccproxy-ca.crt" >> /etc/environment
+        echo "export HTTPS_PROXY=$httpsProxyUrl" > /etc/profile.d/ccproxy-proxy.sh
+        echo "export HTTP_PROXY=$httpsProxyUrl" >> /etc/profile.d/ccproxy-proxy.sh
+        echo "export https_proxy=$httpsProxyUrl" >> /etc/profile.d/ccproxy-proxy.sh
+        echo "export http_proxy=$httpsProxyUrl" >> /etc/profile.d/ccproxy-proxy.sh
+        echo "export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/ccproxy-ca.crt" >> /etc/profile.d/ccproxy-proxy.sh
         """
             .trimIndent()
     }
