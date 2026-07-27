@@ -49,9 +49,7 @@ class LoginOrchestrator(
             loginRequestRepository.save(req)
 
             // Fresh tmux session running Claude Code interactively, with HTTPS_PROXY pointed at the
-            // engine (so the OAuth token exchange is intercepted); dismiss the first-run wizard
-            // with
-            // a couple of Enters, then run /login.
+            // engine (so the OAuth token exchange is intercepted).
             val proxyUrl =
                 "http://${machine.proxyUser}:${machine.proxyPassword}@${config.engine.proxyEndpoint}"
             // A too-small pane makes Claude Code exit ("terminal too small"); a very wide pane also
@@ -59,22 +57,18 @@ class LoginOrchestrator(
             sshRun(machine, "tmux kill-session -t $session 2>/dev/null || true")
             sshRun(
                 machine,
-                // Launch via a login shell (bash -lc) so the user's profile PATH is loaded — the
-                // claude.ai installer puts `claude` in ~/.local/bin, which is not on a
-                // non-interactive PATH, so a bare `claude` would exit and kill the session.
+                // Launch via a login shell AND prepend ~/.local/bin to PATH: the claude.ai
+                // installer
+                // drops `claude` in ~/.local/bin, which a normal user's profile adds to PATH but
+                // root's does not — a bare `claude` would then not be found and the session would
+                // die. Setting PATH explicitly works for both root and non-root machines.
                 "tmux new-session -d -s $session -x 1000 -y 50 " +
                     "-e HTTPS_PROXY=$proxyUrl -e HTTP_PROXY=$proxyUrl " +
                     "-e NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/ccproxy-ca.crt " +
-                    "bash -lc claude",
+                    "bash -lc 'PATH=\"\$HOME/.local/bin:\$PATH\" claude'",
             )
-            // First-run wizard: accept the theme, then pick login method #1 (Claude subscription),
-            // which drops straight into the OAuth flow and prints the authorize URL.
-            Thread.sleep(5000)
-            sshRun(machine, "tmux send-keys -t $session Enter")
-            Thread.sleep(2500)
-            sshRun(machine, "tmux send-keys -t $session Enter")
 
-            val url = pollForUrl(machine, session)
+            val url = driveToOAuthUrl(machine, session)
             req.oauthUrl = url
             req.status = LoginRequestStatus.AWAITING_CODE
             req.expiresAt = System.currentTimeMillis() / 1000 + 600
@@ -204,14 +198,53 @@ class LoginOrchestrator(
         return null
     }
 
-    private fun pollForUrl(machine: Machine, session: String): String {
+    /**
+     * Drive Claude Code to emit an OAuth authorize URL, then return it. Instead of assuming a fixed
+     * keystroke sequence, this inspects the pane each tick and reacts to whatever screen is
+     * showing, so it works for BOTH a brand-new machine (first-run wizard: theme -> login method ->
+     * OAuth auto-starts) and an already-onboarded one (main prompt -> must run `/login`), and
+     * tolerates cross-version wording changes. Each distinct screen is acted on once (debounced by
+     * action) so a slow screen isn't double-advanced.
+     */
+    private fun driveToOAuthUrl(machine: Machine, session: String): String {
         val deadline =
             System.currentTimeMillis() + config.provisioning.loginUrlTimeoutSeconds * 1000
+        var lastAction = ""
+        var loginIssued = false
+        Thread.sleep(4000)
         while (System.currentTimeMillis() < deadline) {
             // -J joins wrapped lines so a long URL split across pane rows is captured whole.
             val pane = sshRun(machine, "tmux capture-pane -t $session -p -J -S -200")
             urlRegex.find(pane)?.let {
                 return it.value.trim()
+            }
+            val p = pane.lowercase()
+            val action =
+                when {
+                    // First-run wizard: choose the terminal theme.
+                    p.contains("text style") || p.contains("dark mode") -> "theme"
+                    // First-run wizard: choose the login method (default #1 = Claude subscription).
+                    p.contains("login method") || p.contains("select login") -> "method"
+                    // Per-directory trust/safety prompt.
+                    p.contains("trust") && p.contains("folder") -> "trust"
+                    // Already onboarded, sitting at the main prompt but not logged in: run /login.
+                    !loginIssued &&
+                        (p.contains("/login") ||
+                            p.contains("manual mode") ||
+                            p.contains("shortcuts")) -> "login"
+                    else -> "wait"
+                }
+            if (action != "wait" && action != lastAction) {
+                when (action) {
+                    "login" -> {
+                        sshRun(machine, "tmux send-keys -t $session '/login'")
+                        Thread.sleep(500)
+                        sshRun(machine, "tmux send-keys -t $session Enter")
+                        loginIssued = true
+                    }
+                    else -> sshRun(machine, "tmux send-keys -t $session Enter")
+                }
+                lastAction = action
             }
             Thread.sleep(2000)
         }
