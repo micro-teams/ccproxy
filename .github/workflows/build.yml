@@ -79,7 +79,7 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y shellcheck
           shellcheck deploy/*.sh backend/scripts/*.sh
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Syntax + lint the proxy-engine (stdlib-only Python)
