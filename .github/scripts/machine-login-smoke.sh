@@ -129,4 +129,18 @@ wait_status "$MID" awaitingLogin || exit 1
 docker exec "$MACHINE" bash -lc 'python3 -c "import json,os;p=os.path.expanduser(\"~/.claude.json\");d=json.load(open(p)) if os.path.exists(p) and os.path.getsize(p) else {};d[\"hasCompletedOnboarding\"]=True;json.dump(d,open(p,\"w\"))"'
 expect_awaiting_code "$MID" "round2-onboarded-login" || exit 1
 
+echo "== round 3: engine restart self-heal (lazy session fetch, NO reprovision) =="
+# The engine keeps sessions in memory; restarting wipes them. Without on-demand refetch a machine
+# would then stall at 'Checking connectivity' until reprovisioned. Restart the engine and DO NOT
+# reprovision — a fresh login must still reach awaitingCode because the engine rebuilds the session
+# from the backend on the first connection.
+docker compose restart proxy-engine >/dev/null 2>&1
+for _ in $(seq 1 20); do
+  h="$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q proxy-engine)" 2>/dev/null || true)"
+  [ "$h" = "healthy" ] && break
+  sleep 2
+done
+wait_status "$MID" awaitingLogin || exit 1
+expect_awaiting_code "$MID" "round3-engine-restart-selfheal" || exit 1
+
 echo "ALL PASS [$INSTALL]"
