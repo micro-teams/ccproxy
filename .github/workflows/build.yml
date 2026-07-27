@@ -46,13 +46,13 @@ jobs:
             echo "No uncommitted changes."
           fi
       - name: Upload jar
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: jar
           path: backend/target/*.jar
       # CREATE.sql is generated at build time (not versioned); ship it to package-zip via an artifact.
       - name: Upload CREATE.sql
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: create-sql
           path: backend/CREATE.sql
@@ -72,7 +72,7 @@ jobs:
       - run: npm ci
       - run: npm run build
       - name: Upload dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: frontend-dist
           path: frontend/dist
@@ -114,7 +114,7 @@ jobs:
           cp -r artifacts/frontend-dist/. "$STAGE/frontend/dist/"
           chmod +x "$STAGE/gen-env.sh"
           echo "== bundle contents =="; find "$STAGE" -maxdepth 3 -type f | sort
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ccproxy-deploy
           path: ccproxy-deploy
