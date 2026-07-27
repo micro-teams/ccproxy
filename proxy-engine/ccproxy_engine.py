@@ -46,6 +46,9 @@ MITM_DOMAINS = {"api.anthropic.com", "platform.claude.com"}
 # When set, every MITM'd (decrypted) request/response is mirrored under this directory, per machine.
 # Purely a side-channel copy — it never touches the bytes forwarded to the client.
 DUMP_DIR = os.environ.get("CCPROXY_DUMP_DIR", "")
+# When set, each session's captured real+fake tokens are persisted here so an engine restart does not
+# lose them (otherwise every machine would have to log in again). One JSON file per proxyUser.
+SESSION_DIR = os.environ.get("CCPROXY_SESSION_DIR", "")
 
 os.makedirs(CERTS_DIR, exist_ok=True)
 _log_lock = threading.Lock()
@@ -58,7 +61,8 @@ def log(msg):
 
 # ── Session registry ──────────────────────────────────────────────────────────
 class Session:
-    def __init__(self, proxy_password, account_proxy):
+    def __init__(self, proxy_password, account_proxy, user=None):
+        self.user = user
         self.proxy_password = proxy_password
         self.account_proxy = account_proxy
         self.real_access = None
@@ -79,7 +83,7 @@ class Registry:
         with self._lock:
             s = self._by_user.get(user)
             if s is None:
-                s = Session(proxy_password, account_proxy)
+                s = Session(proxy_password, account_proxy, user)
                 self._by_user[user] = s
             else:
                 s.proxy_password = proxy_password
@@ -96,6 +100,81 @@ class Registry:
 
 
 REGISTRY = Registry()
+
+
+# ── Session token persistence ──────────────────────────────────────────────────
+# Real credentials live in memory, so an engine restart would lose them and force every machine to
+# log in again. When SESSION_DIR is set we mirror each session's tokens to disk on capture and reload
+# them on startup / on a cache miss, so a restart is transparent. Written synchronously so disk is
+# never behind the fake tokens the machine already holds.
+_persist_lock = threading.Lock()
+_TOKEN_FIELDS = (
+    "proxy_password",
+    "account_proxy",
+    "real_access",
+    "real_refresh",
+    "fake_access",
+    "fake_refresh",
+    "expires_at",
+)
+
+
+def persist_session(user, sess):
+    if not SESSION_DIR:
+        return
+    try:
+        os.makedirs(SESSION_DIR, exist_ok=True)
+        data = {k: getattr(sess, k) for k in _TOKEN_FIELDS}
+        p = os.path.join(SESSION_DIR, user + ".json")
+        tmp = p + ".tmp"
+        with _persist_lock:
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, p)  # atomic
+    except Exception as e:
+        log(f"persist session {user} failed: {str(e)[:80]}")
+
+
+def load_persisted_tokens(user, sess):
+    """Overlay disk-persisted tokens onto an existing session (leaves proxy_password/account_proxy as
+    provided by the backend, which is authoritative for those). Returns True if tokens were loaded."""
+    if not SESSION_DIR:
+        return False
+    try:
+        p = os.path.join(SESSION_DIR, user + ".json")
+        if not os.path.exists(p):
+            return False
+        with open(p) as f:
+            d = json.load(f)
+        for k in ("real_access", "real_refresh", "fake_access", "fake_refresh", "expires_at"):
+            if d.get(k) is not None:
+                setattr(sess, k, d[k])
+        return sess.real_access is not None
+    except Exception as e:
+        log(f"load session {user} failed: {str(e)[:80]}")
+        return False
+
+
+def load_all_persisted():
+    """On startup, restore every persisted session into the registry so machines keep working after a
+    restart without waiting for a backend round-trip."""
+    if not SESSION_DIR or not os.path.isdir(SESSION_DIR):
+        return
+    n = 0
+    for fn in os.listdir(SESSION_DIR):
+        if not fn.endswith(".json"):
+            continue
+        user = fn[:-5]
+        try:
+            with open(os.path.join(SESSION_DIR, fn)) as f:
+                d = json.load(f)
+            sess = REGISTRY.put(user, d.get("proxy_password", ""), d.get("account_proxy"))
+            load_persisted_tokens(user, sess)
+            n += 1
+        except Exception as e:
+            log(f"restore session {user} failed: {str(e)[:80]}")
+    if n:
+        log(f"restored {n} persisted session(s)")
 
 
 # ── Certificate generation (per MITM domain, signed by the mounted CA) ─────────
@@ -267,6 +346,9 @@ def swap_response_body(body, sess):
         obj["access_token"] = sess.fake_access
         if sess.real_refresh:
             obj["refresh_token"] = sess.fake_refresh
+        # Persist before handing the fake tokens back, so disk is never behind the machine.
+        if sess.user:
+            persist_session(sess.user, sess)
         log("captured real tokens; handed fake tokens to machine")
         return json.dumps(obj).encode()
     # Steady-state: never leak a real token that might echo back.
@@ -466,7 +548,11 @@ def fetch_session(user):
             headers={"X-Engine-Secret": CONTROL_SECRET},
         )
         data = json.loads(urllib.request.urlopen(req, timeout=5).read())
-        return REGISTRY.put(user, data["proxyPassword"], data["accountProxy"])
+        sess = REGISTRY.put(user, data["proxyPassword"], data["accountProxy"])
+        # Restore captured tokens from disk if we have them, so a logged-in machine keeps working
+        # across an engine restart without re-login.
+        load_persisted_tokens(user, sess)
+        return sess
     except Exception as e:
         log(f"session fetch for {user} failed: {str(e)[:80]}")
         return None
@@ -635,6 +721,7 @@ def run_control():
 
 
 def main():
+    load_all_persisted()
     threading.Thread(target=run_control, daemon=True).start()
     run_proxy()
 
