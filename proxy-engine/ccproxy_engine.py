@@ -30,6 +30,7 @@ import socket
 import ssl
 import threading
 import time
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -455,6 +456,22 @@ def tunnel(a, b):
                 pass
 
 
+def fetch_session(user):
+    """Self-heal: the session registry is in memory, so a restart loses it. On a miss, pull this
+    machine's session (proxyPassword + account egress proxy) from the backend — the DB is the source
+    of truth — and cache it. Returns the Session, or None if the backend doesn't know this user."""
+    try:
+        req = urllib.request.Request(
+            f"{BACKEND_URL}/internal/session?proxyUser={urllib.parse.quote(user)}",
+            headers={"X-Engine-Secret": CONTROL_SECRET},
+        )
+        data = json.loads(urllib.request.urlopen(req, timeout=5).read())
+        return REGISTRY.put(user, data["proxyPassword"], data["accountProxy"])
+    except Exception as e:
+        log(f"session fetch for {user} failed: {str(e)[:80]}")
+        return None
+
+
 def parse_proxy_auth(headers):
     """Return (user, password) from a Proxy-Authorization: Basic header, or (None, None)."""
     import base64
@@ -487,6 +504,10 @@ def handle_client(cs):
         port = int(port or 443)
         user, pw = parse_proxy_auth(headers)
         sess = REGISTRY.get(user) if user else None
+        if sess is None and user:
+            # Cache miss (e.g. after an engine restart) — rebuild the session from the backend so
+            # machines keep working without a manual reprovision.
+            sess = fetch_session(user)
         if host in MITM_DOMAINS and sess and sess.proxy_password == pw:
             cs.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             kf, cf = gen_cert(host)
