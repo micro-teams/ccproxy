@@ -458,6 +458,10 @@ def forward(upstream, method, path, headers, body, sess, user):
     rh = parse_headers(upstream)
     if rh is None:
         return None
+    # Snapshot the upstream response headers verbatim (before we strip encoding/rewrite length below)
+    # so the dump records exactly what Anthropic sent — incl. every anthropic-ratelimit-* header, for
+    # quota-consumption analysis.
+    dump_resp_headers = dict(rh) if DUMP_DIR else None
     rb = read_body(upstream, rh)
     if rh.get("Transfer-Encoding", "").lower() == "chunked":
         rh.pop("Transfer-Encoding", None)
@@ -470,7 +474,7 @@ def forward(upstream, method, path, headers, body, sess, user):
     if DUMP_DIR:
         threading.Thread(
             target=dump_exchange,
-            args=(user, method, path, dump_req_headers, dump_req_body, status, dict(rh), swapped),
+            args=(user, method, path, dump_req_headers, dump_req_body, status, dump_resp_headers, swapped),
             daemon=True,
         ).start()
     out = status
