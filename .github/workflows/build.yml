@@ -50,6 +50,12 @@ jobs:
         with:
           name: jar
           path: backend/target/*.jar
+      # CREATE.sql is generated at build time (not versioned); ship it to package-zip via an artifact.
+      - name: Upload CREATE.sql
+        uses: actions/upload-artifact@v4
+        with:
+          name: create-sql
+          path: backend/CREATE.sql
 
   build-frontend:
     runs-on: ubuntu-latest
@@ -101,7 +107,7 @@ jobs:
           STAGE=ccproxy-deploy
           mkdir -p "$STAGE/backend" "$STAGE/frontend"
           cp deploy/docker-compose.yml deploy/nginx.conf deploy/gen-env.sh deploy/README.md "$STAGE/"
-          cp backend/CREATE.sql "$STAGE/CREATE.sql"
+          cp artifacts/create-sql/CREATE.sql "$STAGE/CREATE.sql"
           cp -r deploy/init "$STAGE/"
           cp -r proxy-engine "$STAGE/proxy-engine"
           cp artifacts/jar/*.jar "$STAGE/backend/backend.jar"
