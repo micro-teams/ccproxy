@@ -106,6 +106,19 @@ MID="$(curl -s -X POST "$GW/machine" -H "Authorization: Bearer $TSEC" -H 'Conten
 wait_status "$MID" awaitingLogin || exit 1
 echo "provisioned OK"
 
+# Regression guard: a bash LOGIN shell (how agent runners start claude) must see the proxy. It only
+# reads /etc/profile(.d) + ~/.profile, NOT /etc/environment (that is PAM-only) — so provisioning must
+# drop /etc/profile.d/ccproxy-proxy.sh, or a login-shell claude runs with no proxy and gets logged
+# out sending its fake token straight to the real API.
+echo "== verify login-shell sees the proxy =="
+docker exec "$MACHINE" test -f /etc/profile.d/ccproxy-proxy.sh ||
+  { echo "FAIL: /etc/profile.d/ccproxy-proxy.sh missing"; exit 1; }
+PROXY_SEEN="$(docker exec "$MACHINE" bash -lc 'printf %s "$HTTPS_PROXY"')"
+case "$PROXY_SEEN" in
+  http*://*@*:*) echo "login-shell HTTPS_PROXY OK ($PROXY_SEEN)" ;;
+  *) echo "FAIL: bash -lc did not inherit HTTPS_PROXY (got: '$PROXY_SEEN')"; exit 1 ;;
+esac
+
 echo "== round 1: fresh machine (first-run wizard path) =="
 expect_awaiting_code "$MID" "round1-fresh-wizard" || exit 1
 
