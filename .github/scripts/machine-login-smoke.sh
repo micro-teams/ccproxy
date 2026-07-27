@@ -143,4 +143,28 @@ done
 wait_status "$MID" awaitingLogin || exit 1
 expect_awaiting_code "$MID" "round3-engine-restart-selfheal" || exit 1
 
+echo "== round 4: token-persistence round-trip inside the engine container =="
+# Captured tokens are persisted to disk and reloaded on restart, so a logged-in machine survives an
+# engine restart without re-login. A real login needs an account, so exercise the persist/reload
+# directly against the running engine module (with its real SESSION_DIR + mounted volume).
+POUT="$(docker compose exec -T -w /app proxy-engine python3 - <<'PY'
+import os, ccproxy_engine as e
+assert e.SESSION_DIR, "CCPROXY_SESSION_DIR not set in engine"
+s = e.REGISTRY.put("smoketest", "pw", "http://egress-proxy:7890")
+s.real_access, s.real_refresh = "RA", "RR"
+s.fake_access, s.fake_refresh, s.expires_at = "FA", "FR", 999
+e.persist_session("smoketest", s)
+e.REGISTRY._by_user.clear()          # simulate a restart wiping memory
+e.load_all_persisted()               # reload from disk
+s2 = e.REGISTRY.get("smoketest")
+ok = bool(s2 and s2.real_refresh == "RR" and s2.fake_access == "FA" and s2.expires_at == 999)
+os.remove(os.path.join(e.SESSION_DIR, "smoketest.json"))
+print("PERSIST_OK" if ok else "PERSIST_FAIL")
+PY
+)"
+case "$POUT" in
+  *PERSIST_OK*) echo "PASS round4-token-persistence" ;;
+  *) echo "FAIL round4-token-persistence: $POUT"; exit 1 ;;
+esac
+
 echo "ALL PASS [$INSTALL]"
