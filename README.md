@@ -306,6 +306,15 @@ These are real behaviours discovered while validating the flow — worth knowing
   `proxy-engine:3128` default only works for in-network machines.
 - **Engine sessions are in memory.** After an engine restart, re-provision machines to re-register
   their sessions.
+- **Optional traffic dump.** With `CCPROXY_DUMP_DIR` set (the bundle points it at
+  `app_data/dumps/`, on by default; set `ENGINE_DUMP_DIR=` in `.env` to turn it off), the engine
+  mirrors every decrypted request/response to `app_data/dumps/<machine>/*.http`. It records the
+  machine's view (fake credential — real tokens are never written to disk) and runs in a daemon
+  thread, so it never affects the bytes forwarded to the client. It can grow large — prune it.
+- **The engine currently buffers whole responses** before returning them (it reads the full body to
+  swap tokens and recompute Content-Length), so a streaming response reaches the client in one shot
+  rather than incrementally. Fine for correctness and short calls; making it a true chunk-by-chunk
+  passthrough for non-token endpoints would be a separate change.
 - **`CREATE.sql` is generated at build time** (from entity metadata) and is not versioned; CI ships
   it into the bundle as an artifact.
 

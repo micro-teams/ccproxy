@@ -42,6 +42,9 @@ CA_CERT = os.environ.get("CCPROXY_CA_CERT", "/keys/ca.crt")
 CA_KEY = os.environ.get("CCPROXY_CA_KEY", "/keys/ca.key")
 CERTS_DIR = os.environ.get("CCPROXY_CERTS_DIR", "/tmp/ccproxy-certs")
 MITM_DOMAINS = {"api.anthropic.com", "platform.claude.com"}
+# When set, every MITM'd (decrypted) request/response is mirrored under this directory, per machine.
+# Purely a side-channel copy — it never touches the bytes forwarded to the client.
+DUMP_DIR = os.environ.get("CCPROXY_DUMP_DIR", "")
 
 os.makedirs(CERTS_DIR, exist_ok=True)
 _log_lock = threading.Lock()
@@ -319,8 +322,41 @@ def report_usage(user, path, resp_body):
         log(f"usage report failed: {e}")
 
 
+# ── Traffic dump (optional, side-channel only) ───────────────────────────────────
+def dump_exchange(user, method, path, req_headers, req_body, status, resp_headers, resp_body):
+    """Mirror one decrypted request/response to DUMP_DIR/<machine>/. Best-effort and always run in a
+    daemon thread, so a slow or failing disk write can never affect what the client receives. Records
+    the client's view (fake credential), so real tokens are never written to disk."""
+    if not DUMP_DIR:
+        return
+    try:
+        d = os.path.join(DUMP_DIR, user or "unknown")
+        os.makedirs(d, exist_ok=True)
+        ts = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+        seq = f"{int(time.time() * 1000) % 1000:03d}"
+        safe = "".join(c if c.isalnum() else "_" for c in path)[:48].strip("_") or "root"
+        fn = os.path.join(d, f"{ts}_{seq}_{method}_{safe}.http")
+        with open(fn, "wb") as f:
+            f.write(f"{method} {path} HTTP/1.1\r\n".encode())
+            for k, v in req_headers.items():
+                f.write(f"{k}: {v}\r\n".encode())
+            f.write(b"\r\n")
+            f.write(req_body or b"")
+            f.write(b"\r\n\r\n===== RESPONSE =====\r\n")
+            f.write(status or b"")
+            for k, v in resp_headers.items():
+                f.write(f"{k}: {v}\r\n".encode())
+            f.write(b"\r\n")
+            f.write(resp_body or b"")
+    except Exception as e:
+        log(f"dump failed: {str(e)[:80]}")
+
+
 # ── MITM forwarding ────────────────────────────────────────────────────────────
 def forward(upstream, method, path, headers, body, sess, user):
+    # Capture the client's view (pre-swap: fake credential) for the optional traffic dump.
+    dump_req_headers = dict(headers) if DUMP_DIR else None
+    dump_req_body = body if DUMP_DIR else None
     body = swap_request_body(body, sess)
     swap_auth_header(headers, sess)
     if body:
@@ -348,6 +384,12 @@ def forward(upstream, method, path, headers, body, sess, user):
     swapped = swap_response_body(raw, sess)
     rh["Content-Length"] = str(len(swapped))
     threading.Thread(target=report_usage, args=(user, path, raw), daemon=True).start()
+    if DUMP_DIR:
+        threading.Thread(
+            target=dump_exchange,
+            args=(user, method, path, dump_req_headers, dump_req_body, status, dict(rh), swapped),
+            daemon=True,
+        ).start()
     out = status
     for k, v in rh.items():
         out += f"{k}: {v}\r\n".encode()

@@ -195,3 +195,13 @@ jobs:
         if: always()
         working-directory: ccproxy-deploy
         run: docker compose down
+
+  # Single aggregate gate: succeeds only if every job above succeeded (a job with `needs` runs only
+  # when all needed jobs pass; otherwise this is skipped and stays non-green). Require just this check
+  # in branch protection / auto-merge rules instead of listing each job.
+  ci-success:
+    name: CI success
+    needs: [build-jar, build-frontend, lint, package-zip, test-compose, machine-login-compat]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "All required CI jobs passed."
