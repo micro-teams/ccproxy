@@ -1,0 +1,970 @@
+openapi: 3.0.0
+info:
+  title: CCProxy backend API
+  version: "0.1"
+servers:
+  - url: "http://localhost:8080"
+
+# The single API contract. The backend's interfaces (app.microteams.ccproxy.api.*Api) and the test
+# frontend's client are both GENERATED from this file. The generator names an Api class after a
+# path's first segment, so the path IS the structure. Edit the yaml first.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# What CCProxy is
+# ─────────────────────────────────────────────────────────────────────────────
+# CCProxy lets a remote "machine" run an ordinary, interactive Claude Code while the REAL OAuth
+# credentials NEVER live on that machine. A MITM proxy (the proxy-engine, port 3128) sits between
+# the machine's Claude Code and Anthropic and swaps a per-machine FAKE credential for the machine's
+# own REAL credential on the wire. The machine only ever holds the fake one, so it cannot be stolen
+# to bypass metering.
+#
+# Hard rule (the whole point): ONE machine == ONE independent Claude Code login, exactly like a
+# person using Claude Code on their own computer. Real tokens are per-machine and are NEVER shared
+# or deduplicated across machines. Claude Code always runs in normal interactive mode — never
+# `claude -p` / `--console` (different quota).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Three auth realms (components.securitySchemes) → three kinds of user
+# ─────────────────────────────────────────────────────────────────────────────
+#   - superAdmin          : platform operator session (from password login). Runs the whole thing:
+#                           tenants, login-operators, the Anthropic ACCOUNT POOL, global usage.
+#   - tenantSecret        : an upstream deployment (e.g. MicroCloud). Owns its MACHINES: registers
+#                           them, binds each to an account, triggers logins, reads its usage.
+#   - loginOperatorSecret : the human who performs the manual OAuth step. Sees pending LOGIN-REQUESTs
+#                           (with the account's email/proxy/remark + the OAuth URL to open) and
+#                           submits the real authorization code.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# The account pool
+# ─────────────────────────────────────────────────────────────────────────────
+# An "account" is just METADATA about an Anthropic identity plus its egress: email, an upstream
+# proxy the machine's traffic (and the operator's browser login) must go out through, and a remark.
+# It holds NO tokens — because login is per-machine. Its job: (1) tell the operator which identity to
+# authenticate as during a login, and (2) supply the per-machine MITM egress proxy so a machine's API
+# traffic and its manual login share one egress IP. The bundle ships a default egress proxy
+# (`egress-proxy` service, http://egress-proxy:7890) that simply exposes the host's own network, so a
+# fresh deploy has a proxy value to fill in before any per-account network separation exists.
+
+security:
+  - tenantSecret: []
+
+paths:
+  # =====================================================================
+  # PING
+  # =====================================================================
+  /ping:
+    get:
+      tags: [ping]
+      operationId: ping
+      summary: Authenticated health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer }
+                  message: { type: string }
+                required: [code, message]
+
+  # =====================================================================
+  # SUPER-ADMIN — login
+  # =====================================================================
+  /superadmin/login:
+    post:
+      tags: [superadmin]
+      operationId: superadminLogin
+      summary: Log in as the platform operator; returns a session token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SuperadminLoginRequest" }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/SuperadminLoginResponse" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # =====================================================================
+  # SUPER-ADMIN — tenant management
+  # =====================================================================
+  /tenant:
+    get:
+      tags: [tenant]
+      operationId: listTenants
+      summary: List tenants
+      security: [{ superAdmin: [] }]
+      parameters:
+        - $ref: "#/components/parameters/PageStart"
+        - $ref: "#/components/parameters/PageSize"
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/ListTenantsResponse" } } } }
+    post:
+      tags: [tenant]
+      operationId: createTenant
+      summary: Create a tenant
+      security: [{ superAdmin: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/CreateTenantRequest" } } } }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Tenant" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /tenant/{id}:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    get:
+      tags: [tenant]
+      operationId: getTenant
+      summary: Get a tenant
+      security: [{ superAdmin: [] }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Tenant" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [tenant]
+      operationId: updateTenant
+      summary: Update a tenant (rename, suspend, set quota)
+      security: [{ superAdmin: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/UpdateTenantRequest" } } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Tenant" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [tenant]
+      operationId: deleteTenant
+      summary: Delete a tenant (must have no machines)
+      security: [{ superAdmin: [] }]
+      responses:
+        "204": { description: No Content }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /tenant/{id}/secret:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    get:
+      tags: [tenant]
+      operationId: listTenantSecrets
+      summary: List a tenant's auth secrets (metadata only; never the value)
+      security: [{ superAdmin: [] }]
+      parameters:
+        - $ref: "#/components/parameters/PageStart"
+        - $ref: "#/components/parameters/PageSize"
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/ListAuthSecretsResponse" } } } }
+    post:
+      tags: [tenant]
+      operationId: createTenantSecret
+      description: >-
+        Mint a new auth secret for the tenant. The plaintext value is returned ONCE (only its hash is
+        stored); the tenant uses it as a Bearer token.
+      security: [{ superAdmin: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/CreateSecretRequest" } } } }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/CreateSecretResponse" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /tenant/{id}/secret/{secretId}:
+    parameters:
+      - $ref: "#/components/parameters/IdPath"
+      - $ref: "#/components/parameters/SecretIdPath"
+    delete:
+      tags: [tenant]
+      operationId: revokeTenantSecret
+      summary: Revoke one of a tenant's auth secrets
+      security: [{ superAdmin: [] }]
+      responses:
+        "204": { description: No Content }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # =====================================================================
+  # SUPER-ADMIN — login-operator management
+  # (a login-operator is a person/seat that performs the manual OAuth step)
+  # =====================================================================
+  /login-operator:
+    get:
+      tags: [loginOperator]
+      operationId: listLoginOperators
+      summary: List login-operators
+      security: [{ superAdmin: [] }]
+      parameters:
+        - $ref: "#/components/parameters/PageStart"
+        - $ref: "#/components/parameters/PageSize"
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/ListLoginOperatorsResponse" } } } }
+    post:
+      tags: [loginOperator]
+      operationId: createLoginOperator
+      summary: Create a login-operator
+      security: [{ superAdmin: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/CreateLoginOperatorRequest" } } } }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/LoginOperator" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /login-operator/{id}:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    get:
+      tags: [loginOperator]
+      operationId: getLoginOperator
+      security: [{ superAdmin: [] }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/LoginOperator" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [loginOperator]
+      operationId: updateLoginOperator
+      summary: Rename or suspend a login-operator
+      security: [{ superAdmin: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/UpdateLoginOperatorRequest" } } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/LoginOperator" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [loginOperator]
+      operationId: deleteLoginOperator
+      security: [{ superAdmin: [] }]
+      responses:
+        "204": { description: No Content }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /login-operator/{id}/secret:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    get:
+      tags: [loginOperator]
+      operationId: listLoginOperatorSecrets
+      summary: List a login-operator's secrets (metadata only)
+      security: [{ superAdmin: [] }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/ListAuthSecretsResponse" } } } }
+    post:
+      tags: [loginOperator]
+      operationId: createLoginOperatorSecret
+      description: Mint a secret for the login-operator; plaintext returned ONCE.
+      security: [{ superAdmin: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/CreateSecretRequest" } } } }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/CreateSecretResponse" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /login-operator/{id}/secret/{secretId}:
+    parameters:
+      - $ref: "#/components/parameters/IdPath"
+      - $ref: "#/components/parameters/SecretIdPath"
+    delete:
+      tags: [loginOperator]
+      operationId: revokeLoginOperatorSecret
+      security: [{ superAdmin: [] }]
+      responses:
+        "204": { description: No Content }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # =====================================================================
+  # ACCOUNT POOL — SUPER-ADMIN ONLY, fully internal to CCProxy.
+  # Tenants never see accounts: the account and the machine↔account binding are CCProxy's private
+  # concern. A machine is auto-bound to an active account at creation; super-admin can rebind.
+  # =====================================================================
+  /account:
+    get:
+      tags: [account]
+      operationId: listAccounts
+      summary: List accounts in the pool
+      description: Tokens are never here — accounts hold none.
+      security: [{ superAdmin: [] }]
+      parameters:
+        - $ref: "#/components/parameters/PageStart"
+        - $ref: "#/components/parameters/PageSize"
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/AccountStatus" }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/ListAccountsResponse" } } } }
+    post:
+      tags: [account]
+      operationId: createAccount
+      summary: Add an Anthropic account to the pool
+      security: [{ superAdmin: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/CreateAccountRequest" } } } }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Account" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /account/{id}:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    get:
+      tags: [account]
+      operationId: getAccount
+      security: [{ superAdmin: [] }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Account" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [account]
+      operationId: updateAccount
+      summary: Edit email / proxy / remark / status
+      security: [{ superAdmin: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/UpdateAccountRequest" } } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Account" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [account]
+      operationId: deleteAccount
+      summary: Remove an account (must have no machines bound)
+      security: [{ superAdmin: [] }]
+      responses:
+        "204": { description: No Content }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  # =====================================================================
+  # PROVISIONING HELPERS (tenant-readable)
+  # =====================================================================
+  /provisioning/ssh-pubkey:
+    get:
+      tags: [provisioning]
+      operationId: getSshPubkey
+      summary: The SSH public key CCProxy logs in with
+      description: >-
+        The tenant injects this key into a freshly created machine (as root/authorized user) before
+        registering it, so CCProxy can SSH in to install the CA cert, set the proxy, and drive the
+        login. Returns the OpenSSH single-line public key.
+      security: [{ superAdmin: [] }, { tenantSecret: [] }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/SshPubkeyResponse" } } } }
+
+  /provisioning/ca-cert:
+    get:
+      tags: [provisioning]
+      operationId: getCaCert
+      summary: The MITM CA certificate (PEM)
+      description: >-
+        The self-signed CA the machine must trust so Claude Code accepts the intercepted TLS. CCProxy
+        normally installs it over SSH during provisioning; this endpoint exposes it for manual/debug
+        installation.
+      security: [{ superAdmin: [] }, { tenantSecret: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CaCertResponse" }
+
+  # =====================================================================
+  # MACHINES (tenant-owned proxied Claude Code instances)
+  # =====================================================================
+  /machine:
+    get:
+      tags: [machine]
+      operationId: listMachines
+      summary: List machines (tenant sees its own; super-admin sees all)
+      security: [{ tenantSecret: [] }, { superAdmin: [] }]
+      parameters:
+        - $ref: "#/components/parameters/PageStart"
+        - $ref: "#/components/parameters/PageSize"
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/MachineStatus" }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/ListMachinesResponse" } } } }
+    post:
+      tags: [machine]
+      operationId: createMachine
+      description: >-
+        Register a machine: one Claude Code login on one SSH target (user@host:port). Its identity is
+        that full SSH login, so the same host can hold several machines as different users. The tenant
+        must have already injected the CCProxy SSH public key (see /provisioning/ssh-pubkey) into that
+        target. Creation returns immediately with status `provisioning`; the backend then SSHes in to
+        install the CA cert and point the machine's HTTPS_PROXY at the proxy-engine, landing status
+        `awaiting-login`. The response carries the machine's own proxy endpoint + credentials
+        (`httpsProxyUrl`) — how that machine reaches the MITM and how the engine tells its traffic apart
+        from others. CCProxy binds the machine to an account internally (invisible to the tenant).
+      security: [{ tenantSecret: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/CreateMachineRequest" } } } }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Machine" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { description: no account available in the pool to bind, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /machine/{id}:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    get:
+      tags: [machine]
+      operationId: getMachine
+      summary: Get a machine (status, proxy config, credential expiry, current login)
+      security: [{ tenantSecret: [] }, { superAdmin: [] }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Machine" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [machine]
+      operationId: updateMachine
+      summary: Rename a machine
+      security: [{ tenantSecret: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/UpdateMachineRequest" } } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Machine" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [machine]
+      operationId: deleteMachine
+      summary: Tear a machine down (drops its proxy mapping and fake↔real credential)
+      security: [{ tenantSecret: [] }]
+      responses:
+        "204": { description: No Content }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /machine/{id}/account:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    put:
+      tags: [machine]
+      operationId: rebindMachineAccount
+      summary: Rebind a machine to a different account (super-admin; internal)
+      description: Takes effect on the machine's next login; the current credential is unaffected.
+      security: [{ superAdmin: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/RebindAccountRequest" } } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Machine" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /machine/{id}/reprovision:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    post:
+      tags: [machine]
+      operationId: reprovisionMachine
+      summary: Re-run SSH provisioning (reinstall CA cert + re-apply HTTPS_PROXY)
+      description: For recovery when a machine was rebuilt or its cert/proxy config was lost.
+      security: [{ tenantSecret: [] }]
+      responses:
+        "202": { description: Accepted, content: { application/json: { schema: { $ref: "#/components/schemas/Machine" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /machine/{id}/login:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    post:
+      tags: [machine]
+      operationId: startMachineLogin
+      summary: Start (or restart) this machine's Claude Code login
+      description: >-
+        Opens a tmux session on the machine, runs Claude Code in normal interactive mode, executes
+        `/login`, and extracts the OAuth URL. Returns a LoginRequest in status `preparing`; it moves to
+        `awaiting-code` once the URL is ready, at which point a login-operator can act on it. Use this
+        for the first login and for re-login after the credential expires or is revoked. Fails with 409
+        if a login for this machine is already in progress.
+      security: [{ tenantSecret: [] }]
+      responses:
+        "202": { description: Accepted, content: { application/json: { schema: { $ref: "#/components/schemas/LoginRequest" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /machine/{id}/usage:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    get:
+      tags: [machine]
+      operationId: getMachineUsage
+      summary: Usage records for one machine
+      security: [{ tenantSecret: [] }, { superAdmin: [] }]
+      parameters:
+        - $ref: "#/components/parameters/PageStart"
+        - $ref: "#/components/parameters/PageSize"
+        - $ref: "#/components/parameters/Since"
+        - $ref: "#/components/parameters/Until"
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/ListUsageResponse" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # =====================================================================
+  # LOGIN-REQUESTS (the login-operator's work queue)
+  # =====================================================================
+  /login-request:
+    get:
+      tags: [loginRequest]
+      operationId: listLoginRequests
+      summary: List login-requests
+      description: >-
+        The login-operator's queue. Default lists actionable ones (`awaiting-code`). Each item carries
+        the machine + account context (email, upstream proxy, remark) and, once ready, the OAuth URL to
+        open. IMPORTANT for the operator: open that URL in a browser sent through the account's
+        `proxy`, so the login IP matches the API egress IP. Super-admin sees all; a login-operator sees
+        the global queue.
+      security: [{ loginOperatorSecret: [] }, { superAdmin: [] }]
+      parameters:
+        - $ref: "#/components/parameters/PageStart"
+        - $ref: "#/components/parameters/PageSize"
+        - name: status
+          in: query
+          description: filter by status; defaults to awaiting-code
+          schema: { $ref: "#/components/schemas/LoginRequestStatus" }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/ListLoginRequestsResponse" } } } }
+
+  /login-request/{id}:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    get:
+      tags: [loginRequest]
+      operationId: getLoginRequest
+      security: [{ loginOperatorSecret: [] }, { superAdmin: [] }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/LoginRequest" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /login-request/{id}/code:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    post:
+      tags: [loginRequest]
+      operationId: submitLoginCode
+      summary: Submit the real authorization code obtained from the browser
+      description: >-
+        The operator, after authenticating as the account in the browser, pastes the real
+        authorization code here (as `code` and `state`, or the combined `code#state`). The backend saves
+        the real code, generates a FAKE code, drives the waiting Claude Code (in the machine's tmux) to
+        paste it, and the proxy-engine swaps fake→real on the wire — capturing the real tokens and
+        handing the machine fake ones. On success the request lands `completed` and the machine becomes
+        `ready`. Never returns any token.
+      security: [{ loginOperatorSecret: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SubmitLoginCodeRequest" } } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/LoginRequest" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: request not awaiting a code, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /login-request/{id}/cancel:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    post:
+      tags: [loginRequest]
+      operationId: cancelLoginRequest
+      summary: Abandon an in-flight login (kills the tmux session)
+      security: [{ loginOperatorSecret: [] }, { superAdmin: [] }, { tenantSecret: [] }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/LoginRequest" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # =====================================================================
+  # USAGE (aggregate)
+  # =====================================================================
+  /usage:
+    get:
+      tags: [usage]
+      operationId: listUsage
+      summary: Usage records (tenant sees its own; super-admin sees all)
+      security: [{ tenantSecret: [] }, { superAdmin: [] }]
+      parameters:
+        - $ref: "#/components/parameters/PageStart"
+        - $ref: "#/components/parameters/PageSize"
+        - $ref: "#/components/parameters/Since"
+        - $ref: "#/components/parameters/Until"
+        - name: tenantId
+          in: query
+          description: super-admin only — scope to one tenant
+          schema: { type: integer, format: int64 }
+        - name: machineId
+          in: query
+          schema: { type: integer, format: int64 }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/ListUsageResponse" } } } }
+
+  /usage/summary:
+    get:
+      tags: [usage]
+      operationId: getUsageSummary
+      summary: Time-bucketed usage history over a window (e.g. 1-minute buckets)
+      description: >-
+        Returns usage aggregated into fixed-width time buckets — the only billing primitive CCProxy
+        offers. MicroCloud consumes this to do its own billing/quota; CCProxy enforces none.
+      security: [{ tenantSecret: [] }, { superAdmin: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Since"
+        - $ref: "#/components/parameters/Until"
+        - name: bucket
+          in: query
+          description: bucket width in seconds (default 60)
+          schema: { type: integer, default: 60 }
+        - name: machineId
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: tenantId
+          in: query
+          description: super-admin only — scope to one tenant
+          schema: { type: integer, format: int64 }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/UsageSummary" } } } }
+
+components:
+  securitySchemes:
+    superAdmin:
+      type: http
+      scheme: bearer
+      description: The platform operator's session token (from /superadmin/login).
+    tenantSecret:
+      type: http
+      scheme: bearer
+      description: >
+        A tenant auth secret (opaque). `Authorization: Bearer <secret>`. The backend matches its
+        stored hash, resolves the tenant, scopes the call to that tenant, and audits it.
+    loginOperatorSecret:
+      type: http
+      scheme: bearer
+      description: >
+        A login-operator secret (opaque). `Authorization: Bearer <secret>`. Grants access to the
+        login-request queue only.
+
+  parameters:
+    IdPath:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+    SecretIdPath:
+      name: secretId
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+    PageStart:
+      name: page_start
+      in: query
+      description: cursor — id of the first item to return
+      schema: { type: integer, format: int64 }
+    PageSize:
+      name: page_size
+      in: query
+      schema: { type: integer, default: 20 }
+    Since:
+      name: since
+      in: query
+      description: lower time bound (epoch seconds), inclusive
+      schema: { type: integer, format: int64 }
+    Until:
+      name: until
+      in: query
+      description: upper time bound (epoch seconds), exclusive
+      schema: { type: integer, format: int64 }
+
+  responses:
+    BadRequest:
+      description: Bad Request
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    NotFound:
+      description: Not Found
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unauthorized:
+      description: Unauthorized
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Conflict:
+      description: Conflict (precondition not met)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        code: { type: integer }
+        message: { type: string }
+        error: { type: string }
+      required: [code, message]
+
+    Page:
+      type: object
+      description: cursor-pagination metadata
+      properties:
+        pageStart: { type: integer, format: int64, nullable: true }
+        pageSize: { type: integer }
+        hasPrev: { type: boolean }
+        prevStart: { type: integer, format: int64, nullable: true }
+        hasMore: { type: boolean }
+        nextStart: { type: integer, format: int64, nullable: true }
+      required: [pageSize, hasPrev, hasMore]
+
+    # ---- Super-admin login ----
+    SuperadminLoginRequest:
+      type: object
+      properties: { password: { type: string } }
+      required: [password]
+    SuperadminLoginResponse:
+      type: object
+      properties:
+        token: { type: string }
+        expiresAt: { type: integer, format: int64, description: epoch seconds when the token expires }
+      required: [token, expiresAt]
+
+    # ---- Shared: opaque secrets (tenant & login-operator) ----
+    AuthSecretStatus: { type: string, enum: [active, revoked] }
+    AuthSecret:
+      type: object
+      description: secret metadata; the value is never returned here
+      properties:
+        id: { type: integer, format: int64 }
+        ownerId: { type: integer, format: int64, description: tenant id or login-operator id }
+        label: { type: string, nullable: true }
+        status: { $ref: "#/components/schemas/AuthSecretStatus" }
+        createdAt: { type: string, format: date-time, nullable: true }
+        lastUsedAt: { type: string, format: date-time, nullable: true }
+      required: [id, ownerId, status]
+    ListAuthSecretsResponse:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/AuthSecret" } }
+        page: { $ref: "#/components/schemas/Page" }
+      required: [items, page]
+    CreateSecretRequest:
+      type: object
+      properties: { label: { type: string } }
+    CreateSecretResponse:
+      type: object
+      description: the plaintext value is present ONLY in this response
+      properties:
+        id: { type: integer, format: int64 }
+        secret: { type: string, description: the plaintext bearer secret; shown once }
+        label: { type: string, nullable: true }
+      required: [id, secret]
+
+    # ---- Tenants ----
+    TenantStatus: { type: string, enum: [active, suspended] }
+    Tenant:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        status: { $ref: "#/components/schemas/TenantStatus" }
+        createdAt: { type: string, format: date-time, nullable: true }
+      required: [id, name, status]
+    CreateTenantRequest:
+      type: object
+      properties:
+        name: { type: string }
+      required: [name]
+    UpdateTenantRequest:
+      type: object
+      description: partial update; omitted fields unchanged
+      properties:
+        name: { type: string }
+        status: { $ref: "#/components/schemas/TenantStatus" }
+    ListTenantsResponse:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Tenant" } }
+        page: { $ref: "#/components/schemas/Page" }
+      required: [items, page]
+
+    # ---- Login-operators ----
+    LoginOperatorStatus: { type: string, enum: [active, suspended] }
+    LoginOperator:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        status: { $ref: "#/components/schemas/LoginOperatorStatus" }
+        createdAt: { type: string, format: date-time, nullable: true }
+      required: [id, name, status]
+    CreateLoginOperatorRequest:
+      type: object
+      properties: { name: { type: string } }
+      required: [name]
+    UpdateLoginOperatorRequest:
+      type: object
+      properties:
+        name: { type: string }
+        status: { $ref: "#/components/schemas/LoginOperatorStatus" }
+    ListLoginOperatorsResponse:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/LoginOperator" } }
+        page: { $ref: "#/components/schemas/Page" }
+      required: [items, page]
+
+    # ---- Accounts (pool) ----
+    AccountStatus: { type: string, enum: [active, disabled] }
+    Account:
+      type: object
+      description: >-
+        Anthropic identity metadata + egress. Holds NO tokens (login is per-machine). `proxy` is the
+        upstream HTTP proxy a bound machine's API traffic goes out through, and the network the operator
+        should also use when logging in as this account.
+      properties:
+        id: { type: integer, format: int64 }
+        email: { type: string }
+        proxy: { type: string, description: "upstream proxy URL, e.g. http://egress-proxy:7890" }
+        remark: { type: string, nullable: true }
+        status: { $ref: "#/components/schemas/AccountStatus" }
+        machineCount: { type: integer, description: machines currently bound to this account }
+        createdAt: { type: string, format: date-time, nullable: true }
+      required: [id, email, proxy, status]
+    CreateAccountRequest:
+      type: object
+      properties:
+        email: { type: string }
+        proxy: { type: string, description: "defaults to the bundle's egress-proxy if omitted" }
+        remark: { type: string }
+      required: [email]
+    UpdateAccountRequest:
+      type: object
+      description: partial update; omitted fields unchanged
+      properties:
+        email: { type: string }
+        proxy: { type: string }
+        remark: { type: string }
+        status: { $ref: "#/components/schemas/AccountStatus" }
+    ListAccountsResponse:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Account" } }
+        page: { $ref: "#/components/schemas/Page" }
+      required: [items, page]
+
+    # ---- Provisioning helpers ----
+    SshPubkeyResponse:
+      type: object
+      properties:
+        publicKey: { type: string, description: OpenSSH single-line public key }
+      required: [publicKey]
+    CaCertResponse:
+      type: object
+      properties:
+        pem: { type: string, description: the CA certificate in PEM }
+      required: [pem]
+
+    # ---- Machines ----
+    MachineStatus:
+      type: string
+      description: >-
+        created → provisioning (SSH: install CA + set HTTPS_PROXY) → awaitingLogin → loggingIn →
+        ready. error is terminal-until-retried.
+      enum: [created, provisioning, awaitingLogin, loggingIn, ready, error]
+    Machine:
+      type: object
+      description: >-
+        One Claude Code login on one SSH target. Identity is the full SSH login (user@host:port), so a
+        host may hold several machines as different users.
+      properties:
+        id: { type: integer, format: int64 }
+        tenantId: { type: integer, format: int64 }
+        label: { type: string, nullable: true }
+        host: { type: string, description: address CCProxy SSHes into and the proxy identifies }
+        sshUser: { type: string, description: SSH login user (default root) }
+        sshPort: { type: integer, description: SSH port (default 22) }
+        status: { $ref: "#/components/schemas/MachineStatus" }
+        error: { type: string, nullable: true, description: last provisioning/login error }
+        caCertInstalled: { type: boolean }
+        httpsProxyUrl:
+          type: string
+          description: >-
+            The exact value to set as HTTPS_PROXY on the machine — includes the per-machine proxy
+            credentials the engine uses to tell this machine's traffic apart, e.g.
+            http://m-42:xxxx@proxy-engine:3128. CCProxy sets it during provisioning; exposed for
+            debugging.
+        hasCredential: { type: boolean, description: whether the machine currently holds a (fake) credential }
+        credentialExpiresAt: { type: integer, format: int64, nullable: true, description: epoch seconds; when re-login is needed }
+        currentLoginRequestId: { type: integer, format: int64, nullable: true, description: "an in-flight login, if any" }
+        lastUsedAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time, nullable: true }
+        # INTERNAL — populated only for super-admin callers; never returned to tenants.
+        boundAccountId: { type: integer, format: int64, nullable: true, description: "internal; super-admin only" }
+        boundAccountEmail: { type: string, nullable: true, description: "internal; super-admin only" }
+      required: [id, tenantId, host, status, caCertInstalled, hasCredential]
+    CreateMachineRequest:
+      type: object
+      properties:
+        host: { type: string, description: address CCProxy will SSH into (pubkey already injected) }
+        sshUser: { type: string, description: "SSH user (default: root)" }
+        sshPort: { type: integer, description: "SSH port (default: 22)" }
+        label: { type: string }
+      required: [host]
+    UpdateMachineRequest:
+      type: object
+      description: partial update; omitted fields unchanged
+      properties:
+        label: { type: string }
+    RebindAccountRequest:
+      type: object
+      properties:
+        accountId: { type: integer, format: int64 }
+      required: [accountId]
+    ListMachinesResponse:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Machine" } }
+        page: { $ref: "#/components/schemas/Page" }
+      required: [items, page]
+
+    # ---- Login-requests ----
+    LoginRequestStatus:
+      type: string
+      description: >-
+        preparing (opening tmux / running /login / extracting URL) → awaitingCode (operator can act) →
+        applying (fake code being driven into Claude Code) → completed. failed / expired / cancelled
+        are terminal.
+      enum: [preparing, awaitingCode, applying, completed, failed, expired, cancelled]
+    LoginRequest:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        machineId: { type: integer, format: int64 }
+        machineLabel: { type: string, nullable: true }
+        tenantId: { type: integer, format: int64 }
+        accountId: { type: integer, format: int64 }
+        accountEmail: { type: string, description: which Anthropic identity to authenticate as }
+        accountProxy: { type: string, description: proxy the operator's browser should use for the login }
+        accountRemark: { type: string, nullable: true }
+        status: { $ref: "#/components/schemas/LoginRequestStatus" }
+        oauthUrl: { type: string, nullable: true, description: URL to open; present once status is awaiting-code }
+        error: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time, nullable: true }
+        expiresAt: { type: integer, format: int64, nullable: true, description: epoch seconds; the OAuth URL/window expiry }
+      required: [id, machineId, tenantId, accountId, accountEmail, status]
+    SubmitLoginCodeRequest:
+      type: object
+      description: provide either the combined `codeState`, or `code` (+ `state`)
+      properties:
+        codeState: { type: string, description: "the browser's `code#state` string, verbatim" }
+        code: { type: string }
+        state: { type: string }
+    ListLoginRequestsResponse:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/LoginRequest" } }
+        page: { $ref: "#/components/schemas/Page" }
+      required: [items, page]
+
+    # ---- Usage ----
+    UsageEntry:
+      type: object
+      description: one metered API call (account is CCProxy-internal and not exposed)
+      properties:
+        id: { type: integer, format: int64 }
+        tenantId: { type: integer, format: int64 }
+        machineId: { type: integer, format: int64 }
+        model: { type: string }
+        inputTokens: { type: integer, format: int64 }
+        outputTokens: { type: integer, format: int64 }
+        cacheReadTokens: { type: integer, format: int64, nullable: true }
+        cacheWriteTokens: { type: integer, format: int64, nullable: true }
+        at: { type: string, format: date-time }
+      required: [id, tenantId, machineId, model, inputTokens, outputTokens, at]
+    ListUsageResponse:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/UsageEntry" } }
+        page: { $ref: "#/components/schemas/Page" }
+      required: [items, page]
+    UsageBucket:
+      type: object
+      description: usage aggregated over one time bucket (bucket start = `at`)
+      properties:
+        at: { type: integer, format: int64, description: "bucket start, epoch seconds" }
+        requests: { type: integer, format: int64 }
+        inputTokens: { type: integer, format: int64 }
+        outputTokens: { type: integer, format: int64 }
+        cacheReadTokens: { type: integer, format: int64 }
+        cacheWriteTokens: { type: integer, format: int64 }
+      required: [at, requests, inputTokens, outputTokens]
+    UsageSummary:
+      type: object
+      description: >-
+        Time-bucketed usage history over [since, until) at `bucketSeconds` resolution. This is all
+        CCProxy provides for billing — MicroCloud does its own metering/quota on top of it.
+      properties:
+        since: { type: integer, format: int64 }
+        until: { type: integer, format: int64 }
+        bucketSeconds: { type: integer, description: "bucket width, e.g. 60 for 1-minute buckets" }
+        buckets: { type: array, items: { $ref: "#/components/schemas/UsageBucket" } }
+      required: [since, until, bucketSeconds, buckets]
