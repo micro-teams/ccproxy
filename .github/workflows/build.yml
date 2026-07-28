@@ -84,7 +84,7 @@ jobs:
       - name: ShellCheck the shell scripts
         run: |
           sudo apt-get update -qq && sudo apt-get install -y shellcheck
-          shellcheck deploy/*.sh backend/scripts/*.sh .github/scripts/*.sh
+          shellcheck scripts/*.sh deploy/*.sh backend/scripts/*.sh .github/scripts/*.sh
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
