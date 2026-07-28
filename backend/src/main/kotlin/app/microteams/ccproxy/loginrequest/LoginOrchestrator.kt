@@ -62,15 +62,14 @@ class LoginOrchestrator(
                 // drops `claude` in ~/.local/bin, which a normal user's profile adds to PATH but
                 // root's does not — a bare `claude` would then not be found and the session would
                 // die. Setting PATH explicitly works for both root and non-root machines.
-                // Force this login process onto the OFFICIAL Anthropic endpoint via OAuth, regardless
-                // of how the machine is otherwise configured. A machine may currently be pointed at a
-                // third-party gateway (e.g. newapi) via ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN /
-                // ANTHROPIC_API_KEY — set in the environment or ~/.claude. If the login Claude
-                // inherited that, it would run in API-key mode (no OAuth at all) or hit the gateway,
-                // so the engine would never capture a real token and login would fail. Unset the
-                // key/token (forces the OAuth flow) and pin the base URL to official (an env base URL
-                // overrides any ~/.claude setting) — done INSIDE the -c so it runs AFTER the login
-                // shell has sourced /etc/profile.d, whichever set those vars.
+                // Force this login process onto the official Anthropic endpoint via OAuth,
+                // regardless of the machine's current config. The machine may point at a
+                // third-party gateway (e.g. newapi) via ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN
+                // / ANTHROPIC_API_KEY (env or ~/.claude); if the login Claude inherited that, it
+                // would run in API-key mode (no OAuth) or hit the gateway, so the engine would
+                // never capture a real token and login would fail. Unset the key/token (forces
+                // OAuth) and pin the base URL to official (env overrides ~/.claude) — inside the
+                // -c so it runs after the login shell sources /etc/profile.d.
                 "tmux new-session -d -s $session -x 1000 -y 50 " +
                     "-e HTTPS_PROXY=$proxyUrl -e HTTP_PROXY=$proxyUrl " +
                     "-e NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/ccproxy-ca.crt " +
