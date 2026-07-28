@@ -89,9 +89,16 @@ class RemoteSettings(private val operatorSsh: OperatorSsh, private val mapper: O
                     run(machine, "cat \"\$HOME/.claude/settings.json\" 2>/dev/null || true")
                 }
                 .getOrDefault("")
-        if (raw.isBlank()) return mapper.createObjectNode()
-        return runCatching { mapper.readTree(raw) as? ObjectNode }.getOrNull()
-            ?: mapper.createObjectNode()
+        // run() merges stderr into stdout, and a remote shell can prepend noise to it (e.g. ssh
+        // forwards the client locale and the machine prints "bash: warning: setlocale ..."). Carve
+        // out the JSON object between the first '{' and the last '}' so such noise can't turn a
+        // populated settings.json into an empty read — which would silently clobber the user's
+        // keys.
+        val start = raw.indexOf('{')
+        val end = raw.lastIndexOf('}')
+        if (start < 0 || end < start) return mapper.createObjectNode()
+        return runCatching { mapper.readTree(raw.substring(start, end + 1)) as? ObjectNode }
+            .getOrNull() ?: mapper.createObjectNode()
     }
 
     private fun envOf(cfg: ObjectNode): ObjectNode =
