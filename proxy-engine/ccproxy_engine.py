@@ -574,13 +574,37 @@ def parse_proxy_auth(headers):
     return None, None
 
 
+def forward_plain_http(cs, parts):
+    """Forward a plain-HTTP proxy request (absolute-form target, e.g. Claude Code -> an http://
+    gateway like newapi) straight to its origin over the engine's OWN default network, and relay the
+    response back. Anthropic is always HTTPS (CONNECT), so a non-CONNECT request is never something we
+    MITM or meter — it just needs to pass through instead of being dropped. We only rewrite the
+    request-target to origin-form; the still-buffered headers + body (and the response) are then
+    relayed verbatim by tunnel()."""
+    method, target, version = parts[0], parts[1].decode("latin-1"), parts[2]
+    u = urllib.parse.urlsplit(target)
+    if u.scheme != "http" or not u.hostname:
+        return
+    origin = u.path or "/"
+    if u.query:
+        origin += "?" + u.query
+    up = socket.create_connection((u.hostname, u.port or 80), timeout=30)
+    up.sendall(method + b" " + origin.encode("latin-1") + b" " + version + b"\r\n")
+    tunnel(cs, up)
+
+
 def handle_client(cs):
     try:
         line = recv_line(cs)
         if not line:
             return
         parts = line.strip().split(b" ")
-        if len(parts) < 3 or parts[0] != b"CONNECT":
+        if len(parts) < 3:
+            return
+        if parts[0] != b"CONNECT":
+            # A non-CONNECT request is a plain-HTTP forward-proxy request; pass it through direct
+            # instead of dropping the connection (which the client sees as a reset).
+            forward_plain_http(cs, parts)
             return
         target = parts[1].decode()
         headers = parse_headers(cs)
