@@ -129,6 +129,20 @@ wait_status "$MID" awaitingLogin || exit 1
 docker exec "$MACHINE" bash -lc 'python3 -c "import json,os;p=os.path.expanduser(\"~/.claude.json\");d=json.load(open(p)) if os.path.exists(p) and os.path.getsize(p) else {};d[\"hasCompletedOnboarding\"]=True;json.dump(d,open(p,\"w\"))"'
 expect_awaiting_code "$MID" "round2-onboarded-login" || exit 1
 
+echo "== round 2b: a machine pointed at a third-party gateway (newapi env) must STILL log in against official =="
+# Before a machine is switched to ccproxy it may be pointed at a third-party Anthropic gateway (e.g.
+# newapi) via ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN in a login-shell profile. If the login Claude
+# inherited that, it would run in API-key mode / hit the gateway and NEVER produce an OAuth URL, so
+# the engine could not capture a real token. The orchestrator must launch its login Claude forced
+# onto the official endpoint regardless. Reproduce that env and require login to still reach awaitingCode.
+docker exec "$MACHINE" bash -c 'printf "export ANTHROPIC_BASE_URL=https://newapi.example.invalid\nexport ANTHROPIC_AUTH_TOKEN=sk-newapi-fake-token\n" > /etc/profile.d/zz-newapi.sh'
+SEEN="$(docker exec "$MACHINE" bash -lc 'printf %s "$ANTHROPIC_BASE_URL"')"
+[ "$SEEN" = "https://newapi.example.invalid" ] || { echo "FAIL: gateway env not visible in login shell (got '$SEEN')"; exit 1; }
+curl -s -X POST "$GW/machine/$MID/reprovision" -H "Authorization: Bearer $TSEC" >/dev/null
+wait_status "$MID" awaitingLogin || exit 1
+expect_awaiting_code "$MID" "round2b-gateway-env-still-official" || exit 1
+docker exec "$MACHINE" rm -f /etc/profile.d/zz-newapi.sh   # keep later rounds unaffected
+
 echo "== round 3: engine restart self-heal (lazy session fetch, NO reprovision) =="
 # The engine keeps sessions in memory; restarting wipes them. Without on-demand refetch a machine
 # would then stall at 'Checking connectivity' until reprovisioned. Restart the engine and DO NOT
