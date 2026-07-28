@@ -12,12 +12,14 @@
 
 package app.microteams.ccproxy.loginrequest
 
+import app.microteams.ccproxy.account.AccountRepository
 import app.microteams.ccproxy.common.config.CCProxyConfig
 import app.microteams.ccproxy.machine.EngineClient
 import app.microteams.ccproxy.machine.Machine
 import app.microteams.ccproxy.machine.MachineRepository
 import app.microteams.ccproxy.machine.MachineStatus
 import app.microteams.ccproxy.machine.OperatorSsh
+import app.microteams.ccproxy.machine.SettingsPatch
 import java.util.Base64
 import org.slf4j.LoggerFactory
 import org.springframework.scheduling.annotation.Async
@@ -29,13 +31,19 @@ class LoginOrchestrator(
     private val config: CCProxyConfig,
     private val loginRequestRepository: LoginRequestRepository,
     private val machineRepository: MachineRepository,
+    private val accountRepository: AccountRepository,
     private val operatorSsh: OperatorSsh,
     private val engineClient: EngineClient,
 ) {
     private val log = LoggerFactory.getLogger(LoginOrchestrator::class.java)
+    // Temp settings file we drop for the login Claude only — forces the official endpoint + engine
+    // proxy, isolated from the machine's real settings.json. Removed when the login finishes.
+    private val loginSettingsPath = "\$HOME/.claude/ccproxy-login.json"
     // Claude Code prints an OAuth authorize URL on claude.com (redirect to platform.claude.com);
     // match any https URL containing "oauth" so we don't couple to a specific host.
     private val urlRegex = Regex("https://\\S*oauth\\S*")
+    // Claude Code's post-login confirmation text — one of the two required success signals.
+    private val successRegex = Regex("(?i)(login successful|logged in|successfully logged)")
 
     @Async
     @Transactional
@@ -48,34 +56,40 @@ class LoginOrchestrator(
             req.tmuxSession = session
             loginRequestRepository.save(req)
 
-            // Fresh tmux session running Claude Code interactively, with HTTPS_PROXY pointed at the
-            // engine (so the OAuth token exchange is intercepted).
+            // Login binds the account + registers the engine session (birth did neither). The
+            // engine
+            // needs a registered session to MITM this machine's official traffic and capture the
+            // real token; the account supplies the egress proxy the session uses.
+            val account =
+                machine.accountId?.let { accountRepository.findById(it).orElse(null) }
+                    ?: throw IllegalStateException("machine ${machine.id} has no bound account")
+            engineClient.registerSession(
+                machine.proxyUser!!,
+                machine.proxyPassword!!,
+                account.proxy!!,
+            )
+
             val proxyUrl =
                 "http://${machine.proxyUser}:${machine.proxyPassword}@${config.engine.proxyEndpoint}"
-            // A too-small pane makes Claude Code exit ("terminal too small"); a very wide pane also
-            // keeps the long OAuth URL on a single unwrapped line so it scrapes whole.
+            // Drop a login-only settings file that forces the official endpoint + engine proxy +
+            // CA,
+            // and blanks any gateway token, then launch `claude --settings <it>`. --settings is
+            // CLI-scope (above the machine's own ~/.claude/settings.json), so the login Claude runs
+            // official-via-OAuth regardless of a newapi override sitting in the real settings.json
+            // —
+            // without touching that file. The machine's running (newapi) Claude is undisturbed.
             sshRun(machine, "tmux kill-session -t $session 2>/dev/null || true")
+            runPython(machine, SettingsPatch.writeLoginSettingsScript(proxyUrl))
+            // A too-small pane makes Claude Code exit ("terminal too small"); a very wide pane
+            // keeps
+            // the long OAuth URL on a single unwrapped line so it scrapes whole. ~/.local/bin on
+            // PATH:
+            // the claude.ai installer drops `claude` there, which root's profile does not add.
             sshRun(
                 machine,
-                // Launch via a login shell AND prepend ~/.local/bin to PATH: the claude.ai
-                // installer
-                // drops `claude` in ~/.local/bin, which a normal user's profile adds to PATH but
-                // root's does not — a bare `claude` would then not be found and the session would
-                // die. Setting PATH explicitly works for both root and non-root machines.
-                // Force this login process onto the official Anthropic endpoint via OAuth,
-                // regardless of the machine's current config. The machine may point at a
-                // third-party gateway (e.g. newapi) via ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN
-                // / ANTHROPIC_API_KEY (env or ~/.claude); if the login Claude inherited that, it
-                // would run in API-key mode (no OAuth) or hit the gateway, so the engine would
-                // never capture a real token and login would fail. Unset the key/token (forces
-                // OAuth) and pin the base URL to official (env overrides ~/.claude) — inside the
-                // -c so it runs after the login shell sources /etc/profile.d.
                 "tmux new-session -d -s $session -x 1000 -y 50 " +
-                    "-e HTTPS_PROXY=$proxyUrl -e HTTP_PROXY=$proxyUrl " +
-                    "-e NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/ccproxy-ca.crt " +
-                    "bash -lc 'unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; " +
-                    "export ANTHROPIC_BASE_URL=https://api.anthropic.com; " +
-                    "PATH=\"\$HOME/.local/bin:\$PATH\" claude'",
+                    "bash -lc 'PATH=\"\$HOME/.local/bin:\$PATH\" " +
+                    "claude --settings $loginSettingsPath'",
             )
 
             val url = driveToOAuthUrl(machine, session)
@@ -129,16 +143,22 @@ class LoginOrchestrator(
             }
 
             // The engine reports the swap slightly BEFORE Claude Code finishes: Claude still has to
-            // receive the fake tokens, show "Login successful — press Enter to continue", and
-            // persist
-            // ~/.claude/.credentials.json. Advance past that prompt and wait for the file to
-            // actually
-            // land before tearing the session down, or the machine ends up READY with no local
-            // credential (interactive `claude` would then say "Not logged in").
+            // receive the fake tokens, show "Login successful", and persist
+            // ~/.claude/.credentials.json. Success requires BOTH signals — the engine holds the
+            // credential AND Claude's own screen confirms it (belt and suspenders; either alone is
+            // a
+            // failure). Advance past the prompt and wait for both before doing anything
+            // destructive.
             sshRun(machine, "tmux send-keys -t $session Enter")
+            var sawSuccessText = false
+            var credentialLanded = false
             for (i in 0 until 20) {
                 Thread.sleep(1000)
-                val landed =
+                val pane =
+                    runCatching { sshRun(machine, "tmux capture-pane -t $session -p -J -S -200") }
+                        .getOrDefault("")
+                if (successRegex.containsMatchIn(pane)) sawSuccessText = true
+                credentialLanded =
                     runCatching {
                             sshRun(
                                 machine,
@@ -146,8 +166,23 @@ class LoginOrchestrator(
                             )
                         }
                         .getOrDefault("")
-                if (landed.contains("OK")) break
+                        .contains("OK")
+                if (sawSuccessText && credentialLanded) break
             }
+            if (!sawSuccessText || !credentialLanded) {
+                // Config is still untouched at this point, so a failed login costs nothing — the
+                // machine stays on newapi and can be retried.
+                throw IllegalStateException(
+                    "login not confirmed (engineCredential=true, successText=$sawSuccessText, " +
+                        "credentialFile=$credentialLanded)"
+                )
+            }
+
+            // Confirmed: flip the machine to official by removing the newapi override keys from its
+            // real settings.json (surgical, atomic; the proxy and all other keys stay). A running
+            // Claude keeps its in-memory newapi; the next one started reads
+            // official-through-engine.
+            runPython(machine, SettingsPatch.switchToOfficialScript())
 
             machine.hasCredential = true
             machine.credentialExpiresAt = expiresAt
@@ -162,6 +197,7 @@ class LoginOrchestrator(
             req.status = LoginRequestStatus.COMPLETED
             loginRequestRepository.save(req)
             sshRun(machine, "tmux kill-session -t $session 2>/dev/null || true")
+            sshRun(machine, "rm -f $loginSettingsPath")
             log.info("login-request {} completed (machine {} ready)", req.id, machine.id)
         } catch (e: Exception) {
             log.warn("login-request {} apply failed: {}", loginRequestId, e.message)
@@ -280,4 +316,10 @@ class LoginOrchestrator(
             remote,
             timeoutSeconds = 30,
         )
+
+    /** Run a python program on the machine, base64'd + piped to python3 (no shell quoting). */
+    private fun runPython(machine: Machine, script: String): String {
+        val b64 = Base64.getEncoder().encodeToString(script.toByteArray())
+        return sshRun(machine, "echo $b64 | base64 -d | python3")
+    }
 }

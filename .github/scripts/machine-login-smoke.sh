@@ -100,27 +100,37 @@ expect_awaiting_code() { # $1=machineId  $2=label
   echo "FAIL $2: never reached awaitingCode (last=$ls)"; return 1
 }
 
+# Seed a settings.json the tenant/user co-owns BEFORE provisioning: a newapi gateway override plus a
+# user key. Provisioning must MERGE its proxy in and preserve both — it is not the sole owner of this
+# file.
+docker exec "$MACHINE" bash -lc 'mkdir -p ~/.claude; cat > ~/.claude/settings.json' <<'JSON'
+{"env":{"ANTHROPIC_BASE_URL":"https://newapi.example.invalid","ANTHROPIC_AUTH_TOKEN":"sk-newapi-fake"},"theme":"dark"}
+JSON
+
 echo "== register + provision machine =="
 MID="$(curl -s -X POST "$GW/machine" -H "Authorization: Bearer $TSEC" -H 'Content-Type: application/json' \
         -d "{\"host\":\"$MACHINE\",\"label\":\"ci\"}" | jqget "['id']")"
 wait_status "$MID" awaitingLogin || exit 1
 echo "provisioned OK"
 
-# Regression guard: provisioning now writes exactly ONE file — the login user's ~/.claude/settings.json
-# — whose `env` block points Claude Code at the engine proxy (+ NODE_EXTRA_CA_CERTS for the MITM CA
-# dropped alongside it). settings.json's env overrides shell/system env for every Claude this user
-# starts, so ONLY Claude's traffic is proxied. It must NOT touch system-wide env (/etc/profile.d,
-# /etc/environment) — those would proxy the whole machine and are exactly what this design removes.
-echo "== verify settings.json carries the engine proxy; no system-wide env written =="
+# Regression guard: provisioning MERGES the engine proxy into ~/.claude/settings.json's `env` and
+# preserves every key the tenant/user already put there (newapi override + the `theme` user key). It
+# must NOT touch system-wide env (/etc/profile.d, /etc/environment) — those would proxy the whole
+# machine and are exactly what this design removes.
+echo "== verify settings.json got the engine proxy MERGED in, pre-existing keys preserved =="
 docker exec "$MACHINE" bash -lc 'cat "$HOME/.claude/settings.json"' | python3 -c "
 import sys,json
-env=json.load(sys.stdin).get('env',{})
+d=json.load(sys.stdin)
+env=d.get('env',{})
 p=env.get('HTTPS_PROXY','')
 assert p.startswith('http') and '@' in p, 'HTTPS_PROXY missing/unauthed: %r'%p
 assert env.get('HTTP_PROXY')==p, 'HTTP_PROXY != HTTPS_PROXY'
 assert env.get('NODE_EXTRA_CA_CERTS'), 'NODE_EXTRA_CA_CERTS missing'
-print('settings.json env OK ('+p+')')
-" || { echo "FAIL: settings.json env invalid"; exit 1; }
+assert env.get('ANTHROPIC_BASE_URL')=='https://newapi.example.invalid', 'newapi override was clobbered'
+assert env.get('ANTHROPIC_AUTH_TOKEN')=='sk-newapi-fake', 'newapi token was clobbered'
+assert d.get('theme')=='dark', 'user key theme was clobbered'
+print('settings.json merged OK ('+p+'), newapi + user keys preserved')
+" || { echo "FAIL: settings.json merge invalid"; exit 1; }
 docker exec "$MACHINE" bash -lc 'test -f "$HOME/.claude/ccproxy-ca.crt"' ||
   { echo "FAIL: MITM CA not dropped next to settings.json"; exit 1; }
 docker exec "$MACHINE" test ! -e /etc/profile.d/ccproxy-proxy.sh ||
@@ -136,19 +146,19 @@ wait_status "$MID" awaitingLogin || exit 1
 docker exec "$MACHINE" bash -lc 'python3 -c "import json,os;p=os.path.expanduser(\"~/.claude.json\");d=json.load(open(p)) if os.path.exists(p) and os.path.getsize(p) else {};d[\"hasCompletedOnboarding\"]=True;json.dump(d,open(p,\"w\"))"'
 expect_awaiting_code "$MID" "round2-onboarded-login" || exit 1
 
-echo "== round 2b: a machine pointed at a third-party gateway (newapi env) must STILL log in against official =="
-# Before a machine is switched to ccproxy it may be pointed at a third-party Anthropic gateway (e.g.
-# newapi) via ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN in a login-shell profile. If the login Claude
-# inherited that, it would run in API-key mode / hit the gateway and NEVER produce an OAuth URL, so
-# the engine could not capture a real token. The orchestrator must launch its login Claude forced
-# onto the official endpoint regardless. Reproduce that env and require login to still reach awaitingCode.
-docker exec "$MACHINE" bash -c 'printf "export ANTHROPIC_BASE_URL=https://newapi.example.invalid\nexport ANTHROPIC_AUTH_TOKEN=sk-newapi-fake-token\n" > /etc/profile.d/zz-newapi.sh'
-SEEN="$(docker exec "$MACHINE" bash -lc 'printf %s "$ANTHROPIC_BASE_URL"')"
-[ "$SEEN" = "https://newapi.example.invalid" ] || { echo "FAIL: gateway env not visible in login shell (got '$SEEN')"; exit 1; }
-curl -s -X POST "$GW/machine/$MID/reprovision" -H "Authorization: Bearer $TSEC" >/dev/null
-wait_status "$MID" awaitingLogin || exit 1
-expect_awaiting_code "$MID" "round2b-gateway-env-still-official" || exit 1
-docker exec "$MACHINE" rm -f /etc/profile.d/zz-newapi.sh   # keep later rounds unaffected
+echo "== round 2b: newapi in settings.json — login forces official via a temp file, real file untouched =="
+# The machine's real settings.json carries a newapi override (seeded above, still present). The login
+# Claude must reach official-via-OAuth anyway — it runs with a login-only `claude --settings <temp>`
+# that out-precedes user settings — WITHOUT modifying the real settings.json. Since the switch (delete
+# of the newapi keys) only happens on a CONFIRMED login, and CI never completes one, the real file
+# must still carry newapi after an incomplete login: an incomplete login costs nothing.
+docker exec "$MACHINE" bash -lc 'python3 -c "import json,os;print(json.load(open(os.path.expanduser(\"~/.claude/settings.json\")))[\"env\"][\"ANTHROPIC_BASE_URL\"])"' \
+  | grep -q 'newapi.example.invalid' || { echo "FAIL: precondition, newapi not in settings.json"; exit 1; }
+expect_awaiting_code "$MID" "round2b-newapi-settings-still-official" || exit 1
+docker exec "$MACHINE" bash -lc 'python3 -c "import json,os;print(json.load(open(os.path.expanduser(\"~/.claude/settings.json\")))[\"env\"].get(\"ANTHROPIC_BASE_URL\",\"\"))"' \
+  | grep -q 'newapi.example.invalid' ||
+  { echo "FAIL: an incomplete login modified the real settings.json (should be untouched)"; exit 1; }
+echo "PASS round2b: login reached official; real settings.json newapi untouched"
 
 echo "== round 2c: a switched-to-official persistent Claude must survive a concurrent login =="
 # The real steady state after the newapi->official switch: provisioning only ever wrote settings.json,

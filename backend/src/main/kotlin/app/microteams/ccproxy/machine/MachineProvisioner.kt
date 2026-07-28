@@ -1,12 +1,13 @@
 /*
- *  Description: The SSH side of a machine's provisioning — every method is @Async and lands a
- *               terminal status. provision() waits for SSH, then writes ONE file — the login user's
- *               ~/.claude/settings.json — whose `env` block points Claude Code's HTTPS_PROXY at the
- *               proxy-engine (with this machine's own proxy-auth) and its NODE_EXTRA_CA_CERTS at the
- *               MITM CA we drop alongside it. settings.json's env overrides shell/system env and is
- *               read by every Claude process this user starts, so only Claude's traffic is proxied —
- *               no system-wide env files, no CA trust-store install, no sudo. Then it registers the
- *               session with the engine and lands AWAITING_LOGIN (or ERROR).
+ *  Description: The SSH side of a machine's BIRTH-time initialization — @Async, lands a terminal
+ *               status. provision() waits for SSH, then MERGES this machine's proxy into the login
+ *               user's ~/.claude/settings.json `env` (HTTPS_PROXY at the proxy-engine with this
+ *               machine's own proxy-auth, NODE_EXTRA_CA_CERTS at the MITM CA dropped alongside),
+ *               preserving every other key the tenant/user already put there. It binds NO account and
+ *               registers NO engine session — birth only points Claude at the engine, which tunnels
+ *               unregistered sessions straight through, consuming no account. Account binding and
+ *               session registration happen later, at login (see LoginOrchestrator). Lands
+ *               AWAITING_LOGIN (or ERROR).
  *
  *  Author(s):
  *      Nictheboy Li    <nictheboy@outlook.com>
@@ -15,7 +16,6 @@
 
 package app.microteams.ccproxy.machine
 
-import app.microteams.ccproxy.account.AccountRepository
 import app.microteams.ccproxy.common.config.CCProxyConfig
 import java.io.File
 import java.util.Base64
@@ -28,9 +28,7 @@ import org.springframework.transaction.annotation.Transactional
 class MachineProvisioner(
     private val config: CCProxyConfig,
     private val machineRepository: MachineRepository,
-    private val accountRepository: AccountRepository,
     private val operatorSsh: OperatorSsh,
-    private val engineClient: EngineClient,
 ) {
     private val log = LoggerFactory.getLogger(MachineProvisioner::class.java)
 
@@ -74,15 +72,6 @@ class MachineProvisioner(
             }
             machine.caCertInstalled = true
 
-            val account =
-                machine.accountId?.let { accountRepository.findById(it).orElse(null) }
-                    ?: throw IllegalStateException("machine ${machine.id} has no bound account")
-            engineClient.registerSession(
-                machine.proxyUser!!,
-                machine.proxyPassword!!,
-                account.proxy!!,
-            )
-
             machine.status = MachineStatus.AWAITING_LOGIN
             machineRepository.save(machine)
             log.info("provisioned machine {}", machine.id)
@@ -112,23 +101,20 @@ class MachineProvisioner(
         return f.readText()
     }
 
+    /**
+     * The remote init script: drop the MITM CA and MERGE the proxy keys into
+     * ~/.claude/settings.json (preserving any newapi/user keys), written back atomically. The whole
+     * merge is a python program (interpolated with quote-free values), base64'd so no shell quoting
+     * is involved. Needs python3.
+     */
     private fun provisionScript(caPem: String, httpsProxyUrl: String): String {
-        // base64 the PEM onto a single line: it's decoded into the CA file on the machine. (A
-        // heredoc
-        // would break under trimIndent — the PEM's own lines sit at column 0, so the closing
-        // delimiter keeps its indent and the heredoc never terminates.)
         val caB64 = Base64.getEncoder().encodeToString(caPem.toByteArray())
-        // Write the CA and a single-line settings.json (avoids any heredoc/indent pitfalls). The
-        // proxy URL is inlined single-quoted — it never contains a quote (user is m<id>, password
-        // is
-        // [A-Za-z0-9]); the CA path uses the runtime ${'$'}HOME so it works for root and non-root.
-        // ${'$'} is the shell's $ (Kotlin interpolates $httpsProxyUrl / $caB64 only).
+        val py = SettingsPatch.mergeProxyScript(caB64, httpsProxyUrl)
+        val pyB64 = Base64.getEncoder().encodeToString(py.toByteArray())
         return """
         set -euo pipefail
-        D="${'$'}HOME/.claude"
-        mkdir -p "${'$'}D"
-        echo '$caB64' | base64 -d > "${'$'}D/ccproxy-ca.crt"
-        printf '{"env":{"HTTPS_PROXY":"%s","HTTP_PROXY":"%s","NODE_EXTRA_CA_CERTS":"%s"}}\n' '$httpsProxyUrl' '$httpsProxyUrl' "${'$'}D/ccproxy-ca.crt" > "${'$'}D/settings.json"
+        command -v python3 >/dev/null || { echo 'python3 required on the machine' >&2; exit 1; }
+        echo '$pyB64' | base64 -d | python3
         """
             .trimIndent()
     }
