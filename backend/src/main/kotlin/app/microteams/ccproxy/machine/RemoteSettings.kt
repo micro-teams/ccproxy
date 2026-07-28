@@ -25,7 +25,7 @@ class RemoteSettings(private val operatorSsh: OperatorSsh, private val mapper: O
      * Birth init: drop the MITM CA and MERGE the engine proxy into env, preserving every other key.
      */
     fun mergeProxy(machine: Machine, proxyUrl: String, caPem: String) {
-        val caPath = "${home(machine)}/.claude/ccproxy-ca.crt"
+        val caPath = caCertPath(machine)
         val caB64 = Base64.getEncoder().encodeToString(caPem.toByteArray())
         run(machine, "mkdir -p \"\$HOME/.claude\"; echo $caB64 | base64 -d > \"$caPath\"")
         val cfg = read(machine)
@@ -57,7 +57,7 @@ class RemoteSettings(private val operatorSsh: OperatorSsh, private val mapper: O
      * the login Claude runs official-via-OAuth without touching the machine's real settings.json.
      */
     fun writeLoginSettings(machine: Machine, proxyUrl: String) {
-        val caPath = "${home(machine)}/.claude/ccproxy-ca.crt"
+        val caPath = caCertPath(machine)
         val env = mapper.createObjectNode()
         env.put("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
         env.put("ANTHROPIC_AUTH_TOKEN", "")
@@ -71,17 +71,16 @@ class RemoteSettings(private val operatorSsh: OperatorSsh, private val mapper: O
     }
 
     /**
-     * The login user's absolute home, resolved once over SSH (NODE_EXTRA_CA_CERTS needs an absolute
-     * path). Defensive against any stray banner line: take the last non-blank line.
+     * The absolute path of the MITM CA on the machine (NODE_EXTRA_CA_CERTS needs an absolute path,
+     * so we must resolve $HOME server-side). run() merges stderr into stdout and the remote shell
+     * may interleave noise (e.g. a forwarded-locale "setlocale" warning), so wrap the value in
+     * unique markers and pull it back out — immune to any surrounding banner text or ordering.
      */
-    private fun home(machine: Machine): String =
-        run(machine, "printf '%s\\n' \"\$HOME\"")
-            .trim()
-            .lineSequence()
-            .map { it.trim() }
-            .lastOrNull {
-                it.isNotEmpty()
-            } ?: throw IllegalStateException("could not resolve \$HOME on machine ${machine.id}")
+    private fun caCertPath(machine: Machine): String {
+        val out = run(machine, "printf 'CCPX[%s]XPCC' \"\$HOME/.claude/ccproxy-ca.crt\"")
+        return Regex("CCPX\\[(.*?)]XPCC").find(out)?.groupValues?.get(1)
+            ?: throw IllegalStateException("could not resolve \$HOME on machine ${machine.id}")
+    }
 
     private fun read(machine: Machine): ObjectNode {
         val raw =
