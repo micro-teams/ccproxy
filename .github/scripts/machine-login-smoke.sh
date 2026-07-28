@@ -103,7 +103,7 @@ expect_awaiting_code() { # $1=machineId  $2=label
 # Seed a settings.json the tenant/user co-owns BEFORE provisioning: a newapi gateway override plus a
 # user key. Provisioning must MERGE its proxy in and preserve both — it is not the sole owner of this
 # file.
-docker exec "$MACHINE" bash -lc 'mkdir -p ~/.claude; cat > ~/.claude/settings.json' <<'JSON'
+docker exec -i "$MACHINE" bash -lc 'mkdir -p ~/.claude; cat > ~/.claude/settings.json' <<'JSON'
 {"env":{"ANTHROPIC_BASE_URL":"https://newapi.example.invalid","ANTHROPIC_AUTH_TOKEN":"sk-newapi-fake"},"theme":"dark"}
 JSON
 

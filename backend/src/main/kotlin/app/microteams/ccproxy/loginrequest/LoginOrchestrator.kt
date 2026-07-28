@@ -19,7 +19,7 @@ import app.microteams.ccproxy.machine.Machine
 import app.microteams.ccproxy.machine.MachineRepository
 import app.microteams.ccproxy.machine.MachineStatus
 import app.microteams.ccproxy.machine.OperatorSsh
-import app.microteams.ccproxy.machine.SettingsPatch
+import app.microteams.ccproxy.machine.RemoteSettings
 import java.util.Base64
 import org.slf4j.LoggerFactory
 import org.springframework.scheduling.annotation.Async
@@ -34,6 +34,7 @@ class LoginOrchestrator(
     private val accountRepository: AccountRepository,
     private val operatorSsh: OperatorSsh,
     private val engineClient: EngineClient,
+    private val remoteSettings: RemoteSettings,
 ) {
     private val log = LoggerFactory.getLogger(LoginOrchestrator::class.java)
     // Temp settings file we drop for the login Claude only — forces the official endpoint + engine
@@ -79,7 +80,7 @@ class LoginOrchestrator(
             // —
             // without touching that file. The machine's running (newapi) Claude is undisturbed.
             sshRun(machine, "tmux kill-session -t $session 2>/dev/null || true")
-            runPython(machine, SettingsPatch.writeLoginSettingsScript(proxyUrl))
+            remoteSettings.writeLoginSettings(machine, proxyUrl)
             // A too-small pane makes Claude Code exit ("terminal too small"); a very wide pane
             // keeps
             // the long OAuth URL on a single unwrapped line so it scrapes whole. ~/.local/bin on
@@ -182,7 +183,7 @@ class LoginOrchestrator(
             // real settings.json (surgical, atomic; the proxy and all other keys stay). A running
             // Claude keeps its in-memory newapi; the next one started reads
             // official-through-engine.
-            runPython(machine, SettingsPatch.switchToOfficialScript())
+            remoteSettings.switchToOfficial(machine)
 
             machine.hasCredential = true
             machine.credentialExpiresAt = expiresAt
@@ -316,10 +317,4 @@ class LoginOrchestrator(
             remote,
             timeoutSeconds = 30,
         )
-
-    /** Run a python program on the machine, base64'd + piped to python3 (no shell quoting). */
-    private fun runPython(machine: Machine, script: String): String {
-        val b64 = Base64.getEncoder().encodeToString(script.toByteArray())
-        return sshRun(machine, "echo $b64 | base64 -d | python3")
-    }
 }

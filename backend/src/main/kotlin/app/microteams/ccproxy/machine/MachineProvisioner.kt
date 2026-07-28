@@ -18,7 +18,6 @@ package app.microteams.ccproxy.machine
 
 import app.microteams.ccproxy.common.config.CCProxyConfig
 import java.io.File
-import java.util.Base64
 import org.slf4j.LoggerFactory
 import org.springframework.scheduling.annotation.Async
 import org.springframework.stereotype.Component
@@ -29,6 +28,7 @@ class MachineProvisioner(
     private val config: CCProxyConfig,
     private val machineRepository: MachineRepository,
     private val operatorSsh: OperatorSsh,
+    private val remoteSettings: RemoteSettings,
 ) {
     private val log = LoggerFactory.getLogger(MachineProvisioner::class.java)
 
@@ -50,26 +50,14 @@ class MachineProvisioner(
                 config.provisioning.sshReadyTimeoutSeconds,
             )
 
-            val caPem = readCaCert()
-            val proxyUrl = machine.httpsProxyUrl(config.engine.proxyEndpoint)
-            val script = provisionScript(caPem, proxyUrl)
-            val tmp = File.createTempFile("ccproxy-init-", ".sh")
-            try {
-                tmp.writeText(script)
-                // Everything lands under the login user's own ~/.claude — no root, no sudo (minimal
-                // images often lack it anyway). Run the script as that user so $HOME resolves to
-                // it.
-                operatorSsh.runScript(
-                    machine.sshUser,
-                    host,
-                    machine.sshPort,
-                    tmp,
-                    "bash -s",
-                    timeoutSeconds = 120,
-                )
-            } finally {
-                tmp.delete()
-            }
+            // Everything lands under the login user's own ~/.claude — no root, no sudo (minimal
+            // images often lack it anyway). The JSON merge happens server-side; the machine only
+            // runs cat/base64/mv, so no python3 is needed there.
+            remoteSettings.mergeProxy(
+                machine,
+                machine.httpsProxyUrl(config.engine.proxyEndpoint),
+                readCaCert(),
+            )
             machine.caCertInstalled = true
 
             machine.status = MachineStatus.AWAITING_LOGIN
@@ -99,23 +87,5 @@ class MachineProvisioner(
         val f = File(path)
         if (!f.isFile) throw IllegalStateException("CA cert not found at $path")
         return f.readText()
-    }
-
-    /**
-     * The remote init script: drop the MITM CA and MERGE the proxy keys into
-     * ~/.claude/settings.json (preserving any newapi/user keys), written back atomically. The whole
-     * merge is a python program (interpolated with quote-free values), base64'd so no shell quoting
-     * is involved. Needs python3.
-     */
-    private fun provisionScript(caPem: String, httpsProxyUrl: String): String {
-        val caB64 = Base64.getEncoder().encodeToString(caPem.toByteArray())
-        val py = SettingsPatch.mergeProxyScript(caB64, httpsProxyUrl)
-        val pyB64 = Base64.getEncoder().encodeToString(py.toByteArray())
-        return """
-        set -euo pipefail
-        command -v python3 >/dev/null || { echo 'python3 required on the machine' >&2; exit 1; }
-        echo '$pyB64' | base64 -d | python3
-        """
-            .trimIndent()
     }
 }
