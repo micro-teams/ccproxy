@@ -106,18 +106,25 @@ MID="$(curl -s -X POST "$GW/machine" -H "Authorization: Bearer $TSEC" -H 'Conten
 wait_status "$MID" awaitingLogin || exit 1
 echo "provisioned OK"
 
-# Regression guard: a bash LOGIN shell (how agent runners start claude) must see the proxy. It only
-# reads /etc/profile(.d) + ~/.profile, NOT /etc/environment (that is PAM-only) — so provisioning must
-# drop /etc/profile.d/ccproxy-proxy.sh, or a login-shell claude runs with no proxy and gets logged
-# out sending its fake token straight to the real API.
-echo "== verify login-shell sees the proxy =="
-docker exec "$MACHINE" test -f /etc/profile.d/ccproxy-proxy.sh ||
-  { echo "FAIL: /etc/profile.d/ccproxy-proxy.sh missing"; exit 1; }
-PROXY_SEEN="$(docker exec "$MACHINE" bash -lc 'printf %s "$HTTPS_PROXY"')"
-case "$PROXY_SEEN" in
-  http*://*@*:*) echo "login-shell HTTPS_PROXY OK ($PROXY_SEEN)" ;;
-  *) echo "FAIL: bash -lc did not inherit HTTPS_PROXY (got: '$PROXY_SEEN')"; exit 1 ;;
-esac
+# Regression guard: provisioning now writes exactly ONE file — the login user's ~/.claude/settings.json
+# — whose `env` block points Claude Code at the engine proxy (+ NODE_EXTRA_CA_CERTS for the MITM CA
+# dropped alongside it). settings.json's env overrides shell/system env for every Claude this user
+# starts, so ONLY Claude's traffic is proxied. It must NOT touch system-wide env (/etc/profile.d,
+# /etc/environment) — those would proxy the whole machine and are exactly what this design removes.
+echo "== verify settings.json carries the engine proxy; no system-wide env written =="
+docker exec "$MACHINE" bash -lc 'cat "$HOME/.claude/settings.json"' | python3 -c "
+import sys,json
+env=json.load(sys.stdin).get('env',{})
+p=env.get('HTTPS_PROXY','')
+assert p.startswith('http') and '@' in p, 'HTTPS_PROXY missing/unauthed: %r'%p
+assert env.get('HTTP_PROXY')==p, 'HTTP_PROXY != HTTPS_PROXY'
+assert env.get('NODE_EXTRA_CA_CERTS'), 'NODE_EXTRA_CA_CERTS missing'
+print('settings.json env OK ('+p+')')
+" || { echo "FAIL: settings.json env invalid"; exit 1; }
+docker exec "$MACHINE" bash -lc 'test -f "$HOME/.claude/ccproxy-ca.crt"' ||
+  { echo "FAIL: MITM CA not dropped next to settings.json"; exit 1; }
+docker exec "$MACHINE" test ! -e /etc/profile.d/ccproxy-proxy.sh ||
+  { echo "FAIL: /etc/profile.d/ccproxy-proxy.sh must NOT exist under the settings.json design"; exit 1; }
 
 echo "== round 1: fresh machine (first-run wizard path) =="
 expect_awaiting_code "$MID" "round1-fresh-wizard" || exit 1
@@ -142,6 +149,30 @@ curl -s -X POST "$GW/machine/$MID/reprovision" -H "Authorization: Bearer $TSEC" 
 wait_status "$MID" awaitingLogin || exit 1
 expect_awaiting_code "$MID" "round2b-gateway-env-still-official" || exit 1
 docker exec "$MACHINE" rm -f /etc/profile.d/zz-newapi.sh   # keep later rounds unaffected
+
+echo "== round 2c: a switched-to-official persistent Claude must survive a concurrent login =="
+# The real steady state after the newapi->official switch: provisioning only ever wrote settings.json,
+# then the switch flips ANTHROPIC_BASE_URL in that same file to official and (re)starts a long-lived
+# "student" Claude pointed at the official endpoint through the engine. Triggering a fresh login runs
+# in ITS OWN tmux session and must not tear down the already-running student. Reproduce that here.
+curl -s -X POST "$GW/machine/$MID/reprovision" -H "Authorization: Bearer $TSEC" >/dev/null
+wait_status "$MID" awaitingLogin || exit 1
+docker exec "$MACHINE" bash -lc 'python3 - <<PY
+import json,os
+p=os.path.expanduser("~/.claude/settings.json")
+d=json.load(open(p))
+d["env"]["ANTHROPIC_BASE_URL"]="https://api.anthropic.com"
+json.dump(d,open(p,"w"))
+PY
+tmux new-session -d -s student "PATH=\$HOME/.local/bin:\$PATH claude || true; exec sleep infinity"'
+sleep 3
+docker exec "$MACHINE" tmux has-session -t student 2>/dev/null ||
+  { echo "FAIL: persistent student Claude did not start"; exit 1; }
+expect_awaiting_code "$MID" "round2c-persistent-official-claude-survives" || exit 1
+docker exec "$MACHINE" tmux has-session -t student 2>/dev/null ||
+  { echo "FAIL: the login flow killed the running student Claude session"; exit 1; }
+echo "PASS round2c: persistent Claude survived the login"
+docker exec "$MACHINE" tmux kill-session -t student 2>/dev/null || true
 
 echo "== round 3: engine restart self-heal (lazy session fetch, NO reprovision) =="
 # The engine keeps sessions in memory; restarting wipes them. Without on-demand refetch a machine

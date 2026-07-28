@@ -603,23 +603,14 @@ def handle_client(cs):
             client_tls.settimeout(120)
             handle_mitm(client_tls, host, port, sess, user)
         else:
-            # Non-MITM domains (or unauthenticated) — plain tunnel through the account proxy if we
-            # know the session, else direct.
+            # Anything we don't MITM (non-Anthropic domains, or unauthenticated) tunnels DIRECT — it
+            # must NOT go through the session's account egress proxy. Only the machine's Anthropic API
+            # traffic uses that egress (for IP consistency with the manual login); routing e.g. a
+            # third-party gateway (newapi) through it would break connectivity to hosts that egress
+            # can't reach, and that egress is a scarce, bandwidth-limited resource meant only for the
+            # precise MITM path.
             cs.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            proxy = sess.account_proxy if sess else None
-            if proxy:
-                p = proxy.split("://", 1)[-1]
-                ph, pp = p.split(":")
-                up = socket.create_connection((ph, int(pp)), timeout=30)
-                up.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode())
-                resp = b""
-                while b"\r\n\r\n" not in resp:
-                    chunk = up.recv(4096)
-                    if not chunk:
-                        return
-                    resp += chunk
-            else:
-                up = socket.create_connection((host, port), timeout=30)
+            up = socket.create_connection((host, port), timeout=30)
             tunnel(cs, up)
     except Exception as e:
         log(f"client: {str(e)[:100]}")

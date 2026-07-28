@@ -1,9 +1,12 @@
 /*
  *  Description: The SSH side of a machine's provisioning — every method is @Async and lands a
- *               terminal status. provision() waits for SSH, installs the MITM CA cert into the
- *               machine's trust store, points its HTTPS_PROXY at the proxy-engine with this
- *               machine's own proxy-auth, registers the session with the engine, and lands
- *               AWAITING_LOGIN (or ERROR).
+ *               terminal status. provision() waits for SSH, then writes ONE file — the login user's
+ *               ~/.claude/settings.json — whose `env` block points Claude Code's HTTPS_PROXY at the
+ *               proxy-engine (with this machine's own proxy-auth) and its NODE_EXTRA_CA_CERTS at the
+ *               MITM CA we drop alongside it. settings.json's env overrides shell/system env and is
+ *               read by every Claude process this user starts, so only Claude's traffic is proxied —
+ *               no system-wide env files, no CA trust-store install, no sudo. Then it registers the
+ *               session with the engine and lands AWAITING_LOGIN (or ERROR).
  *
  *  Author(s):
  *      Nictheboy Li    <nictheboy@outlook.com>
@@ -55,15 +58,15 @@ class MachineProvisioner(
             val tmp = File.createTempFile("ccproxy-init-", ".sh")
             try {
                 tmp.writeText(script)
-                // Already root over SSH → no sudo (and minimal images often lack it); otherwise
-                // escalate.
-                val runner = if (machine.sshUser == "root") "bash -s" else "sudo bash -s"
+                // Everything lands under the login user's own ~/.claude — no root, no sudo (minimal
+                // images often lack it anyway). Run the script as that user so $HOME resolves to
+                // it.
                 operatorSsh.runScript(
                     machine.sshUser,
                     host,
                     machine.sshPort,
                     tmp,
-                    runner,
+                    "bash -s",
                     timeoutSeconds = 120,
                 )
             } finally {
@@ -110,32 +113,22 @@ class MachineProvisioner(
     }
 
     private fun provisionScript(caPem: String, httpsProxyUrl: String): String {
-        // base64 the PEM onto a single line: a heredoc here would break under trimIndent (the PEM's
-        // own lines sit at column 0, so nothing is stripped and the closing delimiter keeps its
-        // indent, so the heredoc never terminates and the cert is written as garbage).
+        // base64 the PEM onto a single line: it's decoded into the CA file on the machine. (A
+        // heredoc
+        // would break under trimIndent — the PEM's own lines sit at column 0, so the closing
+        // delimiter keeps its indent and the heredoc never terminates.)
         val caB64 = Base64.getEncoder().encodeToString(caPem.toByteArray())
+        // Write the CA and a single-line settings.json (avoids any heredoc/indent pitfalls). The
+        // proxy URL is inlined single-quoted — it never contains a quote (user is m<id>, password
+        // is
+        // [A-Za-z0-9]); the CA path uses the runtime ${'$'}HOME so it works for root and non-root.
+        // ${'$'} is the shell's $ (Kotlin interpolates $httpsProxyUrl / $caB64 only).
         return """
         set -euo pipefail
-        echo "$caB64" | base64 -d > /usr/local/share/ca-certificates/ccproxy-ca.crt
-        update-ca-certificates
-        # Route HTTPS at the proxy-engine and point Node/Claude Code at our CA. /etc/environment is
-        # read by PAM (interactive ssh/login) only; a process started by a bash LOGIN shell — e.g. an
-        # agent runner doing `bash -lc "... claude"` — does NOT read it. So ALSO drop a profile.d
-        # script, which /etc/profile sources for every login shell, or such a Claude Code would run
-        # with no proxy, send its (fake) ccproxy token straight to the real API, and get logged out.
-        grep -q '^HTTPS_PROXY=' /etc/environment && sed -i '/^HTTPS_PROXY=/d' /etc/environment || true
-        grep -q '^HTTP_PROXY=' /etc/environment && sed -i '/^HTTP_PROXY=/d' /etc/environment || true
-        echo "HTTPS_PROXY=$httpsProxyUrl" >> /etc/environment
-        echo "HTTP_PROXY=$httpsProxyUrl" >> /etc/environment
-        echo "https_proxy=$httpsProxyUrl" >> /etc/environment
-        echo "http_proxy=$httpsProxyUrl" >> /etc/environment
-        grep -q '^NODE_EXTRA_CA_CERTS=' /etc/environment && sed -i '/^NODE_EXTRA_CA_CERTS=/d' /etc/environment || true
-        echo "NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/ccproxy-ca.crt" >> /etc/environment
-        echo "export HTTPS_PROXY=$httpsProxyUrl" > /etc/profile.d/ccproxy-proxy.sh
-        echo "export HTTP_PROXY=$httpsProxyUrl" >> /etc/profile.d/ccproxy-proxy.sh
-        echo "export https_proxy=$httpsProxyUrl" >> /etc/profile.d/ccproxy-proxy.sh
-        echo "export http_proxy=$httpsProxyUrl" >> /etc/profile.d/ccproxy-proxy.sh
-        echo "export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/ccproxy-ca.crt" >> /etc/profile.d/ccproxy-proxy.sh
+        D="${'$'}HOME/.claude"
+        mkdir -p "${'$'}D"
+        echo '$caB64' | base64 -d > "${'$'}D/ccproxy-ca.crt"
+        printf '{"env":{"HTTPS_PROXY":"%s","HTTP_PROXY":"%s","NODE_EXTRA_CA_CERTS":"%s"}}\n' '$httpsProxyUrl' '$httpsProxyUrl' "${'$'}D/ccproxy-ca.crt" > "${'$'}D/settings.json"
         """
             .trimIndent()
     }
