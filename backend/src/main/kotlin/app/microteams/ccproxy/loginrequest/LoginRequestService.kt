@@ -96,6 +96,17 @@ class LoginRequestService(
         if (machine.status == MachineStatus.LOGGING_IN && machine.currentLoginRequestId != null) {
             throw ConflictError("a login for machine $machineId is already in progress")
         }
+        // Bind a subscription account at LOGIN, not at birth — a machine that never switches to
+        // official never consumes one. (The engine session is registered from these credentials in
+        // the orchestrator, which needs the bound account's egress proxy.)
+        if (machine.accountId == null) {
+            val account =
+                accountRepository.findFirstByStatusOrderByIdAsc(
+                    app.microteams.ccproxy.account.AccountStatus.ACTIVE
+                ) ?: throw ConflictError("no account available in the pool to bind")
+            machine.accountId = account.id
+            machineRepository.save(machine)
+        }
         var req =
             LoginRequest(
                 machineId = machine.id,

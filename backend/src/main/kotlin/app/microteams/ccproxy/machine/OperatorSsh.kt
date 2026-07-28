@@ -93,6 +93,10 @@ class OperatorSsh(private val config: CCProxyConfig) {
             "StrictHostKeyChecking=no",
             "-o",
             "UserKnownHostsFile=/dev/null",
+            // Suppress ssh's own "Warning: Permanently added ... known hosts" — it goes to stderr,
+            // which we merge into stdout, and would otherwise pollute output we parse (e.g. $HOME).
+            "-o",
+            "LogLevel=ERROR",
             "-o",
             "ConnectTimeout=20",
             "$user@$host",

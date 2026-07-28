@@ -12,7 +12,6 @@ package app.microteams.ccproxy.machine
 
 import app.microteams.ccproxy.account.AccountRepository
 import app.microteams.ccproxy.common.config.CCProxyConfig
-import app.microteams.ccproxy.common.error.ConflictError
 import app.microteams.ccproxy.common.helper.PageHelper
 import app.microteams.ccproxy.model.*
 import java.security.SecureRandom
@@ -46,14 +45,14 @@ class MachineService(
         m.toDTO(config.engine.proxyEndpoint, includeAccount, accountEmail(m))
 
     fun createMachine(tenantId: IdType, req: CreateMachineRequestDTO): MachineDTO {
-        val account =
-            accountRepository.findFirstByStatusOrderByIdAsc(
-                app.microteams.ccproxy.account.AccountStatus.ACTIVE
-            ) ?: throw ConflictError("no account available in the pool to bind")
+        // Birth init: NO account is bound here. MicroCloud calls this at VM creation for every
+        // machine (most of which stay on newapi forever); binding a subscription account at birth
+        // would exhaust the pool. provision() only points Claude at the engine — which tunnels this
+        // still-unregistered session straight through — so no account is consumed until login.
         var machine =
             Machine(
                 tenantId = tenantId,
-                accountId = account.id,
+                accountId = null,
                 host = req.host,
                 sshUser = req.sshUser?.takeIf { it.isNotBlank() } ?: "root",
                 sshPort = req.sshPort ?: 22,
