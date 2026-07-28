@@ -70,8 +70,18 @@ class RemoteSettings(private val operatorSsh: OperatorSsh, private val mapper: O
         writeFile(machine, "\$HOME/.claude/ccproxy-login.json", mapper.writeValueAsString(cfg))
     }
 
-    /** The login user's absolute home, resolved once over SSH (NODE_EXTRA_CA_CERTS needs it). */
-    private fun home(machine: Machine): String = run(machine, "printf %s \"\$HOME\"").trim()
+    /**
+     * The login user's absolute home, resolved once over SSH (NODE_EXTRA_CA_CERTS needs an absolute
+     * path). Defensive against any stray banner line: take the last non-blank line.
+     */
+    private fun home(machine: Machine): String =
+        run(machine, "printf '%s\\n' \"\$HOME\"")
+            .trim()
+            .lineSequence()
+            .map { it.trim() }
+            .lastOrNull {
+                it.isNotEmpty()
+            } ?: throw IllegalStateException("could not resolve \$HOME on machine ${machine.id}")
 
     private fun read(machine: Machine): ObjectNode {
         val raw =
