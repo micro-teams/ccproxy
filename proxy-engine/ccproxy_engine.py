@@ -209,6 +209,42 @@ def load_all_persisted():
         log(f"restored {n} persisted session(s)")
 
 
+def load_all_from_db():
+    """Phase 2: overlay every session from the backend DB (the source of truth). Runs after the file
+    load, so if the backend is not up yet at engine start the files already covered us and the
+    dual-write keeps the two in sync; when the DB is reachable it wins. Only non-null token fields
+    overwrite (a DB row with null tokens — e.g. a registered-but-never-logged-in machine — must not
+    wipe a good file-loaded credential). Best-effort: any failure leaves the file-loaded state."""
+    if not BACKEND_URL or not CONTROL_SECRET:
+        return
+    try:
+        req = urllib.request.Request(
+            f"{BACKEND_URL}/internal/credential/sessions",
+            headers={"X-Engine-Secret": CONTROL_SECRET},
+        )
+        rows = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    except Exception as e:
+        log(f"DB session load failed (keeping file-loaded state): {str(e)[:80]}")
+        return
+    n = 0
+    for r in rows:
+        user = r.get("proxyUser")
+        if not user:
+            continue
+        sess = REGISTRY.put(user, r.get("proxyPassword") or "", r.get("accountProxy"))
+        for src, attr in (
+            ("realAccess", "real_access"),
+            ("realRefresh", "real_refresh"),
+            ("fakeAccess", "fake_access"),
+            ("fakeRefresh", "fake_refresh"),
+            ("expiresAt", "expires_at"),
+        ):
+            if r.get(src) is not None:
+                setattr(sess, attr, r[src])
+        n += 1
+    log(f"loaded {n} session(s) from DB")
+
+
 # ── Certificate generation (per MITM domain, signed by the mounted CA) ─────────
 _cert_lock = threading.Lock()
 
@@ -792,7 +828,8 @@ def run_control():
 
 
 def main():
-    load_all_persisted()
+    load_all_persisted()  # file load first: offline-safe, keeps machines working if backend is down
+    load_all_from_db()  # then overlay from the DB (Phase 2 source of truth)
     threading.Thread(target=run_control, daemon=True).start()
     run_proxy()
 
