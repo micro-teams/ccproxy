@@ -119,7 +119,39 @@ _TOKEN_FIELDS = (
 )
 
 
+def push_credential_to_backend(user, sess):
+    """Mirror a session's tokens to the backend's Postgres store (the future single source of
+    truth). Best-effort dual-write alongside the file: a failure here never blocks the machine,
+    the file persistence still covers a restart. Same secret-guarded engine→backend channel as
+    /internal/usage."""
+    if not BACKEND_URL or not CONTROL_SECRET:
+        return
+    try:
+        payload = {
+            "proxyUser": user,
+            "proxyPassword": sess.proxy_password,
+            "accountProxy": sess.account_proxy,
+            "realAccess": sess.real_access,
+            "realRefresh": sess.real_refresh,
+            "fakeAccess": sess.fake_access,
+            "fakeRefresh": sess.fake_refresh,
+            "expiresAt": sess.expires_at,
+        }
+        req = urllib.request.Request(
+            f"{BACKEND_URL}/internal/credential/session",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "X-Engine-Secret": CONTROL_SECRET},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5).read()
+    except Exception as e:
+        log(f"credential push {user} failed: {str(e)[:80]}")
+
+
 def persist_session(user, sess):
+    # Dual-write: DB (future source of truth) + local file (current source of truth). Either alone
+    # keeps a machine working across a restart; both run so Phase 2 can flip the read side to DB.
+    push_credential_to_backend(user, sess)
     if not SESSION_DIR:
         return
     try:
