@@ -700,6 +700,30 @@ class ControlHandler(BaseHTTPRequestHandler):
             body = self._body()
             REGISTRY.put(parts[1], body.get("proxyPassword", ""), body.get("accountProxy"))
             return self._json(200, {"ok": True})
+        # /sessions/{user}/credential — inject a ready-made real OAuth token directly (the
+        # setup-token path), skipping the interactive /login code exchange. Mints a fresh fake
+        # token in the same shape the exchange would have, and returns it so the backend can write
+        # it into the machine's CLAUDE_CODE_OAUTH_TOKEN. A setup-token has no refresh_token; that is
+        # tolerated everywhere (all refresh swaps are guarded by sess.*_refresh being truthy).
+        if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "credential":
+            sess = REGISTRY.get(parts[1])
+            if not sess:
+                return self._json(404, {"error": "no session"})
+            body = self._body()
+            access = body.get("accessToken")
+            if not access:
+                return self._json(400, {"error": "accessToken required"})
+            sess.real_access = access
+            sess.real_refresh = body.get("refreshToken")
+            sess.fake_access = "sk-ant-oat01-" + secrets.token_hex(32)
+            sess.fake_refresh = (
+                "sk-ant-ort01-" + secrets.token_hex(32) if sess.real_refresh else None
+            )
+            sess.expires_at = body.get("expiresAt")
+            sess.pending = None
+            if sess.user:
+                persist_session(sess.user, sess)
+            return self._json(200, {"ok": True, "fakeAccess": sess.fake_access})
         return self._json(404, {"error": "not found"})
 
     def do_DELETE(self):
