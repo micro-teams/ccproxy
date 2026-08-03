@@ -48,12 +48,14 @@ jobs:
       - name: Upload jar
         uses: actions/upload-artifact@v7
         with:
+          retention-days: 1
           name: jar
           path: backend/target/*.jar
       # CREATE.sql is generated at build time (not versioned); ship it to package-zip via an artifact.
       - name: Upload CREATE.sql
         uses: actions/upload-artifact@v7
         with:
+          retention-days: 1
           name: create-sql
           path: backend/CREATE.sql
 
@@ -74,6 +76,7 @@ jobs:
       - name: Upload dist
         uses: actions/upload-artifact@v7
         with:
+          retention-days: 1
           name: frontend-dist
           path: frontend/dist
 
@@ -116,6 +119,7 @@ jobs:
           echo "== bundle contents =="; find "$STAGE" -maxdepth 3 -type f | sort
       - uses: actions/upload-artifact@v7
         with:
+          retention-days: 1
           name: ccproxy-deploy
           path: ccproxy-deploy
 
