@@ -49,6 +49,11 @@ DUMP_DIR = os.environ.get("CCPROXY_DUMP_DIR", "")
 # When set, each session's captured real+fake tokens are persisted here so an engine restart does not
 # lose them (otherwise every machine would have to log in again). One JSON file per proxyUser.
 SESSION_DIR = os.environ.get("CCPROXY_SESSION_DIR", "")
+# Phase 2 read-cutover flag. Off by default: the engine restores sessions from the files only, and
+# the DB is just a shadow kept current by the dual-write. Turn on (=1) once a soak confirms the DB is
+# fully backfilled and in sync, to make startup also overlay sessions from the DB. Kept behind a flag
+# so a single bundle can ship dual-write (safe, always on) without yet trusting the DB on read.
+READ_FROM_DB = os.environ.get("CCPROXY_READ_FROM_DB", "").strip().lower() not in ("", "0", "false")
 
 os.makedirs(CERTS_DIR, exist_ok=True)
 _log_lock = threading.Lock()
@@ -829,7 +834,8 @@ def run_control():
 
 def main():
     load_all_persisted()  # file load first: offline-safe, keeps machines working if backend is down
-    load_all_from_db()  # then overlay from the DB (Phase 2 source of truth)
+    if READ_FROM_DB:  # Phase 2 read-cutover, flag-gated: overlay from the DB (source of truth)
+        load_all_from_db()
     threading.Thread(target=run_control, daemon=True).start()
     run_proxy()
 
