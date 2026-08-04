@@ -39,7 +39,7 @@ MID="$(printf '%s' "$CREATE" | jqget "['id']")"
 DTOKEN="$(printf '%s' "$CREATE" | jqget "['deviceToken']")"
 CONNECTOR="$(printf '%s' "$CREATE" | jqget "['connector']")"
 [ "$CONNECTOR" = "True" ] || { echo "FAIL: machine is not connector-mode"; exit 1; }
-[ -n "$DTOKEN" ] && [ "$DTOKEN" != "None" ] || { echo "FAIL: no device token issued"; exit 1; }
+if [ -z "$DTOKEN" ] || [ "$DTOKEN" = "None" ]; then echo "FAIL: no device token issued"; exit 1; fi
 echo "machine id=$MID connector=$CONNECTOR deviceToken=${DTOKEN:0:6}…"
 
 echo "== install the connector on the machine from the served install.sh =="
