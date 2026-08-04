@@ -48,7 +48,8 @@ services:
         "ccproxy.engine.proxy-endpoint":"${ENGINE_PROXY_ENDPOINT:-proxy-engine:3128}",
         "ccproxy.engine.default-account-proxy":"http://egress-proxy:7890",
         "ccproxy.provisioning.ssh-private-key-path":"/keys/operator",
-        "ccproxy.ca.cert-path":"/keys/ca.crt"}
+        "ccproxy.ca.cert-path":"/keys/ca.crt",
+        "application.applets-dir":"/app/applets"}
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8080/actuator/health/readiness || exit 1"]
       interval: 10s
@@ -64,6 +65,9 @@ services:
       # connector/<target>/{ccproxy-connector,tmux}. A shipped, replaceable part of the bundle
       # (package-zip assembles it); matches application.connector-binaries-dir (/app/connector).
       - ./connector:/app/connector:ro
+      # The screen-driver applet (claude.js) the backend sends a connector to drive login; a shipped
+      # artifact, matches application.applets-dir (/app/applets).
+      - ./applets:/app/applets:ro
 
   proxy-engine:
     # The MITM data plane. Stock Python image, bind-mounted stdlib-only code — no custom image.

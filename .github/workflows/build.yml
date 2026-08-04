@@ -173,8 +173,34 @@ jobs:
           name: tmux-linux-${{ matrix.arch }}
           path: dist/linux-${{ matrix.arch }}
 
+  # The screen-driver applet (claude.js) the backend sends a connector to drive the login screen. It
+  # is the shared micro-connector artifact — built from that repo, not vendored here — so a Claude
+  # TUI fix reaches all three products from one place. (At release we switch this to installing the
+  # published @micro-teams/connector-applets package; until it is tagged, build from source.)
+  build-applet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build claude.js from the shared micro-connector
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/micro-teams/micro-connector.git mc
+          cd mc/applets
+          npm install
+          node build.mjs
+          test -s dist/claude.js
+          mkdir -p "$GITHUB_WORKSPACE/applet-dist"
+          cp dist/claude.js "$GITHUB_WORKSPACE/applet-dist/claude.js"
+          ls -la "$GITHUB_WORKSPACE/applet-dist"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: applets
+          path: applet-dist
+
   package-zip:
-    needs: [build-jar, build-frontend, lint, connector, build-tmux]
+    needs: [build-jar, build-frontend, lint, connector, build-tmux, build-applet]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -214,6 +240,10 @@ jobs:
               chmod +x "$CONN/linux-$arch/tmux"
             fi
           done
+          # The screen-driver applet the backend serves to a connector: a shipped artifact, mounted
+          # to the backend's application.applets-dir (/app/applets).
+          mkdir -p "$STAGE/applets"
+          cp artifacts/applets/claude.js "$STAGE/applets/claude.js"
           echo "== bundle contents =="; find "$STAGE" -maxdepth 3 -type f | sort
       - uses: actions/upload-artifact@v7
         with:
@@ -264,6 +294,9 @@ jobs:
           [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/connector/latest/linux-amd64/passwd")" = 404 ]
           [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/connector/latest/win-x86/ccproxy-connector")" = 404 ]
           echo "connector distribution OK"
+          echo "== the claude.js driver applet is mounted for the backend =="
+          docker compose exec -T backend sh -c 'test -s /app/applets/claude.js && grep -q screenReady /app/applets/claude.js'
+          echo "applet OK"
       - name: Cluster status
         if: always()
         working-directory: ccproxy-deploy
@@ -325,7 +358,7 @@ jobs:
   # in branch protection / auto-merge rules instead of listing each job.
   ci-success:
     name: CI success
-    needs: [build-jar, build-frontend, lint, connector, build-tmux, package-zip, test-compose, machine-login-compat]
+    needs: [build-jar, build-frontend, lint, connector, build-tmux, build-applet, package-zip, test-compose, machine-login-compat]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All required CI jobs passed."
