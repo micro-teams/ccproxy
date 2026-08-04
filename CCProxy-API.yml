@@ -317,6 +317,35 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
 
+  /account/{id}/setup-token:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    get:
+      tags: [account]
+      operationId: getAccountSetupToken
+      summary: Whether this account has a setup-token + its expiry (never returns the token itself)
+      security: [{ superAdmin: [] }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/SetupTokenStatus" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [account]
+      operationId: setAccountSetupToken
+      summary: Set/replace this account's OAuth setup-token — machines then activate without /login
+      security: [{ superAdmin: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SetSetupTokenRequest" } } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/SetupTokenStatus" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [account]
+      operationId: deleteAccountSetupToken
+      summary: Clear this account's setup-token (future logins revert to interactive /login)
+      security: [{ superAdmin: [] }]
+      responses:
+        "204": { description: No Content }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   # =====================================================================
   # PROVISIONING HELPERS (tenant-readable)
   # =====================================================================
@@ -810,6 +839,19 @@ components:
         items: { type: array, items: { $ref: "#/components/schemas/Account" } }
         page: { $ref: "#/components/schemas/Page" }
       required: [items, page]
+    SetSetupTokenRequest:
+      type: object
+      description: A long-lived OAuth token from `claude setup-token` (sk-ant-oat01-...), minted OUTSIDE ccproxy. Stored server-side; used to activate machines without an interactive /login.
+      properties:
+        oauthToken: { type: string }
+      required: [oauthToken]
+    SetupTokenStatus:
+      type: object
+      description: Non-secret status of an account's setup-token (never the token itself).
+      properties:
+        present: { type: boolean }
+        expiresAt: { type: integer, format: int64, nullable: true, description: "epoch seconds if known" }
+      required: [present]
 
     # ---- Provisioning helpers ----
     SshPubkeyResponse:

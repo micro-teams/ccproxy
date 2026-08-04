@@ -14,6 +14,8 @@ package app.microteams.ccproxy.loginrequest
 import app.microteams.ccproxy.account.AccountRepository
 import app.microteams.ccproxy.common.error.ConflictError
 import app.microteams.ccproxy.common.helper.PageHelper
+import app.microteams.ccproxy.credential.CredentialRepository
+import app.microteams.ccproxy.credential.CredentialScope
 import app.microteams.ccproxy.machine.MachineRepository
 import app.microteams.ccproxy.machine.MachineStatus
 import app.microteams.ccproxy.machine.OperatorSsh
@@ -56,6 +58,7 @@ class LoginRequestService(
     private val accountRepository: AccountRepository,
     private val orchestrator: LoginOrchestrator,
     private val operatorSsh: OperatorSsh,
+    private val credentialRepository: CredentialRepository,
 ) {
     private val rng = SecureRandom()
 
@@ -118,7 +121,17 @@ class LoginRequestService(
         machine.status = MachineStatus.LOGGING_IN
         machine.currentLoginRequestId = req.id
         machineRepository.save(machine)
-        orchestrator.prepare(req.id!!)
+        // If the bound account carries a setup-token, activate directly (no interactive /login);
+        // otherwise drive the OAuth flow through the operator as usual.
+        val hasSetupToken =
+            credentialRepository
+                .findByScopeAndCredKey(CredentialScope.ACCOUNT, machine.accountId.toString())
+                ?.setupToken != null
+        if (hasSetupToken) {
+            orchestrator.prepareViaSetupToken(req.id!!)
+        } else {
+            orchestrator.prepare(req.id!!)
+        }
         return toDTO(req)
     }
 
