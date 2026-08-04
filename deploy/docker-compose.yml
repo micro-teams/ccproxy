@@ -59,6 +59,11 @@ services:
       - ./backend/backend.jar:/app/backend.jar:ro
       # Operator SSH keys + MITM CA (gen-env.sh creates ./keys/).
       - ./keys:/keys:ro
+      # The connector distribution the backend serves at /connector/latest/<target>/<artifact>:
+      # the cross-compiled ccproxy-connector binaries + static tmux, laid out as
+      # connector/<target>/{ccproxy-connector,tmux}. A shipped, replaceable part of the bundle
+      # (package-zip assembles it); matches application.connector-binaries-dir (/app/connector).
+      - ./connector:/app/connector:ro
 
   proxy-engine:
     # The MITM data plane. Stock Python image, bind-mounted stdlib-only code — no custom image.
