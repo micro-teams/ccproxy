@@ -209,7 +209,7 @@ function AdminPanels({ tab, token }: { tab: string; token: string }) {
     return (
       <ResourcePanel
         title="Account pool"
-        description="Anthropic identities + egress. No tokens stored (login is per-machine). Internal — tenants never see this."
+        description="Anthropic identities + egress. Internal — tenants never see this. An account may optionally carry a setup-token (a `claude setup-token` OAuth token, minted OUTSIDE ccproxy): if set, its machines activate without an interactive /login. The token is write-only — it is never shown again; setup-token? only reports whether one is present + its expiry."
         columns={[
           { key: "id", label: "id" },
           { key: "email", label: "email" },
@@ -233,6 +233,26 @@ function AdminPanels({ tab, token }: { tab: string; token: string }) {
                 token,
                 body: { status: r.status === "active" ? "disabled" : "active" },
               }),
+          },
+          {
+            label: "setup-token?",
+            run: (r) => request("GET", `/account/${r.id}/setup-token`, { token }),
+          },
+          {
+            label: "set setup-token",
+            run: (r) => {
+              const t = window.prompt(
+                `Paste the setup-token for account ${r.email} (sk-ant-oat01-…, minted OUTSIDE ccproxy via \`claude setup-token\`). It is stored write-only.`,
+              );
+              const oauthToken = t?.trim();
+              if (!oauthToken) return Promise.resolve(null);
+              return request("PUT", `/account/${r.id}/setup-token`, { token, body: { oauthToken } });
+            },
+          },
+          {
+            label: "clear setup-token",
+            confirm: "clear this account's setup-token? Future logins revert to interactive /login.",
+            run: (r) => request("DELETE", `/account/${r.id}/setup-token`, { token }),
           },
           {
             label: "delete",
