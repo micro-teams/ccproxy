@@ -1,0 +1,4 @@
+# Build output — binaries are produced by CI and served by the control plane, never committed.
+/dist/
+/ccproxy-connector
+/connector
