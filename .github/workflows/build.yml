@@ -245,18 +245,21 @@ jobs:
       - name: Connector distribution is served through the gateway
         working-directory: ccproxy-deploy
         run: |
-          set -euo pipefail
+          set -eu
           PORT="$(grep -E '^NGINX_HTTP_PORT=' .env | cut -d= -f2 || true)"; PORT="${PORT:-80}"
           BASE="http://localhost:$PORT/ccproxy"
           echo "== install.sh (origin baked from the request) =="
           curl -fsS "$BASE/install.sh" -o /tmp/install.sh
           grep -q "connector/latest" /tmp/install.sh
-          ! grep -q "__CONNECTOR_BASE__" /tmp/install.sh   # placeholders were replaced
-          grep -qF "$BASE" /tmp/install.sh                 # and with this request's origin+prefix
+          # Placeholders were replaced with this request's origin + the /ccproxy prefix. curl drops a
+          # default :80 from the Host header, so match the host port-agnostically.
+          ! grep -q "__CONNECTOR_BASE__" /tmp/install.sh
+          grep -qE 'CCPROXY_CONNECTOR_BASE:-https?://localhost(:[0-9]+)?/ccproxy' /tmp/install.sh
           echo "== a published binary downloads and is an ELF =="
           curl -fsS "$BASE/connector/latest/linux-amd64/ccproxy-connector" -o /tmp/ccproxy-connector
           test -s /tmp/ccproxy-connector
-          head -c4 /tmp/ccproxy-connector | od -An -tx1 | tr -d ' \n' | grep -qi "7f454c46"  # ELF magic
+          magic="$(head -c4 /tmp/ccproxy-connector | od -An -tx1 | tr -d ' \n')"
+          case "$magic" in 7f454c46*) ;; *) echo "not an ELF (magic=$magic)"; exit 1 ;; esac
           echo "== unknown target / off-allowlist artifact is a 404 =="
           [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/connector/latest/linux-amd64/passwd")" = 404 ]
           [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/connector/latest/win-x86/ccproxy-connector")" = 404 ]
