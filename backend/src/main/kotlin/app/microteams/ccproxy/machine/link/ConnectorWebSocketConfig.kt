@@ -5,6 +5,11 @@
  *               the session — so origin checking is not relied on (a dial-out connector has no
  *               meaningful browser Origin).
  *
+ *               Registered as a raw SimpleUrlHandlerMapping at order -1 (consulted BEFORE the MVC
+ *               DispatcherServlet's mappings), not via @EnableWebSocket: the annotation's mapping
+ *               orders after RequestMappingHandlerMapping, so /machine/link would otherwise be
+ *               swallowed by MVC and the upgrade rejected. This mirrors the proven MicroTeams setup.
+ *
  *  Author(s):
  *      Nictheboy Li    <nictheboy@outlook.com>
  *
@@ -14,26 +19,41 @@ package app.microteams.ccproxy.machine.link
 
 import app.microteams.ccproxy.machine.MachineService
 import org.slf4j.LoggerFactory
+import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import org.springframework.http.server.ServerHttpRequest
 import org.springframework.http.server.ServerHttpResponse
+import org.springframework.web.HttpRequestHandler
+import org.springframework.web.servlet.HandlerMapping
+import org.springframework.web.servlet.handler.SimpleUrlHandlerMapping
 import org.springframework.web.socket.WebSocketHandler
-import org.springframework.web.socket.config.annotation.EnableWebSocket
-import org.springframework.web.socket.config.annotation.WebSocketConfigurer
-import org.springframework.web.socket.config.annotation.WebSocketHandlerRegistry
 import org.springframework.web.socket.server.HandshakeInterceptor
+import org.springframework.web.socket.server.support.WebSocketHttpRequestHandler
 
 @Configuration
-@EnableWebSocket
-class ConnectorWebSocketConfig(
-    private val linkHandler: LinkHandler,
-    private val machineService: MachineService,
-) : WebSocketConfigurer {
-    override fun registerWebSocketHandlers(registry: WebSocketHandlerRegistry) {
-        registry
-            .addHandler(linkHandler, "/machine/link")
-            .addInterceptors(MachineHandshakeInterceptor(machineService))
-            .setAllowedOrigins("*")
+class ConnectorWebSocketConfig {
+
+    @Bean
+    fun connectorWsRequestHandler(
+        linkHandler: LinkHandler,
+        machineService: MachineService,
+    ): WebSocketHttpRequestHandler {
+        val requestHandler = WebSocketHttpRequestHandler(linkHandler)
+        requestHandler.handshakeInterceptors.add(MachineHandshakeInterceptor(machineService))
+        return requestHandler
+    }
+
+    @Bean
+    fun connectorWsHandlerMapping(
+        connectorWsRequestHandler: WebSocketHttpRequestHandler
+    ): HandlerMapping {
+        val mapping = SimpleUrlHandlerMapping()
+        // Consulted before the DispatcherServlet's own mappings, so the upgrade reaches the WS
+        // handler instead of falling into MVC.
+        mapping.order = -1
+        mapping.urlMap =
+            mapOf<String, HttpRequestHandler>("/machine/link" to connectorWsRequestHandler)
+        return mapping
     }
 }
 
