@@ -14,6 +14,8 @@ package app.microteams.ccproxy.loginrequest
 
 import app.microteams.ccproxy.account.AccountRepository
 import app.microteams.ccproxy.common.config.CCProxyConfig
+import app.microteams.ccproxy.credential.CredentialRepository
+import app.microteams.ccproxy.credential.CredentialScope
 import app.microteams.ccproxy.machine.EngineClient
 import app.microteams.ccproxy.machine.Machine
 import app.microteams.ccproxy.machine.MachineRepository
@@ -35,6 +37,7 @@ class LoginOrchestrator(
     private val operatorSsh: OperatorSsh,
     private val engineClient: EngineClient,
     private val remoteSettings: RemoteSettings,
+    private val credentialRepository: CredentialRepository,
 ) {
     private val log = LoggerFactory.getLogger(LoginOrchestrator::class.java)
     // Temp settings file we drop for the login Claude only — forces the official endpoint + engine
@@ -101,6 +104,70 @@ class LoginOrchestrator(
             log.info("login-request {} awaiting code (machine {})", req.id, machine.id)
         } catch (e: Exception) {
             log.warn("login-request {} prepare failed: {}", loginRequestId, e.message)
+            failRequest(req, machine, e.message)
+        }
+    }
+
+    /**
+     * The setup-token fast path: when the bound account carries a setup-token, skip the interactive
+     * /login entirely. Register the engine session, inject the account's setup-token as its real
+     * credential (the engine mints a fake), plant that fake as the machine's
+     * CLAUDE_CODE_OAUTH_TOKEN while switching off newapi, mark onboarding complete, and flip the
+     * machine to READY — no tmux, no OAuth URL, no operator code.
+     */
+    @Async
+    @Transactional
+    fun prepareViaSetupToken(loginRequestId: Long) {
+        val req =
+            awaitRow { loginRequestRepository.findById(loginRequestId).orElse(null) } ?: return
+        val machine = machineRepository.findById(req.machineId!!).orElse(null) ?: return
+        try {
+            val accountId =
+                machine.accountId
+                    ?: throw IllegalStateException("machine ${machine.id} has no bound account")
+            val account =
+                accountRepository.findById(accountId).orElse(null)
+                    ?: throw IllegalStateException("bound account $accountId not found")
+            val cred =
+                credentialRepository.findByScopeAndCredKey(
+                    CredentialScope.ACCOUNT,
+                    accountId.toString(),
+                )
+            val setupToken =
+                cred?.setupToken
+                    ?: throw IllegalStateException("account $accountId has no setup-token")
+
+            // The engine needs a registered session before a credential can be injected into it.
+            engineClient.registerSession(
+                machine.proxyUser!!,
+                machine.proxyPassword!!,
+                account.proxy!!,
+            )
+            val fakeToken =
+                engineClient.setCredential(machine.proxyUser!!, setupToken, cred.expiresAt)
+
+            remoteSettings.activateWithOauthToken(machine, fakeToken)
+            markOnboardingComplete(machine)
+
+            machine.hasCredential = true
+            machine.credentialExpiresAt = cred.expiresAt
+            machine.status = MachineStatus.READY
+            machine.currentLoginRequestId = null
+            machineRepository.save(machine)
+
+            req.status = LoginRequestStatus.COMPLETED
+            loginRequestRepository.save(req)
+            log.info(
+                "login-request {} completed via setup-token (machine {} ready)",
+                req.id,
+                machine.id,
+            )
+        } catch (e: Exception) {
+            log.warn(
+                "login-request {} setup-token activation failed: {}",
+                loginRequestId,
+                e.message,
+            )
             failRequest(req, machine, e.message)
         }
     }

@@ -11,6 +11,9 @@ package app.microteams.ccproxy.account
 
 import app.microteams.ccproxy.common.config.CCProxyConfig
 import app.microteams.ccproxy.common.helper.PageHelper
+import app.microteams.ccproxy.credential.Credential
+import app.microteams.ccproxy.credential.CredentialRepository
+import app.microteams.ccproxy.credential.CredentialScope
 import app.microteams.ccproxy.machine.MachineRepository
 import app.microteams.ccproxy.model.*
 import java.time.LocalDateTime
@@ -38,6 +41,7 @@ class AccountService(
     private val repository: AccountRepository,
     private val machineRepository: MachineRepository,
     private val config: CCProxyConfig,
+    private val credentialRepository: CredentialRepository,
 ) {
     fun get(id: IdType): Account =
         repository.findById(id).orElseThrow { NotFoundError("account", id) }
@@ -105,4 +109,30 @@ class AccountService(
     /** Internal: pick an active account to bind a new machine to. Null if the pool is empty. */
     fun pickActiveForBinding(): Account? =
         repository.findFirstByStatusOrderByIdAsc(AccountStatus.ACTIVE)
+
+    // ── Setup-token (no-/login activation) — the token itself is never returned ──
+
+    private fun accountCredential(id: IdType) =
+        credentialRepository.findByScopeAndCredKey(CredentialScope.ACCOUNT, id.toString())
+
+    fun getSetupTokenStatus(id: IdType): SetupTokenStatusDTO {
+        get(id) // 404 if the account doesn't exist
+        val cred = accountCredential(id)
+        return SetupTokenStatusDTO(present = cred?.setupToken != null, expiresAt = cred?.expiresAt)
+    }
+
+    fun setSetupToken(id: IdType, req: SetSetupTokenRequestDTO): SetupTokenStatusDTO {
+        get(id)
+        val row =
+            accountCredential(id)
+                ?: Credential(scope = CredentialScope.ACCOUNT, credKey = id.toString())
+        row.setupToken = req.oauthToken
+        credentialRepository.save(row)
+        return SetupTokenStatusDTO(present = true, expiresAt = row.expiresAt)
+    }
+
+    fun deleteSetupToken(id: IdType) {
+        get(id)
+        accountCredential(id)?.let { credentialRepository.delete(it) }
+    }
 }

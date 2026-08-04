@@ -60,6 +60,23 @@ class EngineClient(private val config: CCProxyConfig, private val mapper: Object
         return mapper.readValue(body, LoginResult::class.java)
     }
 
+    /**
+     * Inject a ready-made real OAuth token (from `claude setup-token`) as this session's
+     * credential, skipping the interactive /login code exchange. The engine stores it as the real
+     * token, mints a fake token in the same shape a login would have, and returns that fake — which
+     * the backend then writes into the machine's CLAUDE_CODE_OAUTH_TOKEN. A setup-token has no
+     * refresh_token; that is tolerated engine-side.
+     */
+    fun setCredential(proxyUser: String, accessToken: String, expiresAt: Long?): String {
+        val body =
+            send(
+                "PUT",
+                "/sessions/$proxyUser/credential",
+                mapOf("accessToken" to accessToken, "expiresAt" to expiresAt),
+            )
+        return mapper.readTree(body).get("fakeAccess").asText()
+    }
+
     private fun send(method: String, path: String, body: Any?): String {
         val builder =
             HttpRequest.newBuilder()

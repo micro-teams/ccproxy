@@ -54,4 +54,24 @@ class AccountController(private val service: AccountService) : AccountApi {
         service.delete(id)
         return ResponseEntity(HttpStatus.NO_CONTENT)
     }
+
+    @Guard("get-account", "account")
+    override fun getAccountSetupToken(
+        @PathVariable("id") @ResourceId id: IdType
+    ): ResponseEntity<SetupTokenStatusDTO> = ResponseEntity.ok(service.getSetupTokenStatus(id))
+
+    @Guard("update-account", "account")
+    override fun setAccountSetupToken(
+        @PathVariable("id") @ResourceId id: IdType,
+        @RequestBody setSetupTokenRequestDTO: SetSetupTokenRequestDTO,
+    ): ResponseEntity<SetupTokenStatusDTO> =
+        ResponseEntity.ok(service.setSetupToken(id, setSetupTokenRequestDTO))
+
+    @Guard("update-account", "account")
+    override fun deleteAccountSetupToken(
+        @PathVariable("id") @ResourceId id: IdType
+    ): ResponseEntity<Unit> {
+        service.deleteSetupToken(id)
+        return ResponseEntity(HttpStatus.NO_CONTENT)
+    }
 }

@@ -52,6 +52,21 @@ class RemoteSettings(private val operatorSsh: OperatorSsh, private val mapper: O
     }
 
     /**
+     * Setup-token activation: switch the machine to official (drop the newapi override keys) and
+     * plant the (fake) OAuth token as CLAUDE_CODE_OAUTH_TOKEN in one atomic settings.json write.
+     * The machine's Claude Code then authenticates through the engine without an interactive /login
+     * — the engine swaps this fake for the account's real setup-token. Preserves every other key.
+     */
+    fun activateWithOauthToken(machine: Machine, oauthToken: String) {
+        val cfg = read(machine)
+        val env = envOf(cfg)
+        env.remove(listOf("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"))
+        env.put("CLAUDE_CODE_OAUTH_TOKEN", oauthToken)
+        cfg.replace("env", env)
+        writeSettings(machine, cfg)
+    }
+
+    /**
      * Write the login-only settings file (~/.claude/ccproxy-login.json) that forces the official
      * endpoint + engine proxy + CA and blanks any gateway token — passed to `claude --settings` so
      * the login Claude runs official-via-OAuth without touching the machine's real settings.json.
