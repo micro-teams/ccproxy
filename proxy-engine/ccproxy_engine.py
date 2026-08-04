@@ -49,6 +49,11 @@ DUMP_DIR = os.environ.get("CCPROXY_DUMP_DIR", "")
 # When set, each session's captured real+fake tokens are persisted here so an engine restart does not
 # lose them (otherwise every machine would have to log in again). One JSON file per proxyUser.
 SESSION_DIR = os.environ.get("CCPROXY_SESSION_DIR", "")
+# Phase 2 read-cutover flag. Off by default: the engine restores sessions from the files only, and
+# the DB is just a shadow kept current by the dual-write. Turn on (=1) once a soak confirms the DB is
+# fully backfilled and in sync, to make startup also overlay sessions from the DB. Kept behind a flag
+# so a single bundle can ship dual-write (safe, always on) without yet trusting the DB on read.
+READ_FROM_DB = os.environ.get("CCPROXY_READ_FROM_DB", "").strip().lower() not in ("", "0", "false")
 
 os.makedirs(CERTS_DIR, exist_ok=True)
 _log_lock = threading.Lock()
@@ -119,7 +124,39 @@ _TOKEN_FIELDS = (
 )
 
 
+def push_credential_to_backend(user, sess):
+    """Mirror a session's tokens to the backend's Postgres store (the future single source of
+    truth). Best-effort dual-write alongside the file: a failure here never blocks the machine,
+    the file persistence still covers a restart. Same secret-guarded engine→backend channel as
+    /internal/usage."""
+    if not BACKEND_URL or not CONTROL_SECRET:
+        return
+    try:
+        payload = {
+            "proxyUser": user,
+            "proxyPassword": sess.proxy_password,
+            "accountProxy": sess.account_proxy,
+            "realAccess": sess.real_access,
+            "realRefresh": sess.real_refresh,
+            "fakeAccess": sess.fake_access,
+            "fakeRefresh": sess.fake_refresh,
+            "expiresAt": sess.expires_at,
+        }
+        req = urllib.request.Request(
+            f"{BACKEND_URL}/internal/credential/session",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "X-Engine-Secret": CONTROL_SECRET},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5).read()
+    except Exception as e:
+        log(f"credential push {user} failed: {str(e)[:80]}")
+
+
 def persist_session(user, sess):
+    # Dual-write: DB (future source of truth) + local file (current source of truth). Either alone
+    # keeps a machine working across a restart; both run so Phase 2 can flip the read side to DB.
+    push_credential_to_backend(user, sess)
     if not SESSION_DIR:
         return
     try:
@@ -175,6 +212,42 @@ def load_all_persisted():
             log(f"restore session {user} failed: {str(e)[:80]}")
     if n:
         log(f"restored {n} persisted session(s)")
+
+
+def load_all_from_db():
+    """Phase 2: overlay every session from the backend DB (the source of truth). Runs after the file
+    load, so if the backend is not up yet at engine start the files already covered us and the
+    dual-write keeps the two in sync; when the DB is reachable it wins. Only non-null token fields
+    overwrite (a DB row with null tokens — e.g. a registered-but-never-logged-in machine — must not
+    wipe a good file-loaded credential). Best-effort: any failure leaves the file-loaded state."""
+    if not BACKEND_URL or not CONTROL_SECRET:
+        return
+    try:
+        req = urllib.request.Request(
+            f"{BACKEND_URL}/internal/credential/sessions",
+            headers={"X-Engine-Secret": CONTROL_SECRET},
+        )
+        rows = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    except Exception as e:
+        log(f"DB session load failed (keeping file-loaded state): {str(e)[:80]}")
+        return
+    n = 0
+    for r in rows:
+        user = r.get("proxyUser")
+        if not user:
+            continue
+        sess = REGISTRY.put(user, r.get("proxyPassword") or "", r.get("accountProxy"))
+        for src, attr in (
+            ("realAccess", "real_access"),
+            ("realRefresh", "real_refresh"),
+            ("fakeAccess", "fake_access"),
+            ("fakeRefresh", "fake_refresh"),
+            ("expiresAt", "expires_at"),
+        ):
+            if r.get(src) is not None:
+                setattr(sess, attr, r[src])
+        n += 1
+    log(f"loaded {n} session(s) from DB")
 
 
 # ── Certificate generation (per MITM domain, signed by the mounted CA) ─────────
@@ -700,6 +773,30 @@ class ControlHandler(BaseHTTPRequestHandler):
             body = self._body()
             REGISTRY.put(parts[1], body.get("proxyPassword", ""), body.get("accountProxy"))
             return self._json(200, {"ok": True})
+        # /sessions/{user}/credential — inject a ready-made real OAuth token directly (the
+        # setup-token path), skipping the interactive /login code exchange. Mints a fresh fake
+        # token in the same shape the exchange would have, and returns it so the backend can write
+        # it into the machine's CLAUDE_CODE_OAUTH_TOKEN. A setup-token has no refresh_token; that is
+        # tolerated everywhere (all refresh swaps are guarded by sess.*_refresh being truthy).
+        if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "credential":
+            sess = REGISTRY.get(parts[1])
+            if not sess:
+                return self._json(404, {"error": "no session"})
+            body = self._body()
+            access = body.get("accessToken")
+            if not access:
+                return self._json(400, {"error": "accessToken required"})
+            sess.real_access = access
+            sess.real_refresh = body.get("refreshToken")
+            sess.fake_access = "sk-ant-oat01-" + secrets.token_hex(32)
+            sess.fake_refresh = (
+                "sk-ant-ort01-" + secrets.token_hex(32) if sess.real_refresh else None
+            )
+            sess.expires_at = body.get("expiresAt")
+            sess.pending = None
+            if sess.user:
+                persist_session(sess.user, sess)
+            return self._json(200, {"ok": True, "fakeAccess": sess.fake_access})
         return self._json(404, {"error": "not found"})
 
     def do_DELETE(self):
@@ -736,7 +833,9 @@ def run_control():
 
 
 def main():
-    load_all_persisted()
+    load_all_persisted()  # file load first: offline-safe, keeps machines working if backend is down
+    if READ_FROM_DB:  # Phase 2 read-cutover, flag-gated: overlay from the DB (source of truth)
+        load_all_from_db()
     threading.Thread(target=run_control, daemon=True).start()
     run_proxy()
 
