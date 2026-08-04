@@ -52,14 +52,42 @@ class MachineController(
     @Guard("create-machine", "machine")
     override fun createMachine(
         @RequestBody createMachineRequestDTO: CreateMachineRequestDTO
-    ): ResponseEntity<MachineDTO> =
-        ResponseEntity.status(HttpStatus.CREATED)
-            .body(
-                machineService.createMachine(
-                    authenticationService.getCurrentUserId(),
-                    createMachineRequestDTO,
-                )
+    ): ResponseEntity<MachineDTO> {
+        val created =
+            machineService.createMachine(
+                authenticationService.getCurrentUserId(),
+                createMachineRequestDTO,
             )
+        // For a connector-mode machine, hand back the exact one-line command to install + connect
+        // it,
+        // with the base derived from this request's origin (correct behind any proxy).
+        val withCmd =
+            if (created.connector == true && created.deviceToken != null) {
+                val base = currentOrigin() + "/ccproxy"
+                created.copy(
+                    installCommand =
+                        "curl -fsSL $base/install.sh | sh && " +
+                            "ccproxy-connector connect $base --token ${created.deviceToken}"
+                )
+            } else {
+                created
+            }
+        return ResponseEntity.status(HttpStatus.CREATED).body(withCmd)
+    }
+
+    /**
+     * The forwarded-header origin (scheme://host), the same derivation the rest of the backend
+     * uses.
+     */
+    private fun currentOrigin(): String {
+        val req =
+            (org.springframework.web.context.request.RequestContextHolder.currentRequestAttributes()
+                    as org.springframework.web.context.request.ServletRequestAttributes)
+                .request
+        val proto = req.getHeader("X-Forwarded-Proto") ?: req.scheme
+        val host = req.getHeader("X-Forwarded-Host") ?: req.getHeader("Host")
+        return "$proto://$host"
+    }
 
     @Guard("list-machine", "machine")
     override fun listMachines(

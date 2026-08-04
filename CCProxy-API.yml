@@ -899,18 +899,33 @@ components:
         currentLoginRequestId: { type: integer, format: int64, nullable: true, description: "an in-flight login, if any" }
         lastUsedAt: { type: string, format: date-time, nullable: true }
         createdAt: { type: string, format: date-time, nullable: true }
+        connector: { type: boolean, description: "connector-mode (dial-out) machine, not SSH-provisioned" }
+        online: { type: boolean, description: "connector-mode: whether the connector is currently dialed in" }
+        deviceToken:
+          type: string
+          nullable: true
+          description: >-
+            connector-mode credential the machine presents to dial in (`ccproxy-connector connect
+            --token <deviceToken>`). Returned to the owning tenant so it can connect the machine.
+        installCommand:
+          type: string
+          nullable: true
+          description: "connector-mode: the one-line install + connect command for this machine (create response only)"
         # INTERNAL — populated only for super-admin callers; never returned to tenants.
         boundAccountId: { type: integer, format: int64, nullable: true, description: "internal; super-admin only" }
         boundAccountEmail: { type: string, nullable: true, description: "internal; super-admin only" }
-      required: [id, tenantId, host, status, caCertInstalled, hasCredential]
+      required: [id, tenantId, status, caCertInstalled, hasCredential, connector, online]
     CreateMachineRequest:
       type: object
+      description: >-
+        Omit `host` for a connector-mode machine: it is not SSHed into; instead the response carries a
+        `deviceToken` the machine presents (via `ccproxy-connector connect --token`) to dial back in.
+        Provide `host` for a legacy SSH-provisioned machine.
       properties:
-        host: { type: string, description: address CCProxy will SSH into (pubkey already injected) }
+        host: { type: string, description: "SSH target address; omit for a connector-mode machine" }
         sshUser: { type: string, description: "SSH user (default: root)" }
         sshPort: { type: integer, description: "SSH port (default: 22)" }
         label: { type: string }
-      required: [host]
     UpdateMachineRequest:
       type: object
       description: partial update; omitted fields unchanged

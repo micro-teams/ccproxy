@@ -37,7 +37,8 @@ class Machine(
     @Column(name = "tenant_id", nullable = false) var tenantId: IdType? = null,
     @Column(name = "account_id") var accountId: IdType? = null,
     @Column var label: String? = null,
-    @Column(nullable = false) var host: String? = null,
+    /** SSH target address. Null for a connector-mode machine (it dials out; we never SSH in). */
+    @Column var host: String? = null,
     @Column(name = "ssh_user", nullable = false) var sshUser: String = "root",
     @Column(name = "ssh_port", nullable = false) var sshPort: Int = 22,
     @Enumerated(EnumType.STRING)
@@ -48,6 +49,12 @@ class Machine(
     /** Per-machine proxy-auth the engine keys sessions by (HTTPS_PROXY user:pass). */
     @Column(name = "proxy_user", nullable = false) var proxyUser: String? = null,
     @Column(name = "proxy_password", nullable = false) var proxyPassword: String? = null,
+    /**
+     * The durable device token a connector-mode machine holds and presents at the WebSocket
+     * handshake (header X-Microteams-Session). Issued at creation; the only credential the machine
+     * carries. Null for legacy SSH-provisioned machines. Revocable on its own by rotating it.
+     */
+    @Column(name = "device_token") var deviceToken: String? = null,
     @Column(name = "has_credential", nullable = false) var hasCredential: Boolean = false,
     @Column(name = "credential_expires_at") var credentialExpiresAt: Long? = null,
     @Column(name = "current_login_request_id") var currentLoginRequestId: IdType? = null,
@@ -60,4 +67,6 @@ interface MachineRepository : JpaRepository<Machine, IdType> {
     fun countByAccountId(accountId: IdType): Long
 
     fun findByProxyUser(proxyUser: String): Machine?
+
+    fun findByDeviceToken(deviceToken: String): Machine?
 }

@@ -29,11 +29,16 @@ fun Machine.toDTO(
     proxyEndpoint: String,
     includeAccount: Boolean = false,
     accountEmail: String? = null,
+    online: Boolean = false,
+    installCommand: String? = null,
 ): MachineDTO =
     MachineDTO(
         id = this.id!!,
         tenantId = this.tenantId!!,
-        host = this.host!!,
+        // A connector-mode machine has no host; SSH mode always does.
+        connector = this.host.isNullOrBlank(),
+        online = online,
+        host = this.host,
         status = this.status.toDTO(),
         caCertInstalled = this.caCertInstalled,
         hasCredential = this.hasCredential,
@@ -46,6 +51,10 @@ fun Machine.toDTO(
         currentLoginRequestId = this.currentLoginRequestId,
         lastUsedAt = this.lastUsedAt?.atOffset(ZoneOffset.UTC),
         createdAt = this.createdAt?.atOffset(ZoneOffset.UTC),
+        // The owning tenant needs the token to connect the machine; only meaningful in connector
+        // mode.
+        deviceToken = this.deviceToken,
+        installCommand = installCommand,
         boundAccountId = if (includeAccount) this.accountId else null,
         boundAccountEmail = if (includeAccount) accountEmail else null,
     )

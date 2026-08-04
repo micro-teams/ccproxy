@@ -29,8 +29,13 @@ class MachineService(
     private val provisioner: MachineProvisioner,
     private val engineClient: EngineClient,
     private val config: CCProxyConfig,
+    private val hub: app.microteams.ccproxy.machine.link.MachineHub,
 ) {
     private val rng = SecureRandom()
+
+    /** Resolve a device token presented at the WebSocket handshake to its machine, or null. */
+    fun verifyDeviceToken(token: String): Machine? =
+        if (token.isBlank()) null else machineRepository.findByDeviceToken(token)
 
     fun getMachine(id: IdType): Machine =
         machineRepository.findById(id).orElseThrow { NotFoundError("machine", id) }
@@ -42,24 +47,36 @@ class MachineService(
         m.accountId?.let { accountRepository.findById(it).orElse(null)?.email }
 
     fun toDTO(m: Machine, includeAccount: Boolean): MachineDTO =
-        m.toDTO(config.engine.proxyEndpoint, includeAccount, accountEmail(m))
+        m.toDTO(
+            config.engine.proxyEndpoint,
+            includeAccount,
+            accountEmail(m),
+            online = m.id?.let { hub.isOnline(it.toString()) } ?: false,
+        )
 
     fun createMachine(tenantId: IdType, req: CreateMachineRequestDTO): MachineDTO {
         // Birth init: NO account is bound here. MicroCloud calls this at VM creation for every
         // machine (most of which stay on newapi forever); binding a subscription account at birth
         // would exhaust the pool. provision() only points Claude at the engine — which tunnels this
         // still-unregistered session straight through — so no account is consumed until login.
+        // Connector mode: no SSH target given. The machine dials OUT via its connector, so instead
+        // of
+        // SSHing in we issue a durable device token it presents at the WebSocket handshake, and
+        // skip
+        // provisioning — the connector applies config and drives login once it is online.
+        val connectorMode = req.host.isNullOrBlank()
         var machine =
             Machine(
                 tenantId = tenantId,
                 accountId = null,
-                host = req.host,
+                host = req.host?.takeIf { it.isNotBlank() },
                 sshUser = req.sshUser?.takeIf { it.isNotBlank() } ?: "root",
                 sshPort = req.sshPort ?: 22,
                 label = req.label,
                 status = MachineStatus.CREATED,
                 proxyUser = "pending",
                 proxyPassword = randomToken(24),
+                deviceToken = if (connectorMode) randomToken(24) else null,
             )
         // Flush the INSERT so the id is assigned AND @CreationTimestamp fires; then the follow-up
         // update (embedding the id in the proxy username so the engine keys sessions stably) is a
@@ -68,7 +85,7 @@ class MachineService(
         machine.proxyUser = "m${machine.id}"
         machine = machineRepository.save(machine)
 
-        provisioner.provision(machine.id!!)
+        if (!connectorMode) provisioner.provision(machine.id!!)
         return toDTO(machine, includeAccount = false)
     }
 
