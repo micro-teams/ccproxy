@@ -198,25 +198,29 @@ done
 wait_status "$MID" awaitingLogin || exit 1
 expect_awaiting_code "$MID" "round3-engine-restart-selfheal" || exit 1
 
-echo "== round 4: token-persistence round-trip inside the engine container =="
-# Captured tokens are persisted to disk and reloaded on restart, so a logged-in machine survives an
-# engine restart without re-login. A real login needs an account, so exercise the persist/reload
-# directly against the running engine module (with its real SESSION_DIR + mounted volume).
+echo "== round 4: token-persistence round-trip through the backend DB =="
+# Captured tokens are persisted to the backend Postgres store (the single source of truth) and
+# reloaded on restart, so a logged-in machine survives an engine restart without re-login. A real
+# login needs an account, so exercise the persist/reload directly against the running engine module:
+# persist_session POSTs to the backend, load_all_from_db() reads it back.
 POUT="$(docker compose exec -T -w /app proxy-engine python3 - <<'PY'
-import os, ccproxy_engine as e
-assert e.SESSION_DIR, "CCPROXY_SESSION_DIR not set in engine"
+import ccproxy_engine as e
 s = e.REGISTRY.put("smoketest", "pw", "http://egress-proxy:7890")
 s.real_access, s.real_refresh = "RA", "RR"
 s.fake_access, s.fake_refresh, s.expires_at = "FA", "FR", 999
-e.persist_session("smoketest", s)
+e.persist_session("smoketest", s)    # write-through to the backend DB
 e.REGISTRY._by_user.clear()          # simulate a restart wiping memory
-e.load_all_persisted()               # reload from disk
+e.load_all_from_db()                 # reload from the DB (source of truth)
 s2 = e.REGISTRY.get("smoketest")
 ok = bool(s2 and s2.real_refresh == "RR" and s2.fake_access == "FA" and s2.expires_at == 999)
-os.remove(os.path.join(e.SESSION_DIR, "smoketest.json"))
 print("PERSIST_OK" if ok else "PERSIST_FAIL")
 PY
 )"
+# Clean up the smoketest row so it never leaks into a real registry. psql runs inside the postgres
+# container, so expand POSTGRES_USER/POSTGRES_DB there (the host shell doesn't source .env).
+docker compose exec -T postgres sh -c \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "DELETE FROM ccproxy.credential WHERE scope='\''SESSION'\'' AND cred_key='\''smoketest'\'';"' \
+  >/dev/null 2>&1 || true
 case "$POUT" in
   *PERSIST_OK*) echo "PASS round4-token-persistence" ;;
   *) echo "FAIL round4-token-persistence: $POUT"; exit 1 ;;

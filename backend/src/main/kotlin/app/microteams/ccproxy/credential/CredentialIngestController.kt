@@ -19,6 +19,7 @@ import org.rucca.cheese.common.error.BadRequestError
 import org.springframework.http.ResponseEntity
 import org.springframework.transaction.annotation.Transactional
 import org.springframework.web.bind.annotation.GetMapping
+import org.springframework.web.bind.annotation.PathVariable
 import org.springframework.web.bind.annotation.PostMapping
 import org.springframework.web.bind.annotation.RequestBody
 import org.springframework.web.bind.annotation.RequestHeader
@@ -47,6 +48,18 @@ class CredentialIngestController(
             throw BadRequestError("invalid engine secret")
         }
     }
+
+    private fun toDto(c: Credential) =
+        SessionCredentialDto(
+            proxyUser = c.credKey,
+            proxyPassword = c.proxyPassword,
+            accountProxy = c.accountProxy,
+            realAccess = c.realAccess,
+            realRefresh = c.realRefresh,
+            fakeAccess = c.fakeAccess,
+            fakeRefresh = c.fakeRefresh,
+            expiresAt = c.expiresAt,
+        )
 
     /** Engine dual-write: upsert a session's captured/injected tokens. Keyed by proxyUser. */
     @NoAuth
@@ -78,20 +91,26 @@ class CredentialIngestController(
         @RequestHeader(value = "X-Engine-Secret", required = false) secret: String?
     ): ResponseEntity<List<SessionCredentialDto>> {
         checkSecret(secret)
-        val rows = credentialRepository.findAllByScope(CredentialScope.SESSION)
         return ResponseEntity.ok(
-            rows.map {
-                SessionCredentialDto(
-                    proxyUser = it.credKey,
-                    proxyPassword = it.proxyPassword,
-                    accountProxy = it.accountProxy,
-                    realAccess = it.realAccess,
-                    realRefresh = it.realRefresh,
-                    fakeAccess = it.fakeAccess,
-                    fakeRefresh = it.fakeRefresh,
-                    expiresAt = it.expiresAt,
-                )
-            }
+            credentialRepository.findAllByScope(CredentialScope.SESSION).map { toDto(it) }
         )
+    }
+
+    /**
+     * Engine lazy self-heal: fetch one session's credential (proxy auth + captured tokens) from the
+     * DB on a cache miss. 404 when the machine has no credential yet (registered but never logged
+     * in) — the engine then falls back to /internal/session for just the proxy auth.
+     */
+    @NoAuth
+    @GetMapping("/internal/credential/session/{proxyUser}")
+    fun getSession(
+        @RequestHeader(value = "X-Engine-Secret", required = false) secret: String?,
+        @PathVariable proxyUser: String,
+    ): ResponseEntity<SessionCredentialDto> {
+        checkSecret(secret)
+        val row =
+            credentialRepository.findByScopeAndCredKey(CredentialScope.SESSION, proxyUser)
+                ?: return ResponseEntity.notFound().build()
+        return ResponseEntity.ok(toDto(row))
     }
 }
