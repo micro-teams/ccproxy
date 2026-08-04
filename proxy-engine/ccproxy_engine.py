@@ -46,14 +46,6 @@ MITM_DOMAINS = {"api.anthropic.com", "platform.claude.com"}
 # When set, every MITM'd (decrypted) request/response is mirrored under this directory, per machine.
 # Purely a side-channel copy — it never touches the bytes forwarded to the client.
 DUMP_DIR = os.environ.get("CCPROXY_DUMP_DIR", "")
-# When set, each session's captured real+fake tokens are persisted here so an engine restart does not
-# lose them (otherwise every machine would have to log in again). One JSON file per proxyUser.
-SESSION_DIR = os.environ.get("CCPROXY_SESSION_DIR", "")
-# Phase 2 read-cutover flag. Off by default: the engine restores sessions from the files only, and
-# the DB is just a shadow kept current by the dual-write. Turn on (=1) once a soak confirms the DB is
-# fully backfilled and in sync, to make startup also overlay sessions from the DB. Kept behind a flag
-# so a single bundle can ship dual-write (safe, always on) without yet trusting the DB on read.
-READ_FROM_DB = os.environ.get("CCPROXY_READ_FROM_DB", "").strip().lower() not in ("", "0", "false")
 
 os.makedirs(CERTS_DIR, exist_ok=True)
 _log_lock = threading.Lock()
@@ -107,28 +99,17 @@ class Registry:
 REGISTRY = Registry()
 
 
-# ── Session token persistence ──────────────────────────────────────────────────
-# Real credentials live in memory, so an engine restart would lose them and force every machine to
-# log in again. When SESSION_DIR is set we mirror each session's tokens to disk on capture and reload
-# them on startup / on a cache miss, so a restart is transparent. Written synchronously so disk is
-# never behind the fake tokens the machine already holds.
-_persist_lock = threading.Lock()
-_TOKEN_FIELDS = (
-    "proxy_password",
-    "account_proxy",
-    "real_access",
-    "real_refresh",
-    "fake_access",
-    "fake_refresh",
-    "expires_at",
-)
+# ── Session credential store (Postgres, via the backend) ───────────────────────
+# Real credentials live in memory; an engine restart loses the registry. The backend's Postgres
+# `credential` table is the durable source of truth: the engine writes each session's tokens there on
+# capture, reloads them all on startup, and lazily re-fetches a single session on a cache miss. (The
+# proxy-engine `depends_on` the backend being healthy, so the DB is always reachable at engine start.)
 
 
-def push_credential_to_backend(user, sess):
-    """Mirror a session's tokens to the backend's Postgres store (the future single source of
-    truth). Best-effort dual-write alongside the file: a failure here never blocks the machine,
-    the file persistence still covers a restart. Same secret-guarded engine→backend channel as
-    /internal/usage."""
+def persist_session(user, sess):
+    """Write a session's captured/injected tokens to the backend DB. Synchronous on capture so the
+    store is never behind the fake tokens the machine already holds; a failure only logs — the
+    in-memory session keeps the machine working until the next write."""
     if not BACKEND_URL or not CONTROL_SECRET:
         return
     try:
@@ -150,76 +131,46 @@ def push_credential_to_backend(user, sess):
         )
         urllib.request.urlopen(req, timeout=5).read()
     except Exception as e:
-        log(f"credential push {user} failed: {str(e)[:80]}")
-
-
-def persist_session(user, sess):
-    # Dual-write: DB (future source of truth) + local file (current source of truth). Either alone
-    # keeps a machine working across a restart; both run so Phase 2 can flip the read side to DB.
-    push_credential_to_backend(user, sess)
-    if not SESSION_DIR:
-        return
-    try:
-        os.makedirs(SESSION_DIR, exist_ok=True)
-        data = {k: getattr(sess, k) for k in _TOKEN_FIELDS}
-        p = os.path.join(SESSION_DIR, user + ".json")
-        tmp = p + ".tmp"
-        with _persist_lock:
-            with open(tmp, "w") as f:
-                json.dump(data, f)
-            os.replace(tmp, p)  # atomic
-    except Exception as e:
         log(f"persist session {user} failed: {str(e)[:80]}")
 
 
-def load_persisted_tokens(user, sess):
-    """Overlay disk-persisted tokens onto an existing session (leaves proxy_password/account_proxy as
-    provided by the backend, which is authoritative for those). Returns True if tokens were loaded."""
-    if not SESSION_DIR:
+def _apply_db_tokens(sess, row):
+    """Overlay non-null token fields from a DB credential row onto a session (proxy fields are left
+    as the caller set them)."""
+    for src, attr in (
+        ("realAccess", "real_access"),
+        ("realRefresh", "real_refresh"),
+        ("fakeAccess", "fake_access"),
+        ("fakeRefresh", "fake_refresh"),
+        ("expiresAt", "expires_at"),
+    ):
+        if row.get(src) is not None:
+            setattr(sess, attr, row[src])
+
+
+def load_db_tokens(user, sess):
+    """Cache-miss self-heal: fetch one session's tokens from the DB and overlay them. Returns True if
+    the machine has a captured credential; 404 = registered-but-never-logged-in (no tokens yet)."""
+    if not BACKEND_URL or not CONTROL_SECRET:
         return False
     try:
-        p = os.path.join(SESSION_DIR, user + ".json")
-        if not os.path.exists(p):
-            return False
-        with open(p) as f:
-            d = json.load(f)
-        for k in ("real_access", "real_refresh", "fake_access", "fake_refresh", "expires_at"):
-            if d.get(k) is not None:
-                setattr(sess, k, d[k])
+        req = urllib.request.Request(
+            f"{BACKEND_URL}/internal/credential/session/{urllib.parse.quote(user)}",
+            headers={"X-Engine-Secret": CONTROL_SECRET},
+        )
+        row = json.loads(urllib.request.urlopen(req, timeout=5).read())
+        _apply_db_tokens(sess, row)
         return sess.real_access is not None
     except Exception as e:
-        log(f"load session {user} failed: {str(e)[:80]}")
+        if getattr(e, "code", None) == 404:
+            return False
+        log(f"db token fetch for {user} failed: {str(e)[:80]}")
         return False
-
-
-def load_all_persisted():
-    """On startup, restore every persisted session into the registry so machines keep working after a
-    restart without waiting for a backend round-trip."""
-    if not SESSION_DIR or not os.path.isdir(SESSION_DIR):
-        return
-    n = 0
-    for fn in os.listdir(SESSION_DIR):
-        if not fn.endswith(".json"):
-            continue
-        user = fn[:-5]
-        try:
-            with open(os.path.join(SESSION_DIR, fn)) as f:
-                d = json.load(f)
-            sess = REGISTRY.put(user, d.get("proxy_password", ""), d.get("account_proxy"))
-            load_persisted_tokens(user, sess)
-            n += 1
-        except Exception as e:
-            log(f"restore session {user} failed: {str(e)[:80]}")
-    if n:
-        log(f"restored {n} persisted session(s)")
 
 
 def load_all_from_db():
-    """Phase 2: overlay every session from the backend DB (the source of truth). Runs after the file
-    load, so if the backend is not up yet at engine start the files already covered us and the
-    dual-write keeps the two in sync; when the DB is reachable it wins. Only non-null token fields
-    overwrite (a DB row with null tokens — e.g. a registered-but-never-logged-in machine — must not
-    wipe a good file-loaded credential). Best-effort: any failure leaves the file-loaded state."""
+    """On startup, load every session from the backend DB into the registry so machines keep working
+    across a restart without re-login. The DB is the source of truth."""
     if not BACKEND_URL or not CONTROL_SECRET:
         return
     try:
@@ -229,7 +180,7 @@ def load_all_from_db():
         )
         rows = json.loads(urllib.request.urlopen(req, timeout=10).read())
     except Exception as e:
-        log(f"DB session load failed (keeping file-loaded state): {str(e)[:80]}")
+        log(f"DB session load failed: {str(e)[:80]}")
         return
     n = 0
     for r in rows:
@@ -237,15 +188,7 @@ def load_all_from_db():
         if not user:
             continue
         sess = REGISTRY.put(user, r.get("proxyPassword") or "", r.get("accountProxy"))
-        for src, attr in (
-            ("realAccess", "real_access"),
-            ("realRefresh", "real_refresh"),
-            ("fakeAccess", "fake_access"),
-            ("fakeRefresh", "fake_refresh"),
-            ("expiresAt", "expires_at"),
-        ):
-            if r.get(src) is not None:
-                setattr(sess, attr, r[src])
+        _apply_db_tokens(sess, r)
         n += 1
     log(f"loaded {n} session(s) from DB")
 
@@ -622,9 +565,9 @@ def fetch_session(user):
         )
         data = json.loads(urllib.request.urlopen(req, timeout=5).read())
         sess = REGISTRY.put(user, data["proxyPassword"], data["accountProxy"])
-        # Restore captured tokens from disk if we have them, so a logged-in machine keeps working
+        # Overlay this machine's captured tokens from the DB, so a logged-in machine keeps working
         # across an engine restart without re-login.
-        load_persisted_tokens(user, sess)
+        load_db_tokens(user, sess)
         return sess
     except Exception as e:
         log(f"session fetch for {user} failed: {str(e)[:80]}")
@@ -833,9 +776,7 @@ def run_control():
 
 
 def main():
-    load_all_persisted()  # file load first: offline-safe, keeps machines working if backend is down
-    if READ_FROM_DB:  # Phase 2 read-cutover, flag-gated: overlay from the DB (source of truth)
-        load_all_from_db()
+    load_all_from_db()  # restore the session registry from the DB (the source of truth)
     threading.Thread(target=run_control, daemon=True).start()
     run_proxy()
 

@@ -75,14 +75,10 @@ services:
       # Mirror every decrypted request/response under app_data/dumps/<machine>/. Side-channel only —
       # never affects forwarded bytes. Set ENGINE_DUMP_DIR= (empty) in .env to disable. Grows large.
       CCPROXY_DUMP_DIR: ${ENGINE_DUMP_DIR-/dump}
-      # Persist per-machine captured tokens so an engine restart doesn't force every machine to
-      # re-login. Holds real credentials — kept under app_data (host-local, root-owned).
-      CCPROXY_SESSION_DIR: /sessions
     volumes:
       - ./proxy-engine:/app:ro
       - ./keys:/keys:ro
       - ./app_data/dumps:/dump
-      - ./app_data/sessions:/sessions
     # Publish the MITM proxy so machines outside the compose network can reach it. It is not an open
     # proxy — every request needs the machine's own proxy-auth. For such machines, also set
     # ENGINE_PROXY_ENDPOINT in .env to a host:port they can reach (e.g. this host's LAN address).
