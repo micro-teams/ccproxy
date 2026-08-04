@@ -96,6 +96,31 @@ jobs:
           python -m py_compile proxy-engine/*.py
           pip install pyflakes >/dev/null && python -m pyflakes proxy-engine/*.py
 
+  # The machine-side connector: a thin brand shell over the shared micro-connector library. Just
+  # building it proves the shared library still satisfies ccproxy's needs; cross-compiling proves the
+  # binaries the control plane serves to real machines will link. The Go version comes from go.mod.
+  connector:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: connector
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: connector/go.mod
+          cache-dependency-path: connector/go.sum
+      - name: Vet + build
+        run: |
+          go vet ./...
+          go build ./...
+      - name: Cross-compile the published targets
+        run: |
+          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            echo "== $t =="
+            GOOS="${t%/*}" GOARCH="${t#*/}" go build -o /dev/null .
+          done
+
   package-zip:
     needs: [build-jar, build-frontend, lint]
     runs-on: ubuntu-latest
@@ -205,7 +230,7 @@ jobs:
   # in branch protection / auto-merge rules instead of listing each job.
   ci-success:
     name: CI success
-    needs: [build-jar, build-frontend, lint, package-zip, test-compose, machine-login-compat]
+    needs: [build-jar, build-frontend, lint, connector, package-zip, test-compose, machine-login-compat]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All required CI jobs passed."
