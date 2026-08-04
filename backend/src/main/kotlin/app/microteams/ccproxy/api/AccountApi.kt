@@ -9,6 +9,8 @@ import app.microteams.ccproxy.model.AccountStatusDTO
 import app.microteams.ccproxy.model.CreateAccountRequestDTO
 import app.microteams.ccproxy.model.ErrorDTO
 import app.microteams.ccproxy.model.ListAccountsResponseDTO
+import app.microteams.ccproxy.model.SetSetupTokenRequestDTO
+import app.microteams.ccproxy.model.SetupTokenStatusDTO
 import app.microteams.ccproxy.model.UpdateAccountRequestDTO
 import io.swagger.v3.oas.annotations.*
 import io.swagger.v3.oas.annotations.enums.*
@@ -94,6 +96,33 @@ interface AccountApi {
 
     @Operation(
         tags = ["account"],
+        summary = "Clear this account's setup-token (future logins revert to interactive /login)",
+        operationId = "deleteAccountSetupToken",
+        description = """""",
+        responses =
+            [
+                ApiResponse(responseCode = "204", description = "No Content"),
+                ApiResponse(
+                    responseCode = "404",
+                    description = "Not Found",
+                    content = [Content(schema = Schema(implementation = ErrorDTO::class))],
+                ),
+            ],
+        security = [SecurityRequirement(name = "superAdmin")],
+    )
+    @RequestMapping(
+        method = [RequestMethod.DELETE],
+        value = ["/account/{id}/setup-token"],
+        produces = ["application/json"],
+    )
+    fun deleteAccountSetupToken(
+        @Parameter(description = "", required = true) @PathVariable("id") id: kotlin.Long
+    ): ResponseEntity<Unit> {
+        return ResponseEntity(HttpStatus.NOT_IMPLEMENTED)
+    }
+
+    @Operation(
+        tags = ["account"],
         summary = "",
         operationId = "getAccount",
         description = """""",
@@ -120,6 +149,39 @@ interface AccountApi {
     fun getAccount(
         @Parameter(description = "", required = true) @PathVariable("id") id: kotlin.Long
     ): ResponseEntity<AccountDTO> {
+        return ResponseEntity(HttpStatus.NOT_IMPLEMENTED)
+    }
+
+    @Operation(
+        tags = ["account"],
+        summary =
+            "Whether this account has a setup-token + its expiry (never returns the token itself)",
+        operationId = "getAccountSetupToken",
+        description = """""",
+        responses =
+            [
+                ApiResponse(
+                    responseCode = "200",
+                    description = "OK",
+                    content =
+                        [Content(schema = Schema(implementation = SetupTokenStatusDTO::class))],
+                ),
+                ApiResponse(
+                    responseCode = "404",
+                    description = "Not Found",
+                    content = [Content(schema = Schema(implementation = ErrorDTO::class))],
+                ),
+            ],
+        security = [SecurityRequirement(name = "superAdmin")],
+    )
+    @RequestMapping(
+        method = [RequestMethod.GET],
+        value = ["/account/{id}/setup-token"],
+        produces = ["application/json"],
+    )
+    fun getAccountSetupToken(
+        @Parameter(description = "", required = true) @PathVariable("id") id: kotlin.Long
+    ): ResponseEntity<SetupTokenStatusDTO> {
         return ResponseEntity(HttpStatus.NOT_IMPLEMENTED)
     }
 
@@ -158,6 +220,49 @@ interface AccountApi {
         @RequestParam(value = "status", required = false)
         status: AccountStatusDTO?,
     ): ResponseEntity<ListAccountsResponseDTO> {
+        return ResponseEntity(HttpStatus.NOT_IMPLEMENTED)
+    }
+
+    @Operation(
+        tags = ["account"],
+        summary =
+            "Set/replace this account's OAuth setup-token — machines then activate without /login",
+        operationId = "setAccountSetupToken",
+        description = """""",
+        responses =
+            [
+                ApiResponse(
+                    responseCode = "200",
+                    description = "OK",
+                    content =
+                        [Content(schema = Schema(implementation = SetupTokenStatusDTO::class))],
+                ),
+                ApiResponse(
+                    responseCode = "400",
+                    description = "Bad Request",
+                    content = [Content(schema = Schema(implementation = ErrorDTO::class))],
+                ),
+                ApiResponse(
+                    responseCode = "404",
+                    description = "Not Found",
+                    content = [Content(schema = Schema(implementation = ErrorDTO::class))],
+                ),
+            ],
+        security = [SecurityRequirement(name = "superAdmin")],
+    )
+    @RequestMapping(
+        method = [RequestMethod.PUT],
+        value = ["/account/{id}/setup-token"],
+        produces = ["application/json"],
+        consumes = ["application/json"],
+    )
+    fun setAccountSetupToken(
+        @Parameter(description = "", required = true) @PathVariable("id") id: kotlin.Long,
+        @Parameter(description = "", required = true)
+        @Valid
+        @RequestBody
+        setSetupTokenRequestDTO: SetSetupTokenRequestDTO,
+    ): ResponseEntity<SetupTokenStatusDTO> {
         return ResponseEntity(HttpStatus.NOT_IMPLEMENTED)
     }
 
