@@ -51,7 +51,7 @@ interface ProvisioningApi {
         summary = "The SSH public key CCProxy logs in with",
         operationId = "getSshPubkey",
         description =
-            """The tenant injects this key into a freshly created machine (as root/authorized user) before registering it, so CCProxy can SSH in to install the CA cert, set the proxy, and drive the login. Returns the OpenSSH single-line public key.""",
+            """The tenant injects this key into a freshly created machine (as root/authorized user) before registering it with a `host`, so CCProxy can SSH in ONCE to bootstrap the connector (install it and dial in). Returns the OpenSSH single-line public key.""",
         responses =
             [
                 ApiResponse(
