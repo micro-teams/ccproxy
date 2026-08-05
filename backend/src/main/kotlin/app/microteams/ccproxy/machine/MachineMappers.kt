@@ -26,11 +26,15 @@ fun MachineStatus.toDTO() =
 fun Machine.httpsProxyUrl(endpoint: String): String = "http://$proxyUser:$proxyPassword@$endpoint"
 
 fun Machine.toDTO(
-    proxyEndpoint: String,
     includeAccount: Boolean = false,
     accountEmail: String? = null,
     online: Boolean = false,
     installCommand: String? = null,
+    // The device token is a machine-auth credential (it authenticates the WebSocket dial-in), so it
+    // is returned ONLY on the create response the owning tenant needs to connect the machine —
+    // never
+    // in a list/get, the same "shown once" rule as the tenant/operator secrets.
+    includeSecrets: Boolean = false,
 ): MachineDTO =
     MachineDTO(
         id = this.id!!,
@@ -46,15 +50,12 @@ fun Machine.toDTO(
         sshUser = this.sshUser,
         sshPort = this.sshPort,
         error = this.error,
-        httpsProxyUrl = this.httpsProxyUrl(proxyEndpoint),
         credentialExpiresAt = this.credentialExpiresAt,
         currentLoginRequestId = this.currentLoginRequestId,
         lastUsedAt = this.lastUsedAt?.atOffset(ZoneOffset.UTC),
         createdAt = this.createdAt?.atOffset(ZoneOffset.UTC),
-        // The owning tenant needs the token to connect the machine; only meaningful in connector
-        // mode.
-        deviceToken = this.deviceToken,
-        installCommand = installCommand,
+        deviceToken = if (includeSecrets) this.deviceToken else null,
+        installCommand = if (includeSecrets) installCommand else null,
         boundAccountId = if (includeAccount) this.accountId else null,
         boundAccountEmail = if (includeAccount) accountEmail else null,
     )

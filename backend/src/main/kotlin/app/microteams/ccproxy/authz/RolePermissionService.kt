@@ -36,7 +36,10 @@ class RolePermissionService {
             else -> throw IllegalArgumentException("Role '$role' is not supported")
         }
 
-    /** The platform operator: full control over tenants, login-operators, accounts; sees all. */
+    /**
+     * The platform operator, all-powerful by design: every action on every resource — tenants,
+     * login-operators, the account pool, machines (unscoped), login-requests, usage.
+     */
     private fun superAdmin(userId: IdType): Authorization =
         Authorization(
             userId = userId,
@@ -80,18 +83,31 @@ class RolePermissionService {
                         "account",
                     ),
                     grant(listOf("get-ssh-pubkey", "get-ca-cert"), "provisioning"),
-                    // Super-admin sees every machine and can rebind its account.
+                    // The platform operator is all-powerful over machines: every action, on ANY
+                    // machine (unscoped — no "owned" predicate), so the console can fully manage
+                    // the
+                    // fleet, not just the four read/rebind actions it used to have.
                     grant(
                         listOf(
                             "list-machine",
                             "get-machine",
+                            "create-machine",
+                            "update-machine",
+                            "delete-machine",
+                            "reprovision-machine",
+                            "start-machine-login",
                             "rebind-machine-account",
                             "get-machine-usage",
                         ),
                         "machine",
                     ),
                     grant(
-                        listOf("list-login-requests", "get-login-request", "cancel-login-request"),
+                        listOf(
+                            "list-login-requests",
+                            "get-login-request",
+                            "cancel-login-request",
+                            "submit-login-code",
+                        ),
                         "login-request",
                     ),
                     grant(listOf("list-usage", "get-usage-summary"), "usage"),
