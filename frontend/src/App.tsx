@@ -269,7 +269,9 @@ function AdminPanels({ tab, token }: { tab: string; token: string }) {
         columns={[
           { key: "id", label: "id" },
           { key: "tenantId", label: "tenant" },
+          { key: "connector", label: "mode", render: (v) => (v ? "connector" : "ssh") },
           { key: "host", label: "host" },
+          { key: "online", label: "online", render: (v) => (v ? "yes" : "—") },
           { key: "status", label: "status" },
           { key: "hasCredential", label: "cred", render: (v) => (v ? "yes" : "—") },
           { key: "boundAccountEmail", label: "account" },
@@ -287,19 +289,24 @@ function TenantPanels({ tab, token }: { tab: string; token: string }) {
     return (
       <ResourcePanel
         title="Machines"
-        description="One machine = one SSH target = one Claude Code login. After Register, provisioning installs the CA + sets HTTPS_PROXY; then hit login."
+        description="One machine = one Claude Code login. SSH mode: give a host, CCProxy SSHes in to provision + login. Connector mode: leave host BLANK — Register returns a deviceToken + installCommand; run that command on the machine (it can be behind NAT, no SSH needed), it dials in (online → yes), then hit login as usual."
         columns={[
           { key: "id", label: "id" },
           { key: "label", label: "label" },
+          { key: "connector", label: "mode", render: (v) => (v ? "connector" : "ssh") },
           { key: "host", label: "host" },
-          { key: "sshUser", label: "user" },
+          { key: "online", label: "online", render: (v) => (v ? "yes" : "—") },
           { key: "status", label: "status" },
           { key: "hasCredential", label: "cred", render: (v) => (v ? "yes" : "—") },
           { key: "httpsProxyUrl", label: "HTTPS_PROXY" },
         ]}
         load={() => request("GET", "/machine", { token })}
         createFields={[
-          { name: "host", label: "host (ip/hostname)" },
+          {
+            name: "host",
+            label: "host (ip/hostname) — leave BLANK for connector mode",
+            optional: true,
+          },
           { name: "sshUser", label: "ssh user", optional: true, placeholder: "root" },
           { name: "sshPort", label: "ssh port", type: "number", optional: true, placeholder: "22" },
           { name: "label", label: "label", optional: true },
