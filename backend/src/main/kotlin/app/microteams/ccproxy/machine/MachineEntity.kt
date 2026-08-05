@@ -52,7 +52,7 @@ class Machine(
     /**
      * The durable device token a connector-mode machine holds and presents at the WebSocket
      * handshake (header X-Microteams-Session). Issued at creation; the only credential the machine
-     * carries. Null for legacy SSH-provisioned machines. Revocable on its own by rotating it.
+     * carries (every machine has one). Revocable on its own by rotating it.
      */
     @Column(name = "device_token") var deviceToken: String? = null,
     @Column(name = "has_credential", nullable = false) var hasCredential: Boolean = false,

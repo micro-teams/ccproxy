@@ -20,7 +20,6 @@ package app.microteams.ccproxy.machine
 
 import app.microteams.ccproxy.common.config.CCProxyConfig
 import app.microteams.ccproxy.machine.link.MachineHub
-import java.security.SecureRandom
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.scheduling.annotation.Async
@@ -39,7 +38,6 @@ class MachineProvisioner(
     @Value("\${application.connector-public-base:}") private val publicBase: String,
 ) {
     private val log = LoggerFactory.getLogger(MachineProvisioner::class.java)
-    private val rng = SecureRandom()
 
     @Async
     @Transactional
@@ -61,13 +59,6 @@ class MachineProvisioner(
                         "application.connector-public-base is not set; cannot bootstrap SSH machines"
                     )
                 }
-            // Existing (pre-connector) machines may carry no device token yet — mint one so the
-            // bootstrap can enrol them. New machines already have one from createMachine.
-            if (machine.deviceToken.isNullOrBlank()) {
-                machine.deviceToken = randomToken(24)
-                machineRepository.save(machine)
-            }
-
             operatorSsh.waitForSsh(
                 machine.host!!,
                 machine.sshPort,
@@ -123,10 +114,5 @@ class MachineProvisioner(
             Thread.sleep(250)
         }
         return null
-    }
-
-    private fun randomToken(len: Int): String {
-        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-        return (1..len).map { alphabet[rng.nextInt(alphabet.length)] }.joinToString("")
     }
 }

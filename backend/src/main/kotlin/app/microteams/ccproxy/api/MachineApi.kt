@@ -33,7 +33,7 @@ interface MachineApi {
         summary = "",
         operationId = "createMachine",
         description =
-            """Register a machine: one Claude Code login on one SSH target (user@host:port). Its identity is that full SSH login, so the same host can hold several machines as different users. The tenant must have already injected the CCProxy SSH public key (see /provisioning/ssh-pubkey) into that target. Creation returns immediately with status `provisioning`; the backend then SSHes in to install the CA cert and point the machine's HTTPS_PROXY at the proxy-engine, landing status `awaiting-login`. CCProxy binds the machine to an account internally (invisible to the tenant). (The per-machine proxy credentials the engine uses to tell traffic apart are secret — CCProxy sets them on the machine itself and never returns them.)""",
+            """Register a machine. Every machine is driven by an on-machine connector that dials OUT to the control plane. Provide a `host` and the backend BOOTSTRAPS it: it SSHes in exactly once (the tenant must have injected the CCProxy SSH public key first — see /provisioning/ssh-pubkey) to install the connector and dial it back in — after which all config + login go over the connector, never SSH. Omit `host` for a machine the operator installs by hand: the response carries a `deviceToken` + `installCommand` to run on it. Creation returns immediately with status `provisioning`, landing `awaiting-login` once the connector is online (`online:true`). CCProxy binds the machine to an account internally (invisible to the tenant); the per-machine proxy/device credentials are secret and set on the machine, not returned in a list/get.""",
         responses =
             [
                 ApiResponse(

@@ -11,7 +11,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/micro-teams/micro-connector/cli/auth"
 	"github.com/micro-teams/micro-connector/cli/brand"
 	"github.com/micro-teams/micro-connector/cli/config"
 	"github.com/micro-teams/micro-connector/cli/screen"
@@ -58,10 +57,9 @@ func root() *cobra.Command {
 }
 
 // enroll records the machine's durable identity in the config. ccproxy issues a device token when
-// the machine is created in the console, so the normal path is `--token <t>`: the token is bound to
-// exactly one machine already, so there is nothing to approve. (The library's browser device flow
-// is kept as a fallback for a control plane that wants a human in the loop.) Idempotent: an already
-// enrolled machine is simply told so.
+// the machine is created in the console, so enrolment is just `--token <t>`: the token is bound to
+// exactly one machine already, so there is nothing to approve. Idempotent: an already enrolled
+// machine is simply told so.
 func enrollCmd(cfgPath *string) *cobra.Command {
 	var token string
 	c := &cobra.Command{
@@ -80,35 +78,24 @@ func enrollCmd(cfgPath *string) *cobra.Command {
 				fmt.Println("already enrolled as", cfg.MachineID)
 				return nil
 			}
-			return enroll(cmd.Context(), *cfgPath, cfg, token)
+			return enroll(*cfgPath, cfg, token)
 		},
 	}
 	c.Flags().StringVar(&token, "token", "", "device token issued when the machine was created")
 	return c
 }
 
-// enroll saves the machine's identity. With a token it stores it directly (the ccproxy path); with
-// none it runs the library's device flow. Split out so `connect` can reuse it.
-func enroll(ctx context.Context, cfgPath string, cfg *config.Config, token string) error {
-	if token != "" {
-		cfg.Token = token
-		if err := config.Save(cfgPath, cfg); err != nil {
-			return err
-		}
-		fmt.Println("enrolled")
-		return nil
+// enroll stores the machine's identity. ccproxy issues a device token when the machine is created,
+// so a token is always supplied; there is nothing to approve. Split out so `connect` can reuse it.
+func enroll(cfgPath string, cfg *config.Config, token string) error {
+	if token == "" {
+		return errors.New("no device token: pass --token <t> (shown when the machine was created)")
 	}
-	res, err := auth.Login(ctx, cfg.Base, func(url string) {
-		fmt.Println("approve this machine at:", url)
-	})
-	if err != nil {
-		return err
-	}
-	cfg.Token, cfg.MachineID = res.Token, res.MachineID
+	cfg.Token = token
 	if err := config.Save(cfgPath, cfg); err != nil {
 		return err
 	}
-	fmt.Println("enrolled as", cfg.MachineID)
+	fmt.Println("enrolled")
 	return nil
 }
 
@@ -171,7 +158,7 @@ func connectCmd(cfgPath *string) *cobra.Command {
 				return errors.New("no control-plane base URL: pass one, e.g. `connect https://host/ccproxy`")
 			}
 			if cfg.Token == "" {
-				if err := enroll(cmd.Context(), *cfgPath, cfg, token); err != nil {
+				if err := enroll(*cfgPath, cfg, token); err != nil {
 					return err
 				}
 			}
