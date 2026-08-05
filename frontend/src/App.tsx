@@ -298,7 +298,6 @@ function TenantPanels({ tab, token }: { tab: string; token: string }) {
           { key: "online", label: "online", render: (v) => (v ? "yes" : "—") },
           { key: "status", label: "status" },
           { key: "hasCredential", label: "cred", render: (v) => (v ? "yes" : "—") },
-          { key: "httpsProxyUrl", label: "HTTPS_PROXY" },
         ]}
         load={() => request("GET", "/machine", { token })}
         createFields={[

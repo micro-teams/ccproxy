@@ -20,9 +20,6 @@ import javax.validation.Valid
  * @param sshUser SSH login user (default root)
  * @param sshPort SSH port (default 22)
  * @param error last provisioning/login error
- * @param httpsProxyUrl The exact value to set as HTTPS_PROXY on the machine — includes the
- *   per-machine proxy credentials the engine uses to tell this machine's traffic apart, e.g.
- *   http://m-42:xxxx@proxy-engine:3128. CCProxy sets it during provisioning; exposed for debugging.
  * @param credentialExpiresAt epoch seconds; when re-login is needed
  * @param currentLoginRequestId an in-flight login, if any
  * @param lastUsedAt
@@ -84,13 +81,6 @@ data class MachineDTO(
     @Schema(example = "null", description = "last provisioning/login error")
     @get:JsonProperty("error")
     val error: kotlin.String? = null,
-    @Schema(
-        example = "null",
-        description =
-            "The exact value to set as HTTPS_PROXY on the machine — includes the per-machine proxy credentials the engine uses to tell this machine's traffic apart, e.g. http://m-42:xxxx@proxy-engine:3128. CCProxy sets it during provisioning; exposed for debugging.",
-    )
-    @get:JsonProperty("httpsProxyUrl")
-    val httpsProxyUrl: kotlin.String? = null,
     @Schema(example = "null", description = "epoch seconds; when re-login is needed")
     @get:JsonProperty("credentialExpiresAt")
     val credentialExpiresAt: kotlin.Long? = null,

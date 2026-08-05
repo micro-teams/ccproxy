@@ -46,12 +46,12 @@ class MachineService(
     private fun accountEmail(m: Machine): String? =
         m.accountId?.let { accountRepository.findById(it).orElse(null)?.email }
 
-    fun toDTO(m: Machine, includeAccount: Boolean): MachineDTO =
+    fun toDTO(m: Machine, includeAccount: Boolean, includeSecrets: Boolean = false): MachineDTO =
         m.toDTO(
-            config.engine.proxyEndpoint,
-            includeAccount,
-            accountEmail(m),
+            includeAccount = includeAccount,
+            accountEmail = accountEmail(m),
             online = m.id?.let { hub.isOnline(it.toString()) } ?: false,
+            includeSecrets = includeSecrets,
         )
 
     fun createMachine(tenantId: IdType, req: CreateMachineRequestDTO): MachineDTO {
@@ -86,7 +86,8 @@ class MachineService(
         machine = machineRepository.save(machine)
 
         if (!connectorMode) provisioner.provision(machine.id!!)
-        return toDTO(machine, includeAccount = false)
+        // The create response is the one place the device token + install command are returned.
+        return toDTO(machine, includeAccount = false, includeSecrets = true)
     }
 
     fun listMachines(
