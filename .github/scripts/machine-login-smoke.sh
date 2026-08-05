@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Compatibility smoke test: spin a plain Debian container as a "machine", install a given version of
-# Claude Code on it, then drive the real provisioning + login flow through the API until the machine
-# reaches AWAITING_CODE (Claude Code launched, connected through the engine, and emitted an OAuth
-# authorize URL the orchestrator scraped). Needs NO real Anthropic account — it stops where a human
-# would paste a code. Run from an up compose bundle directory (has .env, keys/).
+# Connector login compat smoke: spin a plain Debian "machine" (with sshd + Claude Code), let the
+# backend BOOTSTRAP it onto the connector — POST /machine with a host makes the backend SSH in ONCE
+# to `curl <base>/install.sh | sh && ccproxy-connector connect … --token …`, which installs the
+# connector and dials back in — then drive login OVER that connector until AWAITING_CODE (Claude
+# launched via the shared claude.js applet in login mode, an OAuth URL captured). No real Anthropic
+# account: it stops where a human would paste the code. Run from an up compose bundle dir (.env, keys/).
 #
-# It exercises BOTH login paths on the same machine:
-#   round 1 — a fresh, never-onboarded machine (first-run wizard: theme -> login method -> OAuth), and
-#   round 2 — an already-onboarded machine (main prompt; the orchestrator must run `/login` itself).
+# It exercises the login drive on one machine: a fresh first-run wizard, an already-onboarded /login,
+# a newapi-in-settings machine (login must reach official anyway, via the login-only settings file),
+# engine-restart self-heal, and the DB token-persistence round-trip. The whole thing goes over the
+# connector — the backend no longer SSH-drives tmux.
 #
 # Usage: machine-login-smoke.sh <install-spec>
 #   install-spec = "installer"      -> curl https://claude.ai/install.sh | bash   (latest, unpinned)
@@ -17,8 +19,7 @@ set -euo pipefail
 INSTALL="${1:-installer}"
 GW="http://localhost:$(grep -E '^NGINX_HTTP_PORT=' .env | cut -d= -f2 || echo 80)/ccproxy"
 MACHINE="ccproxy-testmachine"
-# Put the test machine on whatever network the running backend is on (robust to stack naming and to
-# other stale ccproxy_* networks being present).
+# Put the test machine on whatever network the running backend is on (robust to stack naming).
 BACKEND="$(docker ps --filter 'name=backend' --format '{{.Names}}' | head -1)"
 NET="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$BACKEND")"
 PUBKEY="$(cat keys/operator.pub)"
@@ -70,7 +71,7 @@ OSEC="$(curl -s -X POST "$GW/login-operator/$OID/secret" -H "$A" -H 'Content-Typ
 
 wait_status() { # $1=machineId  $2=target
   local st=""
-  for _ in $(seq 1 40); do
+  for _ in $(seq 1 60); do
     st="$(curl -s "$GW/machine/$1" -H "Authorization: Bearer $TSEC" | jqget "['status']")"
     [ "$st" = "$2" ] && return 0
     [ "$st" = "error" ] && { echo "machine error:"; curl -s "$GW/machine/$1" -H "Authorization: Bearer $TSEC"; return 1; }
@@ -88,9 +89,12 @@ expect_awaiting_code() { # $1=machineId  $2=label
     if [ "$ls" = "awaitingCode" ]; then
       url="$(printf '%s' "$body" | jqget "['oauthUrl'] or ''")"
       case "$url" in
-        *oauth*) echo "PASS $2: awaitingCode with URL ${url:0:56}..."
+        # The URL must carry a state= param — a wrapped/truncated capture drops it (see the
+        # connector login pane width). Assert both "oauth" and "state=".
+        *oauth*state=*|*state=*oauth*) echo "PASS $2: awaitingCode with a state-carrying URL"
                  curl -s -X POST "$GW/login-request/$lrid/cancel" -H "Authorization: Bearer $OSEC" >/dev/null 2>&1 || true
                  return 0 ;;
+        *oauth*) echo "FAIL $2: OAuth URL is missing its state= param: ${url:0:80}"; return 1 ;;
         *) echo "FAIL $2: awaitingCode but no oauth URL"; return 1 ;;
       esac
     fi
@@ -100,58 +104,33 @@ expect_awaiting_code() { # $1=machineId  $2=label
   echo "FAIL $2: never reached awaitingCode (last=$ls)"; return 1
 }
 
-# Seed a settings.json the tenant/user co-owns BEFORE provisioning: a newapi gateway override plus a
-# user key. Provisioning must MERGE its proxy in and preserve both — it is not the sole owner of this
-# file.
+# Seed a settings.json the tenant/user co-owns, with a newapi gateway override, for round 2b. The
+# connector never touches this file at provision time now; login uses a separate login-only settings
+# file, so this must still be here (untouched) after an incomplete login.
 docker exec -i "$MACHINE" bash -lc 'mkdir -p ~/.claude; cat > ~/.claude/settings.json' <<'JSON'
 {"env":{"ANTHROPIC_BASE_URL":"https://newapi.example.invalid","ANTHROPIC_AUTH_TOKEN":"sk-newapi-fake"},"theme":"dark"}
 JSON
 
-echo "== register + provision machine =="
+echo "== register: the backend SSH-bootstraps the connector, machine dials in =="
 MID="$(curl -s -X POST "$GW/machine" -H "Authorization: Bearer $TSEC" -H 'Content-Type: application/json' \
         -d "{\"host\":\"$MACHINE\",\"label\":\"ci\"}" | jqget "['id']")"
 wait_status "$MID" awaitingLogin || exit 1
-echo "provisioned OK"
-
-# Regression guard: provisioning MERGES the engine proxy into ~/.claude/settings.json's `env` and
-# preserves every key the tenant/user already put there (newapi override + the `theme` user key). It
-# must NOT touch system-wide env (/etc/profile.d, /etc/environment) — those would proxy the whole
-# machine and are exactly what this design removes.
-echo "== verify settings.json got the engine proxy MERGED in, pre-existing keys preserved =="
-docker exec "$MACHINE" bash -lc 'cat "$HOME/.claude/settings.json"' | python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-env=d.get('env',{})
-p=env.get('HTTPS_PROXY','')
-assert p.startswith('http') and '@' in p, 'HTTPS_PROXY missing/unauthed: %r'%p
-assert env.get('HTTP_PROXY')==p, 'HTTP_PROXY != HTTPS_PROXY'
-assert env.get('NODE_EXTRA_CA_CERTS'), 'NODE_EXTRA_CA_CERTS missing'
-assert env.get('ANTHROPIC_BASE_URL')=='https://newapi.example.invalid', 'newapi override was clobbered'
-assert env.get('ANTHROPIC_AUTH_TOKEN')=='sk-newapi-fake', 'newapi token was clobbered'
-assert d.get('theme')=='dark', 'user key theme was clobbered'
-print('settings.json merged OK ('+p+'), newapi + user keys preserved')
-" || { echo "FAIL: settings.json merge invalid"; exit 1; }
-docker exec "$MACHINE" bash -lc 'test -f "$HOME/.claude/ccproxy-ca.crt"' ||
-  { echo "FAIL: MITM CA not dropped next to settings.json"; exit 1; }
+online="$(curl -s "$GW/machine/$MID" -H "Authorization: Bearer $TSEC" | jqget "['online']")"
+[ "$online" = "True" ] || { echo "FAIL: connector never dialed in (online=$online)"; exit 1; }
+# The connector-first design never writes a system-wide global proxy (that was the old footgun that
+# left a re-imported machine pinned to a dead identity).
 docker exec "$MACHINE" test ! -e /etc/profile.d/ccproxy-proxy.sh ||
-  { echo "FAIL: /etc/profile.d/ccproxy-proxy.sh must NOT exist under the settings.json design"; exit 1; }
+  { echo "FAIL: /etc/profile.d/ccproxy-proxy.sh must NOT exist"; exit 1; }
+echo "bootstrapped onto the connector, online OK"
 
 echo "== round 1: fresh machine (first-run wizard path) =="
 expect_awaiting_code "$MID" "round1-fresh-wizard" || exit 1
 
-echo "== round 2: simulate an already-onboarded machine, expect the /login path =="
-curl -s -X POST "$GW/machine/$MID/reprovision" -H "Authorization: Bearer $TSEC" >/dev/null
-wait_status "$MID" awaitingLogin || exit 1
-# Mark onboarding complete so Claude Code lands on the main prompt (not the first-run wizard).
+echo "== round 2: already-onboarded machine, expect the /login path =="
 docker exec "$MACHINE" bash -lc 'python3 -c "import json,os;p=os.path.expanduser(\"~/.claude.json\");d=json.load(open(p)) if os.path.exists(p) and os.path.getsize(p) else {};d[\"hasCompletedOnboarding\"]=True;json.dump(d,open(p,\"w\"))"'
 expect_awaiting_code "$MID" "round2-onboarded-login" || exit 1
 
-echo "== round 2b: newapi in settings.json — login forces official via a temp file, real file untouched =="
-# The machine's real settings.json carries a newapi override (seeded above, still present). The login
-# Claude must reach official-via-OAuth anyway — it runs with a login-only `claude --settings <temp>`
-# that out-precedes user settings — WITHOUT modifying the real settings.json. Since the switch (delete
-# of the newapi keys) only happens on a CONFIRMED login, and CI never completes one, the real file
-# must still carry newapi after an incomplete login: an incomplete login costs nothing.
+echo "== round 2b: newapi in settings.json — login reaches official anyway, real file untouched =="
 docker exec "$MACHINE" bash -lc 'python3 -c "import json,os;print(json.load(open(os.path.expanduser(\"~/.claude/settings.json\")))[\"env\"][\"ANTHROPIC_BASE_URL\"])"' \
   | grep -q 'newapi.example.invalid' || { echo "FAIL: precondition, newapi not in settings.json"; exit 1; }
 expect_awaiting_code "$MID" "round2b-newapi-settings-still-official" || exit 1
@@ -160,49 +139,19 @@ docker exec "$MACHINE" bash -lc 'python3 -c "import json,os;print(json.load(open
   { echo "FAIL: an incomplete login modified the real settings.json (should be untouched)"; exit 1; }
 echo "PASS round2b: login reached official; real settings.json newapi untouched"
 
-echo "== round 2c: a switched-to-official persistent Claude must survive a concurrent login =="
-# The real steady state after the newapi->official switch: provisioning only ever wrote settings.json,
-# then the switch flips ANTHROPIC_BASE_URL in that same file to official and (re)starts a long-lived
-# "student" Claude pointed at the official endpoint through the engine. Triggering a fresh login runs
-# in ITS OWN tmux session and must not tear down the already-running student. Reproduce that here.
-curl -s -X POST "$GW/machine/$MID/reprovision" -H "Authorization: Bearer $TSEC" >/dev/null
-wait_status "$MID" awaitingLogin || exit 1
-docker exec "$MACHINE" bash -lc 'python3 - <<PY
-import json,os
-p=os.path.expanduser("~/.claude/settings.json")
-d=json.load(open(p))
-d["env"]["ANTHROPIC_BASE_URL"]="https://api.anthropic.com"
-json.dump(d,open(p,"w"))
-PY
-tmux new-session -d -s student "PATH=\$HOME/.local/bin:\$PATH claude || true; exec sleep infinity"'
-sleep 3
-docker exec "$MACHINE" tmux has-session -t student 2>/dev/null ||
-  { echo "FAIL: persistent student Claude did not start"; exit 1; }
-expect_awaiting_code "$MID" "round2c-persistent-official-claude-survives" || exit 1
-docker exec "$MACHINE" tmux has-session -t student 2>/dev/null ||
-  { echo "FAIL: the login flow killed the running student Claude session"; exit 1; }
-echo "PASS round2c: persistent Claude survived the login"
-docker exec "$MACHINE" tmux kill-session -t student 2>/dev/null || true
-
-echo "== round 3: engine restart self-heal (lazy session fetch, NO reprovision) =="
-# The engine keeps sessions in memory; restarting wipes them. Without on-demand refetch a machine
-# would then stall at 'Checking connectivity' until reprovisioned. Restart the engine and DO NOT
-# reprovision — a fresh login must still reach awaitingCode because the engine rebuilds the session
-# from the backend on the first connection.
+echo "== round 3: engine restart self-heal (lazy session fetch, no re-bootstrap) =="
+# The engine keeps sessions in memory; restarting wipes them and it refetches from the backend on the
+# first connection. The connector's control link (to the backend) is untouched by an engine restart,
+# so the machine stays online — a fresh login must still reach awaitingCode.
 docker compose restart proxy-engine >/dev/null 2>&1
 for _ in $(seq 1 20); do
   h="$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q proxy-engine)" 2>/dev/null || true)"
   [ "$h" = "healthy" ] && break
   sleep 2
 done
-wait_status "$MID" awaitingLogin || exit 1
 expect_awaiting_code "$MID" "round3-engine-restart-selfheal" || exit 1
 
 echo "== round 4: token-persistence round-trip through the backend DB =="
-# Captured tokens are persisted to the backend Postgres store (the single source of truth) and
-# reloaded on restart, so a logged-in machine survives an engine restart without re-login. A real
-# login needs an account, so exercise the persist/reload directly against the running engine module:
-# persist_session POSTs to the backend, load_all_from_db() reads it back.
 POUT="$(docker compose exec -T -w /app proxy-engine python3 - <<'PY'
 import ccproxy_engine as e
 s = e.REGISTRY.put("smoketest", "pw", "http://egress-proxy:7890")
@@ -216,8 +165,6 @@ ok = bool(s2 and s2.real_refresh == "RR" and s2.fake_access == "FA" and s2.expir
 print("PERSIST_OK" if ok else "PERSIST_FAIL")
 PY
 )"
-# Clean up the smoketest row so it never leaks into a real registry. psql runs inside the postgres
-# container, so expand POSTGRES_USER/POSTGRES_DB there (the host shell doesn't source .env).
 docker compose exec -T postgres sh -c \
   'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "DELETE FROM ccproxy.credential WHERE scope='\''SESSION'\'' AND cred_key='\''smoketest'\'';"' \
   >/dev/null 2>&1 || true
