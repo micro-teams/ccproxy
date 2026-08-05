@@ -107,7 +107,7 @@ jobs:
         working-directory: connector
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: connector/go.mod
           cache-dependency-path: connector/go.sum
