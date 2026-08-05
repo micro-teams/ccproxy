@@ -59,12 +59,12 @@ class MachineService(
         // machine (most of which stay on newapi forever); binding a subscription account at birth
         // would exhaust the pool. provision() only points Claude at the engine — which tunnels this
         // still-unregistered session straight through — so no account is consumed until login.
-        // Connector mode: no SSH target given. The machine dials OUT via its connector, so instead
-        // of
-        // SSHing in we issue a durable device token it presents at the WebSocket handshake, and
-        // skip
-        // provisioning — the connector applies config and drives login once it is online.
-        val connectorMode = req.host.isNullOrBlank()
+        // Every machine is connector-driven. It gets a durable device token (its only credential,
+        // presented at the WebSocket handshake). A machine WITH an SSH host is bootstrapped —
+        // provision() SSHes in ONCE to install the connector + dial in; a machine with NO host
+        // waits
+        // for the operator to run the install command by hand. Config + login then go over the
+        // connector; the backend never SSH-drives a machine again.
         var machine =
             Machine(
                 tenantId = tenantId,
@@ -76,7 +76,7 @@ class MachineService(
                 status = MachineStatus.CREATED,
                 proxyUser = "pending",
                 proxyPassword = randomToken(24),
-                deviceToken = if (connectorMode) randomToken(24) else null,
+                deviceToken = randomToken(24),
             )
         // Flush the INSERT so the id is assigned AND @CreationTimestamp fires; then the follow-up
         // update (embedding the id in the proxy username so the engine keys sessions stably) is a
@@ -85,7 +85,9 @@ class MachineService(
         machine.proxyUser = "m${machine.id}"
         machine = machineRepository.save(machine)
 
-        if (!connectorMode) provisioner.provision(machine.id!!)
+        // No-ops for a hostless (connector) machine; SSH-bootstraps a host machine onto the
+        // connector.
+        provisioner.provision(machine.id!!)
         // The create response is the one place the device token + install command are returned.
         return toDTO(machine, includeAccount = false, includeSecrets = true)
     }

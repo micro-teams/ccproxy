@@ -47,10 +47,8 @@ class CCProxyConfig {
          * Operator SSH private key used to log into machines. Defaults to the bundle's mounted key.
          */
         var sshPrivateKeyPath: String? = "/keys/operator"
-        /** How long to wait for a machine to accept SSH (TCP :22). */
+        /** How long to wait for a machine to accept SSH (TCP :22) during the one-shot bootstrap. */
         var sshReadyTimeoutSeconds: Long = 60
-        /** How long to wait for `/login` to emit its OAuth URL in the machine's tmux. */
-        var loginUrlTimeoutSeconds: Long = 60
     }
 
     class Engine {

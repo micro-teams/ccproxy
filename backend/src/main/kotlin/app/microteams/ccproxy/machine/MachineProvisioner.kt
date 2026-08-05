@@ -1,13 +1,15 @@
 /*
- *  Description: The SSH side of a machine's BIRTH-time initialization — @Async, lands a terminal
- *               status. provision() waits for SSH, then MERGES this machine's proxy into the login
- *               user's ~/.claude/settings.json `env` (HTTPS_PROXY at the proxy-engine with this
- *               machine's own proxy-auth, NODE_EXTRA_CA_CERTS at the MITM CA dropped alongside),
- *               preserving every other key the tenant/user already put there. It binds NO account and
- *               registers NO engine session — birth only points Claude at the engine, which tunnels
- *               unregistered sessions straight through, consuming no account. Account binding and
- *               session registration happen later, at login (see LoginOrchestrator). Lands
- *               AWAITING_LOGIN (or ERROR).
+ *  Description: Machine BIRTH-time bootstrap — @Async, lands a terminal status. This no longer
+ *               SSH-drives a machine: for a machine with an SSH host it SSHes in exactly ONCE to
+ *               install the connector and dial it back in (`curl <base>/install.sh | sh` then
+ *               `ccproxy-connector connect <base> --token <deviceToken>`); after that all config +
+ *               login go over the connector's dial-out link, not SSH. A machine with NO host is a
+ *               pure connector machine and needs no server-side action — the operator runs the same
+ *               install command by hand. Lands AWAITING_LOGIN once the connector is online (or ERROR).
+ *
+ *               reprovision() runs the same bootstrap, which is also how an existing SSH-provisioned
+ *               machine is migrated onto the connector (idempotent; leaves its working
+ *               settings.json / credentials untouched, so day-to-day use is uninterrupted).
  *
  *  Author(s):
  *      Nictheboy Li    <nictheboy@outlook.com>
@@ -17,8 +19,10 @@
 package app.microteams.ccproxy.machine
 
 import app.microteams.ccproxy.common.config.CCProxyConfig
-import java.io.File
+import app.microteams.ccproxy.machine.link.MachineHub
+import java.security.SecureRandom
 import org.slf4j.LoggerFactory
+import org.springframework.beans.factory.annotation.Value
 import org.springframework.scheduling.annotation.Async
 import org.springframework.stereotype.Component
 import org.springframework.transaction.annotation.Transactional
@@ -28,9 +32,14 @@ class MachineProvisioner(
     private val config: CCProxyConfig,
     private val machineRepository: MachineRepository,
     private val operatorSsh: OperatorSsh,
-    private val remoteSettings: RemoteSettings,
+    private val hub: MachineHub,
+    // The public base URL a machine dials the control plane on (origin + gateway prefix, e.g.
+    // https://ccproxy.example.com/ccproxy). Baked into the bootstrap command. Required to bootstrap
+    // SSH machines; the compose bundle sets it.
+    @Value("\${application.connector-public-base:}") private val publicBase: String,
 ) {
     private val log = LoggerFactory.getLogger(MachineProvisioner::class.java)
+    private val rng = SecureRandom()
 
     @Async
     @Transactional
@@ -38,37 +47,71 @@ class MachineProvisioner(
         // The caller's @Transactional may not have committed yet when this async task starts, so
         // the row may not be visible on the first read — wait briefly for it to commit.
         val machine = awaitRow { machineRepository.findById(machineId).orElse(null) } ?: return
+        // A hostless (connector) machine dials in on its own once the operator runs the installer;
+        // there is nothing to do server-side.
+        if (machine.host.isNullOrBlank()) return
         try {
             machine.status = MachineStatus.PROVISIONING
             machine.error = null
             machineRepository.save(machine)
 
-            val host = machine.host!!
+            val base =
+                publicBase.trimEnd('/').ifBlank {
+                    throw IllegalStateException(
+                        "application.connector-public-base is not set; cannot bootstrap SSH machines"
+                    )
+                }
+            // Existing (pre-connector) machines may carry no device token yet — mint one so the
+            // bootstrap can enrol them. New machines already have one from createMachine.
+            if (machine.deviceToken.isNullOrBlank()) {
+                machine.deviceToken = randomToken(24)
+                machineRepository.save(machine)
+            }
+
             operatorSsh.waitForSsh(
-                host,
+                machine.host!!,
                 machine.sshPort,
                 config.provisioning.sshReadyTimeoutSeconds,
             )
 
-            // Everything lands under the login user's own ~/.claude — no root, no sudo (minimal
-            // images often lack it anyway). The JSON merge happens server-side; the machine only
-            // runs cat/base64/mv, so no python3 is needed there.
-            remoteSettings.mergeProxy(
-                machine,
-                machine.httpsProxyUrl(config.engine.proxyEndpoint),
-                readCaCert(),
+            // The one and only SSH command: install the connector and dial in. `connect` installs a
+            // boot service where there is one and falls back to a detached run where there isn't.
+            // Runs as the login user (no root/sudo): the binary lands in ~/.local/bin.
+            val remote =
+                "curl -fsSL '$base/install.sh' | sh && " +
+                    "PATH=\"\$HOME/.local/bin:\$PATH\" ccproxy-connector connect '$base' " +
+                    "--token '${machine.deviceToken}'"
+            operatorSsh.run(
+                machine.sshUser,
+                machine.host!!,
+                machine.sshPort,
+                remote,
+                timeoutSeconds = 180,
             )
-            machine.caCertInstalled = true
 
+            if (!waitOnline(machine.id!!.toString(), 90)) {
+                throw IllegalStateException("connector did not dial in within 90s after bootstrap")
+            }
             machine.status = MachineStatus.AWAITING_LOGIN
             machineRepository.save(machine)
-            log.info("provisioned machine {}", machine.id)
+            log.info("bootstrapped machine {} onto the connector", machine.id)
         } catch (e: Exception) {
-            log.warn("provisioning machine {} failed: {}", machineId, e.message)
+            log.warn("bootstrapping machine {} failed: {}", machineId, e.message)
             machine.status = MachineStatus.ERROR
             machine.error = e.message?.take(1000)
             machineRepository.save(machine)
         }
+    }
+
+    /** Poll the hub until the machine's connector has dialed in, or the timeout elapses. */
+    private fun waitOnline(machineId: String, timeoutSeconds: Long): Boolean {
+        var waited = 0L
+        while (waited < timeoutSeconds) {
+            if (hub.isOnline(machineId)) return true
+            Thread.sleep(2000)
+            waited += 2
+        }
+        return hub.isOnline(machineId)
     }
 
     /** Retry a row lookup for a short while, to absorb the caller-transaction commit race. */
@@ -82,10 +125,8 @@ class MachineProvisioner(
         return null
     }
 
-    private fun readCaCert(): String {
-        val path = config.ca.certPath ?: throw IllegalStateException("no CA cert path configured")
-        val f = File(path)
-        if (!f.isFile) throw IllegalStateException("CA cert not found at $path")
-        return f.readText()
+    private fun randomToken(len: Int): String {
+        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        return (1..len).map { alphabet[rng.nextInt(alphabet.length)] }.joinToString("")
     }
 }

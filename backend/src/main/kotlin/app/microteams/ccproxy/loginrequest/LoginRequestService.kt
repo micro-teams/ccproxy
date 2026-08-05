@@ -18,7 +18,6 @@ import app.microteams.ccproxy.credential.CredentialRepository
 import app.microteams.ccproxy.credential.CredentialScope
 import app.microteams.ccproxy.machine.MachineRepository
 import app.microteams.ccproxy.machine.MachineStatus
-import app.microteams.ccproxy.machine.OperatorSsh
 import app.microteams.ccproxy.model.*
 import java.security.SecureRandom
 import java.time.ZoneOffset
@@ -56,9 +55,8 @@ class LoginRequestService(
     private val repository: LoginRequestRepository,
     private val machineRepository: MachineRepository,
     private val accountRepository: AccountRepository,
-    private val orchestrator: LoginOrchestrator,
     private val connectorOrchestrator: ConnectorLoginOrchestrator,
-    private val operatorSsh: OperatorSsh,
+    private val hub: app.microteams.ccproxy.machine.link.MachineHub,
     private val credentialRepository: CredentialRepository,
 ) {
     private val rng = SecureRandom()
@@ -122,22 +120,16 @@ class LoginRequestService(
         machine.status = MachineStatus.LOGGING_IN
         machine.currentLoginRequestId = req.id
         machineRepository.save(machine)
-        // If the bound account carries a setup-token, activate directly (no interactive /login);
-        // otherwise drive the OAuth flow through the operator as usual.
+        // Every machine drives login over its connector's dial-out link now. If the bound account
+        // carries a setup-token, activate directly (no interactive /login); otherwise drive the
+        // OAuth
+        // flow through the operator.
         val hasSetupToken =
             credentialRepository
                 .findByScopeAndCredKey(CredentialScope.ACCOUNT, machine.accountId.toString())
                 ?.setupToken != null
-        // Connector-mode machines (no SSH host) drive login over the dial-out link; SSH machines
-        // keep
-        // the tmux-over-SSH path. Both share the setup-token fast path vs interactive branch.
-        val connector = machine.host.isNullOrBlank()
-        when {
-            connector && hasSetupToken -> connectorOrchestrator.prepareViaSetupToken(req.id!!)
-            connector -> connectorOrchestrator.prepare(req.id!!)
-            hasSetupToken -> orchestrator.prepareViaSetupToken(req.id!!)
-            else -> orchestrator.prepare(req.id!!)
-        }
+        if (hasSetupToken) connectorOrchestrator.prepareViaSetupToken(req.id!!)
+        else connectorOrchestrator.prepare(req.id!!)
         return toDTO(req)
     }
 
@@ -148,13 +140,7 @@ class LoginRequestService(
         }
         val (code, state) = parseCode(body)
         val fakeCode = randomHex(32)
-        val connector =
-            machineRepository.findById(req.machineId!!).orElse(null)?.host.isNullOrBlank()
-        if (connector) {
-            connectorOrchestrator.apply(req.id!!, code, state, fakeCode)
-        } else {
-            orchestrator.apply(req.id!!, code, state, fakeCode)
-        }
+        connectorOrchestrator.apply(req.id!!, code, state, fakeCode)
         req.status = LoginRequestStatus.APPLYING
         return toDTO(repository.save(req))
     }
@@ -171,18 +157,11 @@ class LoginRequestService(
         ) {
             return toDTO(req)
         }
-        req.tmuxSession?.let { session ->
+        // tmuxSession holds the connector screen id of the in-flight login; tear that screen down.
+        req.tmuxSession?.let { sid ->
             val machine = machineRepository.findById(req.machineId!!).orElse(null)
             if (machine != null) {
-                runCatching {
-                    operatorSsh.run(
-                        machine.sshUser,
-                        machine.host!!,
-                        machine.sshPort,
-                        "tmux kill-session -t $session 2>/dev/null || true",
-                        timeoutSeconds = 20,
-                    )
-                }
+                runCatching { hub.closeScreen(machine.id.toString(), sid) }
                 machine.status = MachineStatus.AWAITING_LOGIN
                 machine.currentLoginRequestId = null
                 machineRepository.save(machine)

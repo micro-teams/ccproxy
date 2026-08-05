@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -173,8 +175,15 @@ func connectCmd(cfgPath *string) *cobra.Command {
 					return err
 				}
 			}
+			// Prefer a boot service so it reconnects across reboots. Where there is no service
+			// manager (containers, minimal images, the CI machine box), fall back to a detached
+			// foreground run so the one-shot bootstrap still leaves the machine connected.
 			if err := service.Control(*cfgPath, "install"); err != nil {
-				return fmt.Errorf("install service: %w", err)
+				if derr := startDetached(*cfgPath); derr != nil {
+					return fmt.Errorf("install service: %w; detached-run fallback also failed: %v", err, derr)
+				}
+				fmt.Println("connected (no service manager — running detached; it will not survive a reboot)")
+				return nil
 			}
 			if err := service.Control(*cfgPath, "start"); err != nil {
 				return fmt.Errorf("start service: %w", err)
@@ -185,6 +194,22 @@ func connectCmd(cfgPath *string) *cobra.Command {
 	}
 	c.Flags().StringVar(&token, "token", "", "device token issued when the machine was created")
 	return c
+}
+
+// startDetached launches `<self> run --config <cfgPath>` in its own session, fully detached from
+// this process, so it keeps running after `connect` returns on a machine with no service manager.
+func startDetached(cfgPath string) error {
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	c := exec.Command(self, "run", "--config", cfgPath)
+	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	c.Stdin, c.Stdout, c.Stderr = nil, nil, nil
+	if err := c.Start(); err != nil {
+		return err
+	}
+	return c.Process.Release()
 }
 
 // disconnect stops and removes the boot service, acting on whichever privilege variant is actually
