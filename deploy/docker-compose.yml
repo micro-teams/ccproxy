@@ -49,7 +49,8 @@ services:
         "ccproxy.engine.default-account-proxy":"http://egress-proxy:7890",
         "ccproxy.provisioning.ssh-private-key-path":"/keys/operator",
         "ccproxy.ca.cert-path":"/keys/ca.crt",
-        "application.applets-dir":"/app/applets"}
+        "application.applets-dir":"/app/applets",
+        "application.connector-public-base":"${CONNECTOR_PUBLIC_BASE:-http://nginx/ccproxy}"}
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8080/actuator/health/readiness || exit 1"]
       interval: 10s

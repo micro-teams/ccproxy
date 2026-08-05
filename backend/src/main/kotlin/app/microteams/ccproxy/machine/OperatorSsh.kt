@@ -1,9 +1,9 @@
 /*
- *  Description: The backend's operator SSH identity and the SSH operations provisioning/login need:
- *               read the operator public key (injected into machines), wait for a machine to accept
- *               TCP :22, run a command (capturing output), and pipe a script over SSH. Used by
- *               MachineProvisioner (install CA + set HTTPS_PROXY) and the login orchestration (drive
- *               Claude Code's /login in tmux).
+ *  Description: The backend's operator SSH identity and the minimal SSH operations the one-shot
+ *               connector bootstrap needs: read the operator public key (injected into machines),
+ *               wait for a machine to accept TCP :22, and run a single command (capturing output).
+ *               Used only by MachineProvisioner to install the connector and dial it in — the backend
+ *               no longer SSH-drives a machine's settings or login; that all goes over the connector.
  *
  *  Author(s):
  *      Nictheboy Li    <nictheboy@outlook.com>
@@ -61,24 +61,6 @@ class OperatorSsh(private val config: CCProxyConfig) {
         val (code, output) =
             exec(baseArgs(keyPath, user, host, port) + remote, null, timeoutSeconds)
         if (code != 0) throw IllegalStateException("ssh '$remote' on $host failed ($code): $output")
-        return output
-    }
-
-    /**
-     * Pipe [scriptFile] to [remoteCommand] (reads script from stdin) as [user] on [host]:[port].
-     */
-    fun runScript(
-        user: String,
-        host: String,
-        port: Int,
-        scriptFile: File,
-        remoteCommand: String,
-        timeoutSeconds: Long,
-    ): String {
-        val keyPath = privateKeyPath() ?: throw IllegalStateException("no operator SSH key")
-        val (code, output) =
-            exec(baseArgs(keyPath, user, host, port) + remoteCommand, scriptFile, timeoutSeconds)
-        if (code != 0) throw IllegalStateException("piped script on $host failed ($code): $output")
         return output
     }
 
