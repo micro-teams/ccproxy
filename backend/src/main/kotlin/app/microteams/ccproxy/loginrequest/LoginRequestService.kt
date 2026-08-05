@@ -57,6 +57,7 @@ class LoginRequestService(
     private val machineRepository: MachineRepository,
     private val accountRepository: AccountRepository,
     private val orchestrator: LoginOrchestrator,
+    private val connectorOrchestrator: ConnectorLoginOrchestrator,
     private val operatorSsh: OperatorSsh,
     private val credentialRepository: CredentialRepository,
 ) {
@@ -127,10 +128,15 @@ class LoginRequestService(
             credentialRepository
                 .findByScopeAndCredKey(CredentialScope.ACCOUNT, machine.accountId.toString())
                 ?.setupToken != null
-        if (hasSetupToken) {
-            orchestrator.prepareViaSetupToken(req.id!!)
-        } else {
-            orchestrator.prepare(req.id!!)
+        // Connector-mode machines (no SSH host) drive login over the dial-out link; SSH machines
+        // keep
+        // the tmux-over-SSH path. Both share the setup-token fast path vs interactive branch.
+        val connector = machine.host.isNullOrBlank()
+        when {
+            connector && hasSetupToken -> connectorOrchestrator.prepareViaSetupToken(req.id!!)
+            connector -> connectorOrchestrator.prepare(req.id!!)
+            hasSetupToken -> orchestrator.prepareViaSetupToken(req.id!!)
+            else -> orchestrator.prepare(req.id!!)
         }
         return toDTO(req)
     }
@@ -142,7 +148,13 @@ class LoginRequestService(
         }
         val (code, state) = parseCode(body)
         val fakeCode = randomHex(32)
-        orchestrator.apply(req.id!!, code, state, fakeCode)
+        val connector =
+            machineRepository.findById(req.machineId!!).orElse(null)?.host.isNullOrBlank()
+        if (connector) {
+            connectorOrchestrator.apply(req.id!!, code, state, fakeCode)
+        } else {
+            orchestrator.apply(req.id!!, code, state, fakeCode)
+        }
         req.status = LoginRequestStatus.APPLYING
         return toDTO(repository.save(req))
     }

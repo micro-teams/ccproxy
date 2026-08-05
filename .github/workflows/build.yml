@@ -96,9 +96,10 @@ jobs:
           python -m py_compile proxy-engine/*.py
           pip install pyflakes >/dev/null && python -m pyflakes proxy-engine/*.py
 
-  # The machine-side connector: a thin brand shell over the shared micro-connector library. Just
-  # building it proves the shared library still satisfies ccproxy's needs; cross-compiling proves the
-  # binaries the control plane serves to real machines will link. The Go version comes from go.mod.
+  # The machine-side connector: a thin brand shell over the shared micro-connector library. It is a
+  # shipped build artifact — the control plane serves these binaries to real machines — so CI vets
+  # it, cross-compiles the published targets, and uploads them for the bundle. The Go version comes
+  # from go.mod (in lockstep with the shared library).
   connector:
     runs-on: ubuntu-latest
     defaults:
@@ -110,19 +111,96 @@ jobs:
         with:
           go-version-file: connector/go.mod
           cache-dependency-path: connector/go.sum
-      - name: Vet + build
+      - name: Vet + test
         run: |
           go vet ./...
-          go build ./...
-      - name: Cross-compile the published targets
+          go test ./...
+      - name: Build binaries (one per OS/arch)
         run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Product version from the repo-root VERSION file, with the short commit as build metadata
+          # for traceability — e.g. 0.2.1+1a2b3c4. cwd is connector/, so VERSION is one level up.
+          VERSION="$(cat ../VERSION)+${GITHUB_SHA::7}"
+          # Unix only: the connector drives a pty + tmux, so a machine that runs it is Linux or macOS.
           for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
-            echo "== $t =="
-            GOOS="${t%/*}" GOARCH="${t#*/}" go build -o /dev/null .
+            os="${t%/*}"; arch="${t#*/}"
+            echo "building ccproxy-connector-$os-$arch"
+            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+              go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
+              -o "dist/ccproxy-connector-$os-$arch" .
           done
+          ls -la dist
+      - name: Upload connector binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: cli-binaries
+          path: connector/dist
+
+  # A fully static tmux per Linux target, so a fresh machine needs nothing pre-installed: install.sh
+  # drops it at ~/.config/ccproxy-connector/bin/tmux. Only the build recipe is in git. Built natively
+  # per arch and cached by the recipe's hash, so an unchanged tmux version rebuilds instantly.
+  build-tmux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cache the built static tmux
+        id: tmux-cache
+        uses: actions/cache@v4
+        with:
+          path: dist/linux-${{ matrix.arch }}/tmux
+          key: tmux-${{ matrix.arch }}-${{ hashFiles('deploy/tmux/Dockerfile', 'deploy/tmux/build-static-tmux.sh') }}
+      - name: Set up Docker Buildx
+        if: steps.tmux-cache.outputs.cache-hit != 'true'
+        uses: docker/setup-buildx-action@v3
+      - name: Build static tmux (native, no QEMU)
+        if: steps.tmux-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          deploy/tmux/build-static-tmux.sh --arch "${{ matrix.arch }}" --out dist
+          ls -la dist/*/
+      - name: Upload tmux binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: tmux-linux-${{ matrix.arch }}
+          path: dist/linux-${{ matrix.arch }}
+
+  # The screen-driver applet (claude.js) the backend sends a connector to drive the login screen. It
+  # is the shared micro-connector artifact — built from that repo, not vendored here — so a Claude
+  # TUI fix reaches all three products from one place. (At release we switch this to installing the
+  # published @micro-teams/connector-applets package; until it is tagged, build from source.)
+  build-applet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build claude.js from the shared micro-connector
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/micro-teams/micro-connector.git mc
+          cd mc/applets
+          npm install
+          node build.mjs
+          test -s dist/claude.js
+          mkdir -p "$GITHUB_WORKSPACE/applet-dist"
+          cp dist/claude.js "$GITHUB_WORKSPACE/applet-dist/claude.js"
+          ls -la "$GITHUB_WORKSPACE/applet-dist"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: applets
+          path: applet-dist
 
   package-zip:
-    needs: [build-jar, build-frontend, lint]
+    needs: [build-jar, build-frontend, lint, connector, build-tmux, build-applet]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -141,6 +219,31 @@ jobs:
           cp artifacts/jar/*.jar "$STAGE/backend/backend.jar"
           cp -r artifacts/frontend-dist/. "$STAGE/frontend/dist/"
           chmod +x "$STAGE/gen-env.sh"
+          # The connector distribution the backend serves: the cross-compiled ccproxy-connector
+          # binaries and the static tmux, laid out as connector/<target>/{ccproxy-connector,tmux}
+          # (Go-style os-arch, matching install.sh's target and the self-updater's platform dir). It
+          # is a shipped build artifact, so it lives at the bundle top level as connector/ — NOT under
+          # app_data/, which gen-env.sh creates fresh at deploy time and holds only state you back up.
+          # compose bind-mounts connector/ to the backend's application.connector-binaries-dir
+          # (/app/connector), a replaceable independent part of the deployment.
+          CONN="$STAGE/connector"
+          for t in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+            os="${t%-*}"; arch="${t#*-}"
+            mkdir -p "$CONN/$t"
+            cp "artifacts/cli-binaries/ccproxy-connector-$os-$arch" "$CONN/$t/ccproxy-connector"
+            chmod +x "$CONN/$t/ccproxy-connector"
+          done
+          # Static tmux is Linux-only; macOS uses its own via install.sh's system-tmux fallback.
+          for arch in amd64 arm64; do
+            if [ -f "artifacts/tmux-linux-$arch/tmux" ]; then
+              cp "artifacts/tmux-linux-$arch/tmux" "$CONN/linux-$arch/tmux"
+              chmod +x "$CONN/linux-$arch/tmux"
+            fi
+          done
+          # The screen-driver applet the backend serves to a connector: a shipped artifact, mounted
+          # to the backend's application.applets-dir (/app/applets).
+          mkdir -p "$STAGE/applets"
+          cp artifacts/applets/claude.js "$STAGE/applets/claude.js"
           echo "== bundle contents =="; find "$STAGE" -maxdepth 3 -type f | sort
       - uses: actions/upload-artifact@v7
         with:
@@ -169,6 +272,31 @@ jobs:
         run: |
           bash gen-env.sh
           docker compose up -d --wait --wait-timeout 360
+      - name: Connector distribution is served through the gateway
+        working-directory: ccproxy-deploy
+        run: |
+          set -eu
+          PORT="$(grep -E '^NGINX_HTTP_PORT=' .env | cut -d= -f2 || true)"; PORT="${PORT:-80}"
+          BASE="http://localhost:$PORT/ccproxy"
+          echo "== install.sh (origin baked from the request) =="
+          curl -fsS "$BASE/install.sh" -o /tmp/install.sh
+          grep -q "connector/latest" /tmp/install.sh
+          # Placeholders were replaced with this request's origin + the /ccproxy prefix. curl drops a
+          # default :80 from the Host header, so match the host port-agnostically.
+          ! grep -q "__CONNECTOR_BASE__" /tmp/install.sh
+          grep -qE 'CCPROXY_CONNECTOR_BASE:-https?://localhost(:[0-9]+)?/ccproxy' /tmp/install.sh
+          echo "== a published binary downloads and is an ELF =="
+          curl -fsS "$BASE/connector/latest/linux-amd64/ccproxy-connector" -o /tmp/ccproxy-connector
+          test -s /tmp/ccproxy-connector
+          magic="$(head -c4 /tmp/ccproxy-connector | od -An -tx1 | tr -d ' \n')"
+          case "$magic" in 7f454c46*) ;; *) echo "not an ELF (magic=$magic)"; exit 1 ;; esac
+          echo "== unknown target / off-allowlist artifact is a 404 =="
+          [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/connector/latest/linux-amd64/passwd")" = 404 ]
+          [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/connector/latest/win-x86/ccproxy-connector")" = 404 ]
+          echo "connector distribution OK"
+          echo "== the claude.js driver applet is mounted for the backend =="
+          docker compose exec -T backend sh -c 'test -s /app/applets/claude.js && grep -q screenReady /app/applets/claude.js'
+          echo "applet OK"
       - name: Cluster status
         if: always()
         working-directory: ccproxy-deploy
@@ -225,12 +353,49 @@ jobs:
         working-directory: ccproxy-deploy
         run: docker compose down
 
+  # A machine ccproxy cannot SSH into installs the connector from the served install.sh, dials OUT to
+  # the control plane, and is recognised online — the whole enrolment + WebSocket transport + hub
+  # stack, live, on a real machine container. No Claude / no account needed.
+  machine-connector-dialin:
+    needs: [package-zip]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: ccproxy-deploy
+          path: ccproxy-deploy
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Bring the cluster up
+        working-directory: ccproxy-deploy
+        run: |
+          bash gen-env.sh
+          docker compose up -d --wait --wait-timeout 360
+      - name: Connector dial-in
+        working-directory: ccproxy-deploy
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/connector-dialin-smoke.sh"
+      - name: Dump logs on failure
+        if: failure()
+        working-directory: ccproxy-deploy
+        run: docker compose logs --no-color --tail 200
+      - name: Tear down
+        if: always()
+        working-directory: ccproxy-deploy
+        run: docker compose down
+
   # Single aggregate gate: succeeds only if every job above succeeded (a job with `needs` runs only
   # when all needed jobs pass; otherwise this is skipped and stays non-green). Require just this check
   # in branch protection / auto-merge rules instead of listing each job.
   ci-success:
     name: CI success
-    needs: [build-jar, build-frontend, lint, connector, package-zip, test-compose, machine-login-compat]
+    needs: [build-jar, build-frontend, lint, connector, build-tmux, build-applet, package-zip, test-compose, machine-login-compat, machine-connector-dialin]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All required CI jobs passed."
