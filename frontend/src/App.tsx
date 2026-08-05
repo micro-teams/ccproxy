@@ -311,7 +311,22 @@ function TenantPanels({ tab, token }: { tab: string; token: string }) {
           { name: "label", label: "label", optional: true },
         ]}
         createLabel="Register"
-        onCreate={(b) => request("POST", "/machine", { token, body: b })}
+        onCreate={async (b) => {
+          const m = await request("POST", "/machine", { token, body: b });
+          // Connector mode: lead the result with the exact command to run on the machine, so the
+          // operator does not have to dig the installCommand out of the raw JSON.
+          if (m && m.connector && m.installCommand) {
+            return {
+              step_1_run_this_on_the_machine: m.installCommand,
+              step_2:
+                "It installs the connector and dials in (NAT is fine — no inbound/SSH needed). This machine's `online` turns to yes.",
+              step_3: "Then hit `login` on the row to authenticate it.",
+              note: "The deviceToken is shown only here, once — it is this machine's credential. Re-create the machine if you lose it.",
+              machine: m,
+            };
+          }
+          return m;
+        }}
         actions={[
           {
             label: "login",
