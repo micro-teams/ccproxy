@@ -189,6 +189,44 @@ if [ "$(id -u)" = 0 ] && [ "$owner" != "root" ]; then
   chown -R "$owner" "$CFG_DIR" 2>/dev/null || true
 fi
 
+# --- keep the per-user service alive after logout (lingering) ----------------
+# A non-root `connect` installs a `systemd --user` service, which systemd stops once the
+# owning user has no login session — so the connector would die on logout. `loginctl
+# enable-linger <user>` keeps that user's systemd manager (and its enabled --user units)
+# running at boot with nobody logged in. This is only relevant to that per-user case: a
+# root `connect` installs a *system* service that already starts at boot, so we skip it.
+# Best-effort throughout — if we can't enable it we warn and carry on; the install still
+# succeeds, the service just won't survive a logout ("have sudo → stable; no sudo → not
+# dead"). enable-linger is a privileged (logind/polkit) op, and over non-interactive SSH
+# even the self-path is denied, so treat it as needing root/sudo — except we ARE root,
+# which needs neither.
+if command -v loginctl >/dev/null 2>&1; then
+  # The user the --user service runs as: the non-root owner. If connect will run as root
+  # (owner=root), there is no --user service to keep alive — skip.
+  linger_user=""
+  if [ "$(id -u)" = 0 ]; then
+    [ "$owner" != root ] && linger_user="$owner"
+  else
+    linger_user="$(id -un)"
+  fi
+  if [ -n "$linger_user" ]; then
+    if [ "$(id -u)" = 0 ]; then
+      linger_cmd="loginctl"                         # already root — no sudo needed
+    elif command -v sudo >/dev/null 2>&1; then
+      linger_cmd="sudo -n loginctl"                 # -n: never hang a scripted install on a prompt
+    else
+      linger_cmd=""
+    fi
+    if [ -z "$linger_cmd" ]; then
+      warn "no sudo — cannot enable lingering; the service stops on logout. Later: sudo loginctl enable-linger $linger_user"
+    elif $linger_cmd enable-linger "$linger_user" 2>/dev/null; then
+      ok "enabled lingering for $linger_user (service survives logout)"
+    else
+      warn "could not enable lingering for $linger_user; later run: sudo loginctl enable-linger $linger_user"
+    fi
+  fi
+fi
+
 # --- 4. what now? ------------------------------------------------------------
 # One command connects: it binds this machine with the device token issued when the
 # machine was created in the ccproxy console, and installs the boot service — elevating
