@@ -175,8 +175,10 @@ jobs:
 
   # The screen-driver applet (claude.js) the backend sends a connector to drive the login screen. It
   # is the shared micro-connector artifact — built from that repo, not vendored here — so a Claude
-  # TUI fix reaches all three products from one place. (At release we switch this to installing the
-  # published @micro-teams/connector-applets package; until it is tagged, build from source.)
+  # TUI fix reaches all three products from one place. Built from source, but pinned to the released
+  # applets tag (applets-v<version>) so it moves only on a deliberate bump — in lockstep with the
+  # cli version in connector/go.mod. (A later step could install the published
+  # @micro-teams/connector-applets package instead; pinning the source clone locks the version today.)
   build-applet:
     runs-on: ubuntu-latest
     steps:
@@ -186,7 +188,8 @@ jobs:
       - name: Build claude.js from the shared micro-connector
         run: |
           set -euo pipefail
-          git clone --depth 1 https://github.com/micro-teams/micro-connector.git mc
+          # Pinned to the released applets tag — keep in step with connector/go.mod's cli version.
+          git clone --depth 1 --branch applets-v0.1.4 https://github.com/micro-teams/micro-connector.git mc
           cd mc/applets
           npm install
           node build.mjs
