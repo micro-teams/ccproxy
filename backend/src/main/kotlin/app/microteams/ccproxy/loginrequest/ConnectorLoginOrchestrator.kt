@@ -174,6 +174,7 @@ class ConnectorLoginOrchestrator(
             markOnboardingComplete(mid)
 
             machine.hasCredential = true
+            machine.caCertInstalled = true
             machine.credentialExpiresAt = cred.expiresAt
             machine.status = MachineStatus.READY
             machine.currentLoginRequestId = null
@@ -263,6 +264,7 @@ class ConnectorLoginOrchestrator(
             markOnboardingComplete(mid)
 
             machine.hasCredential = true
+            machine.caCertInstalled = true
             machine.credentialExpiresAt = expiresAt
             machine.status = MachineStatus.READY
             machine.currentLoginRequestId = null

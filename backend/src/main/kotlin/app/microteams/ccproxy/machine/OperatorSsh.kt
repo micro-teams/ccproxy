@@ -58,8 +58,7 @@ class OperatorSsh(private val config: CCProxyConfig) {
     /** Run [remote] as [user] on [host]:[port]; returns stdout+stderr; throws on non-zero exit. */
     fun run(user: String, host: String, port: Int, remote: String, timeoutSeconds: Long): String {
         val keyPath = privateKeyPath() ?: throw IllegalStateException("no operator SSH key")
-        val (code, output) =
-            exec(baseArgs(keyPath, user, host, port) + remote, null, timeoutSeconds)
+        val (code, output) = exec(baseArgs(keyPath, user, host, port) + remote, timeoutSeconds)
         if (code != 0) throw IllegalStateException("ssh '$remote' on $host failed ($code): $output")
         return output
     }
@@ -84,15 +83,9 @@ class OperatorSsh(private val config: CCProxyConfig) {
             "$user@$host",
         )
 
-    private fun exec(
-        args: List<String>,
-        stdinFile: File?,
-        timeoutSeconds: Long,
-    ): Pair<Int, String> {
-        val builder = ProcessBuilder(args).redirectErrorStream(true)
-        if (stdinFile != null) builder.redirectInput(stdinFile)
-        val process = builder.start()
-        if (stdinFile == null) process.outputStream.close()
+    private fun exec(args: List<String>, timeoutSeconds: Long): Pair<Int, String> {
+        val process = ProcessBuilder(args).redirectErrorStream(true).start()
+        process.outputStream.close()
         val output = process.inputStream.bufferedReader().readText()
         if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
             process.destroyForcibly()
