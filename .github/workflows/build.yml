@@ -321,6 +321,10 @@ jobs:
     permissions:
       contents: read
       packages: read
+    # The pinned leg is the gate — it can only break when WE change something. `installer` follows the
+    # latest Claude Code release and is advisory: an upstream first-run/login UI change surfaces here
+    # (the shared claude.js driver then needs a look) but must not block a merge. See backlog.md.
+    continue-on-error: ${{ matrix.claude == 'installer' }}
     strategy:
       fail-fast: false
       matrix:
