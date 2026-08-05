@@ -59,8 +59,11 @@ class ConnectorLoginOrchestrator(
         val machine = machineRepository.findById(req.machineId!!).orElse(null) ?: return
         val mid = machine.id.toString()
         try {
-            if (!hub.isOnline(mid)) {
-                throw IllegalStateException("machine ${machine.id} connector is not connected")
+            if (!awaitOnline(mid)) {
+                throw IllegalStateException(
+                    "machine ${machine.id} connector is not connected " +
+                        "(still bootstrapping? give it a moment, or reprovision it)"
+                )
             }
             val account =
                 machine.accountId?.let { accountRepository.findById(it).orElse(null) }
@@ -139,8 +142,11 @@ class ConnectorLoginOrchestrator(
         val machine = machineRepository.findById(req.machineId!!).orElse(null) ?: return
         val mid = machine.id.toString()
         try {
-            if (!hub.isOnline(mid)) {
-                throw IllegalStateException("machine ${machine.id} connector is not connected")
+            if (!awaitOnline(mid)) {
+                throw IllegalStateException(
+                    "machine ${machine.id} connector is not connected " +
+                        "(still bootstrapping? give it a moment, or reprovision it)"
+                )
             }
             val accountId =
                 machine.accountId
@@ -394,6 +400,20 @@ class ConnectorLoginOrchestrator(
                     "printf '%s' '{\"hasCompletedOnboarding\":true}' > \"\$HOME/.claude.json\"",
             )
         }
+    }
+
+    /**
+     * Wait for the machine's connector to dial in. A login issued right after createMachine races
+     * the async bootstrap that installs the connector, so give the connector a moment to come
+     * online rather than failing the login outright.
+     */
+    private fun awaitOnline(machineId: String, timeoutSeconds: Long = 120): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutSeconds * 1000
+        while (System.currentTimeMillis() < deadline) {
+            if (hub.isOnline(machineId)) return true
+            Thread.sleep(2000)
+        }
+        return hub.isOnline(machineId)
     }
 
     /** Poll a mirrored screen variable until it is non-blank, or the timeout elapses. */
