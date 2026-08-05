@@ -15,6 +15,14 @@ credentials never leave the proxy. See [`README.md`](README.md) for the model an
 (`app.microteams.ccproxy.api.*Api`) and the frontend client are generated from. **Change the API by
 editing the yaml first**, then `./mvnw install`.
 
+## Versioning
+
+The repo-root `VERSION` file is the single source of truth. **Never bump versions by hand** — run
+`scripts/version.sh <X.Y.Z>`, which propagates it into every artifact that must ship it
+(`backend/pom.xml`, `CCProxy-API.yml`'s `info.version` = `X.Y`, `frontend/package.json`, and the
+lockfile). `scripts/version.sh` with no argument prints the current version and verifies all files
+agree.
+
 ## The one rule that must never break
 
 One machine = one independent Claude Code login, exactly like a person on their own computer. Real
