@@ -81,8 +81,14 @@ class ConnectorLoginOrchestrator(
             writeLoginSettings(mid, home, proxyUrl, caPath)
 
             // Launch the login Claude with the login-only settings (CLI-scope, above the machine's
-            // own settings.json), driven by the shared claude.js applet in login mode. A wide pane
-            // keeps the long OAuth URL from wrapping; the applet also de-wraps as a fallback.
+            // own settings.json), driven by the shared claude.js applet in login mode. The pane
+            // MUST
+            // be wide enough that the OAuth authorize URL stays on ONE line: it is ~300+ chars and
+            // `state=` sits at the very end, so if it wraps the capture drops the tail (the
+            // operator
+            // then gets "Invalid OAuth Request: Missing state parameter"). The SSH path uses -x
+            // 1000
+            // for the same reason; match it.
             val cmd =
                 listOf(
                     "bash",
@@ -96,7 +102,7 @@ class ConnectorLoginOrchestrator(
                     cmd,
                     kind = "login",
                     appletSource = appletStore.require("claude.js"),
-                    cols = 220,
+                    cols = 1000,
                     rows = 50,
                 )
             req.tmuxSession = screen.sid // reuse the field to remember the screen id
