@@ -392,12 +392,49 @@ jobs:
         working-directory: ccproxy-deploy
         run: docker compose down
 
+  # DELETE /machine/{id} must be a RELIABLE revocation: engine session dropped and confirmed,
+  # durable credential gone, restart-proof, and an honest 502 (nothing deleted) when the engine
+  # cannot confirm. Exercised live against the compose cluster; no real account needed.
+  machine-revoke:
+    needs: [package-zip]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: ccproxy-deploy
+          path: ccproxy-deploy
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Bring the cluster up
+        working-directory: ccproxy-deploy
+        run: |
+          bash gen-env.sh
+          docker compose up -d --wait --wait-timeout 360
+      - name: Machine revocation
+        working-directory: ccproxy-deploy
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/machine-revoke-smoke.sh"
+      - name: Dump logs on failure
+        if: failure()
+        working-directory: ccproxy-deploy
+        run: docker compose logs --no-color --tail 200
+      - name: Tear down
+        if: always()
+        working-directory: ccproxy-deploy
+        run: docker compose down
+
   # Single aggregate gate: succeeds only if every job above succeeded (a job with `needs` runs only
   # when all needed jobs pass; otherwise this is skipped and stays non-green). Require just this check
   # in branch protection / auto-merge rules instead of listing each job.
   ci-success:
     name: CI success
-    needs: [build-jar, build-frontend, lint, connector, build-tmux, build-applet, package-zip, test-compose, machine-login-compat, machine-connector-dialin]
+    needs: [build-jar, build-frontend, lint, connector, build-tmux, build-applet, package-zip, test-compose, machine-login-compat, machine-connector-dialin, machine-revoke]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All required CI jobs passed."

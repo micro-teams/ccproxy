@@ -73,13 +73,23 @@ interface MachineApi {
         tags = ["machine"],
         summary = "Tear a machine down (drops its proxy mapping and fake↔real credential)",
         operationId = "deleteMachine",
-        description = """""",
+        description =
+            """Revocation is confirmed, not best-effort: a 204 means the proxy-engine no longer serves this machine's session AND its durable credential is gone, so the machine's fake token can never spend again — including across engine restarts. If the engine cannot confirm dropping the live session, the call fails with 502 and NOTHING is deleted; retry until you get the 204. Only this machine's credential is touched; every other machine is unaffected.""",
         responses =
             [
-                ApiResponse(responseCode = "204", description = "No Content"),
+                ApiResponse(
+                    responseCode = "204",
+                    description = "No Content — the credential is verifiably revoked",
+                ),
                 ApiResponse(
                     responseCode = "404",
                     description = "Not Found",
+                    content = [Content(schema = Schema(implementation = ErrorDTO::class))],
+                ),
+                ApiResponse(
+                    responseCode = "502",
+                    description =
+                        "proxy-engine did not confirm the revocation; nothing was deleted — retry",
                     content = [Content(schema = Schema(implementation = ErrorDTO::class))],
                 ),
             ],
