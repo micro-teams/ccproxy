@@ -52,9 +52,6 @@ case "$INSTALL" in
       curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null 2>&1
       apt-get install -y -qq nodejs >/dev/null
       npm i -g @anthropic-ai/claude-code@${VER} >/dev/null 2>&1" ;;
-  installer:*)
-    VER="${INSTALL#installer:}"
-    docker exec "$MACHINE" bash -lc "curl -fsSL https://claude.ai/install.sh | bash -s ${VER} >/dev/null 2>&1" ;;
   *)
     docker exec "$MACHINE" bash -lc "curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1" ;;
 esac
