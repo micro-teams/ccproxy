@@ -92,11 +92,20 @@ class ConnectorLoginOrchestrator(
             // then gets "Invalid OAuth Request: Missing state parameter"). The SSH path uses -x
             // 1000
             // for the same reason; match it.
+            // DISABLE_AUTOUPDATER=1: Claude Code otherwise self-updates on startup
+            // (`npm install -g @anthropic-ai/claude-code@latest`), and while that install swaps the
+            // binary a concurrent login's `exec claude` finds no binary → the pane dies status 127
+            // →
+            // no OAuth URL → timeout. A login is a short, version-controlled operation; it must
+            // never
+            // race a self-update. Set it in the process env (earliest, before Claude reads
+            // settings)
+            // as well as in the login settings file (writeLoginSettings) for good measure.
             val cmd =
                 listOf(
                     "bash",
                     "-lc",
-                    "PATH=\"\$HOME/.local/bin:\$PATH\" exec claude --settings " +
+                    "DISABLE_AUTOUPDATER=1 PATH=\"\$HOME/.local/bin:\$PATH\" exec claude --settings " +
                         "\"$home/.claude/ccproxy-login.json\"",
                 )
             val screen =
@@ -334,6 +343,8 @@ class ConnectorLoginOrchestrator(
         env.put("HTTPS_PROXY", proxyUrl)
         env.put("HTTP_PROXY", proxyUrl)
         env.put("NODE_EXTRA_CA_CERTS", caPath)
+        // Never let the login Claude self-update mid-flight (see the launch cmd in prepare()).
+        env.put("DISABLE_AUTOUPDATER", "1")
         val cfg = mapper.createObjectNode()
         cfg.replace("env", env)
         writeFileOnMachine(
