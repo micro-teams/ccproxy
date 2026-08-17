@@ -155,21 +155,26 @@ done
 expect_awaiting_code "$MID" "round3-engine-restart-selfheal" || exit 1
 
 echo "== round 4: token-persistence round-trip through the backend DB =="
-POUT="$(docker compose exec -T -w /app proxy-engine python3 - <<'PY'
-import ccproxy_engine as e
-s = e.REGISTRY.put("smoketest", "pw", "http://egress-proxy:7890")
+# Persist under a REAL machine's proxy user: the credential-ingest write now refuses a user with no
+# live machine (the revoked-ticket guard), so a synthetic key would 404. Machine $MID's proxy user is
+# m$MID (MachineService sets proxyUser = "m<id>").
+PU="m$MID"
+POUT="$(docker compose exec -T -w /app -e PU="$PU" proxy-engine python3 - <<'PY'
+import os, ccproxy_engine as e
+u = os.environ["PU"]
+s = e.REGISTRY.put(u, "pw", "http://egress-proxy:7890")
 s.real_access, s.real_refresh = "RA", "RR"
 s.fake_access, s.fake_refresh, s.expires_at = "FA", "FR", 999
-e.persist_session("smoketest", s)    # write-through to the backend DB
+e.persist_session(u, s)              # write-through to the backend DB
 e.REGISTRY._by_user.clear()          # simulate a restart wiping memory
 e.load_all_from_db()                 # reload from the DB (source of truth)
-s2 = e.REGISTRY.get("smoketest")
+s2 = e.REGISTRY.get(u)
 ok = bool(s2 and s2.real_refresh == "RR" and s2.fake_access == "FA" and s2.expires_at == 999)
 print("PERSIST_OK" if ok else "PERSIST_FAIL")
 PY
 )"
-docker compose exec -T postgres sh -c \
-  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "DELETE FROM ccproxy.credential WHERE scope='\''SESSION'\'' AND cred_key='\''smoketest'\'';"' \
+docker compose exec -T -e PU="$PU" postgres sh -c \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "DELETE FROM ccproxy.credential WHERE scope='\''SESSION'\'' AND cred_key='\''$PU'\'';"' \
   >/dev/null 2>&1 || true
 case "$POUT" in
   *PERSIST_OK*) echo "PASS round4-token-persistence" ;;
