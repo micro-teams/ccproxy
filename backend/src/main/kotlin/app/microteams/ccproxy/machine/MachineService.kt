@@ -12,7 +12,10 @@ package app.microteams.ccproxy.machine
 
 import app.microteams.ccproxy.account.AccountRepository
 import app.microteams.ccproxy.common.config.CCProxyConfig
+import app.microteams.ccproxy.common.error.EngineUnavailableError
 import app.microteams.ccproxy.common.helper.PageHelper
+import app.microteams.ccproxy.credential.CredentialRepository
+import app.microteams.ccproxy.credential.CredentialScope
 import app.microteams.ccproxy.model.*
 import java.security.SecureRandom
 import java.time.LocalDateTime
@@ -30,6 +33,7 @@ class MachineService(
     private val engineClient: EngineClient,
     private val config: CCProxyConfig,
     private val hub: app.microteams.ccproxy.machine.link.MachineHub,
+    private val credentialRepository: CredentialRepository,
 ) {
     private val rng = SecureRandom()
 
@@ -112,10 +116,31 @@ class MachineService(
         return machineRepository.save(m)
     }
 
+    /**
+     * Delete = revoke this machine's ticket, verifiably. A 204 must MEAN the credential can never
+     * spend again, so the engine drop is not best-effort: if the engine cannot confirm removing the
+     * live session, we fail the whole call (502, transaction rolled back, nothing deleted) instead
+     * of returning success while the session keeps serving. The durable SESSION credential row is
+     * soft-deleted in the same transaction — the engine reloads every row at startup, so a row left
+     * behind would resurrect the revoked ticket (proxy auth + real tokens) on the next engine
+     * restart. Everything is keyed by this machine's proxyUser; no other machine is touched.
+     */
     fun deleteMachine(id: IdType) {
         val m = getMachine(id)
-        runCatching { engineClient.removeSession(m.proxyUser!!) }
-        m.deletedAt = LocalDateTime.now()
+        try {
+            engineClient.removeSession(m.proxyUser!!)
+        } catch (e: Exception) {
+            throw EngineUnavailableError(
+                "proxy-engine did not confirm dropping session ${m.proxyUser}: ${e.message} — " +
+                    "the credential may still be live; machine $id was NOT deleted, retry"
+            )
+        }
+        val now = LocalDateTime.now()
+        credentialRepository.findByScopeAndCredKey(CredentialScope.SESSION, m.proxyUser!!)?.let {
+            it.deletedAt = now
+            credentialRepository.save(it)
+        }
+        m.deletedAt = now
         machineRepository.save(m)
     }
 

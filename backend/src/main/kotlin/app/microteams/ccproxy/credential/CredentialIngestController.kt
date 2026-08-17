@@ -14,6 +14,7 @@
 package app.microteams.ccproxy.credential
 
 import app.microteams.ccproxy.common.config.CCProxyConfig
+import app.microteams.ccproxy.machine.MachineRepository
 import org.rucca.cheese.auth.annotation.NoAuth
 import org.rucca.cheese.common.error.BadRequestError
 import org.springframework.http.ResponseEntity
@@ -41,6 +42,7 @@ data class SessionCredentialDto(
 class CredentialIngestController(
     private val credentialRepository: CredentialRepository,
     private val config: CCProxyConfig,
+    private val machineRepository: MachineRepository,
 ) {
     private fun checkSecret(secret: String?) {
         val expected = config.engine.controlSecret
@@ -70,6 +72,9 @@ class CredentialIngestController(
         @RequestBody dto: SessionCredentialDto,
     ): ResponseEntity<Unit> {
         checkSecret(secret)
+        // A machine that no longer exists is a revoked ticket: refuse the write so an in-flight
+        // capture racing a revocation cannot re-plant the credential the delete just removed.
+        machineRepository.findByProxyUser(dto.proxyUser) ?: return ResponseEntity.notFound().build()
         val existing =
             credentialRepository.findByScopeAndCredKey(CredentialScope.SESSION, dto.proxyUser)
         val row = existing ?: Credential(scope = CredentialScope.SESSION, credKey = dto.proxyUser)
@@ -84,7 +89,13 @@ class CredentialIngestController(
         return ResponseEntity.ok().build()
     }
 
-    /** Engine startup: list every session credential to rebuild the in-memory registry. */
+    /**
+     * Engine startup: list every session credential to rebuild the in-memory registry. Only
+     * sessions whose machine still exists are returned — findByProxyUser is @SQLRestriction
+     * -filtered, so a deleted (= revoked) machine's leftover row can never resurrect its ticket
+     * across an engine restart. (Rows written before deleteMachine started soft-deleting them are
+     * caught here too.)
+     */
     @NoAuth
     @GetMapping("/internal/credential/sessions")
     fun listSessions(
@@ -92,7 +103,10 @@ class CredentialIngestController(
     ): ResponseEntity<List<SessionCredentialDto>> {
         checkSecret(secret)
         return ResponseEntity.ok(
-            credentialRepository.findAllByScope(CredentialScope.SESSION).map { toDto(it) }
+            credentialRepository
+                .findAllByScope(CredentialScope.SESSION)
+                .filter { machineRepository.findByProxyUser(it.credKey) != null }
+                .map { toDto(it) }
         )
     }
 
@@ -108,6 +122,8 @@ class CredentialIngestController(
         @PathVariable proxyUser: String,
     ): ResponseEntity<SessionCredentialDto> {
         checkSecret(secret)
+        // Same live-machine guard as the startup list: never hand out a revoked machine's tokens.
+        machineRepository.findByProxyUser(proxyUser) ?: return ResponseEntity.notFound().build()
         val row =
             credentialRepository.findByScopeAndCredKey(CredentialScope.SESSION, proxyUser)
                 ?: return ResponseEntity.notFound().build()
