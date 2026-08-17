@@ -17,8 +17,13 @@ Swaps performed on the wire (per session):
   request  body : fake OAuth code  → real code   (during login token exchange)
   request  auth : fake access token → real token (every API call)
   response body : real tokens       → fake tokens (login token response)
+  refresh grant : answered locally with the machine's stable fake pair; the real chain is
+                  refreshed upstream at most single-flight, only when it nears expiry (#67)
 
-Real tokens NEVER leave this process toward a machine, and are never returned over the control API.
+A machine's fake pair is minted once and then STABLE: a refresh never invalidates it, so every
+claude process on the machine stays valid however many of them refresh concurrently — the machine
+(DELETE /machine/{id}) is the one revocation unit. Real tokens NEVER leave this process toward a
+machine, and are never returned over the control API.
 """
 
 import gzip
@@ -43,6 +48,14 @@ CA_CERT = os.environ.get("CCPROXY_CA_CERT", "/keys/ca.crt")
 CA_KEY = os.environ.get("CCPROXY_CA_KEY", "/keys/ca.key")
 CERTS_DIR = os.environ.get("CCPROXY_CERTS_DIR", "/tmp/ccproxy-certs")
 MITM_DOMAINS = {"api.anthropic.com", "platform.claude.com"}
+# A refresh grant arriving while the real access token still has more than this many seconds of
+# life is answered locally without touching upstream. Must stay ABOVE the claude CLI's own
+# proactive-refresh margin (minutes), or a locally-answered client would immediately consider its
+# new expiry stale and refresh-loop.
+REFRESH_MARGIN = int(os.environ.get("CCPROXY_REFRESH_MARGIN", "3600"))
+# After a failed upstream refresh, don't retry upstream for this many seconds; refreshes arriving
+# meanwhile are answered locally so a transient Anthropic failure can't stampede the real chain.
+REFRESH_BACKOFF = int(os.environ.get("CCPROXY_REFRESH_BACKOFF", "30"))
 # When set, every MITM'd (decrypted) request/response is mirrored under this directory, per machine.
 # Purely a side-channel copy — it never touches the bytes forwarded to the client.
 DUMP_DIR = os.environ.get("CCPROXY_DUMP_DIR", "")
@@ -66,9 +79,18 @@ class Session:
         self.real_refresh = None
         self.fake_access = None
         self.fake_refresh = None
-        self.expires_at = None  # epoch seconds
+        self.expires_at = None  # epoch seconds — the REAL access token's expiry
         # pending login swap: {"realCode","state","fakeCode"}
         self.pending = None
+        # Single-flight guard for the real-chain refresh (#67): one upstream attempt at a time,
+        # concurrent refreshers block briefly and then get the fresh state answered locally.
+        self.refresh_lock = threading.Lock()
+        self.last_refresh_fail = 0.0
+        # Non-token fields of the last real token response (scope etc.), echoed into locally
+        # synthesized refresh answers so the client sees exactly what the real chain granted.
+        # In-memory only; after a restart the lab-validated default in local_refresh_response
+        # covers until the next upstream capture.
+        self.token_extras = None
 
 
 class Registry:
@@ -342,6 +364,30 @@ def swap_auth_header(headers, sess):
             headers[k] = headers[k].replace(sess.fake_access, sess.real_access)
 
 
+def capture_real_tokens(sess, obj):
+    """Take the real pair (and expiry + extra fields) from a real token response. The fake pair is
+    minted only if the machine doesn't have one yet — an existing pair is STABLE (#67), so tokens
+    already in holders' hands survive every rotation and re-login of the real chain."""
+    sess.real_access = obj.get("access_token")
+    # A refresh response may omit refresh_token (= keep using the old one); never null it out.
+    sess.real_refresh = obj.get("refresh_token") or sess.real_refresh
+    if not sess.fake_access:
+        sess.fake_access = "sk-ant-oat01-" + secrets.token_hex(32)
+    if not sess.fake_refresh and sess.real_refresh:
+        sess.fake_refresh = "sk-ant-ort01-" + secrets.token_hex(32)
+    if obj.get("expires_in"):
+        sess.expires_at = int(time.time()) + int(obj["expires_in"])
+    sess.token_extras = {
+        k: v
+        for k, v in obj.items()
+        if k not in ("access_token", "refresh_token", "expires_in")
+    }
+    sess.pending = None
+    # Persist before handing the fake tokens back, so disk is never behind the machine.
+    if sess.user:
+        persist_session(sess.user, sess)
+
+
 def swap_response_body(body, sess):
     """Capture real tokens on the oauth/token response; return the machine fake tokens."""
     if not body:
@@ -352,19 +398,10 @@ def swap_response_body(body, sess):
     except Exception:
         obj = None
     if isinstance(obj, dict) and "access_token" in obj:
-        sess.real_access = obj.get("access_token")
-        sess.real_refresh = obj.get("refresh_token")
-        sess.fake_access = "sk-ant-oat01-" + secrets.token_hex(32)
-        sess.fake_refresh = "sk-ant-ort01-" + secrets.token_hex(32)
-        if obj.get("expires_in"):
-            sess.expires_at = int(time.time()) + int(obj["expires_in"])
-        sess.pending = None
+        capture_real_tokens(sess, obj)
         obj["access_token"] = sess.fake_access
-        if sess.real_refresh:
+        if sess.real_refresh and sess.fake_refresh:
             obj["refresh_token"] = sess.fake_refresh
-        # Persist before handing the fake tokens back, so disk is never behind the machine.
-        if sess.user:
-            persist_session(sess.user, sess)
         log("captured real tokens; handed fake tokens to machine")
         return json.dumps(obj).encode()
     # Steady-state: never leak a real token that might echo back.
@@ -452,12 +489,7 @@ def dump_exchange(user, method, path, req_headers, req_body, status, resp_header
 
 
 # ── MITM forwarding ────────────────────────────────────────────────────────────
-def forward(upstream, method, path, headers, body, sess, user):
-    # Capture the client's view (pre-swap: fake credential) for the optional traffic dump.
-    dump_req_headers = dict(headers) if DUMP_DIR else None
-    dump_req_body = body if DUMP_DIR else None
-    body = swap_request_body(body, sess)
-    swap_auth_header(headers, sess)
+def send_request(upstream, method, path, headers, body):
     if body:
         headers["Content-Length"] = str(len(body))
     req = f"{method} {path} HTTP/1.1\r\n".encode()
@@ -468,6 +500,10 @@ def forward(upstream, method, path, headers, body, sess, user):
     req += b"\r\n" + (body or b"")
     upstream.sendall(req)
 
+
+def read_response(upstream):
+    """Read one upstream response; returns (status_line, headers, body) with chunking and gzip
+    normalized away, or None on a dead connection."""
     status = recv_line(upstream)
     if not status:
         return None
@@ -480,28 +516,140 @@ def forward(upstream, method, path, headers, body, sess, user):
     raw = maybe_gunzip(rb, rh)
     if raw is not rb:
         rh.pop("Content-Encoding", None)
-    swapped = swap_response_body(raw, sess)
-    rh["Content-Length"] = str(len(swapped))
-    threading.Thread(target=report_usage, args=(user, path, raw), daemon=True).start()
-    if DUMP_DIR:
-        threading.Thread(
-            target=dump_exchange,
-            args=(user, method, path, dump_req_headers, dump_req_body, status, dict(rh), swapped),
-            daemon=True,
-        ).start()
+    return status, rh, raw
+
+
+def assemble_response(status, rh, body):
+    rh["Content-Length"] = str(len(body))
     out = status
     for k, v in rh.items():
         out += f"{k}: {v}\r\n".encode()
-    out += b"\r\n" + swapped
+    out += b"\r\n" + body
     return out
 
 
-def handle_mitm(client_tls, host, port, sess, user):
+# ── Refresh absorption (#67) ───────────────────────────────────────────────────
+def parse_refresh_grant(body, sess):
+    """True iff this request is the machine's own token refresh: a refresh_token grant carrying
+    this machine's issued fake refresh token. Keyed on the BODY, not the URL, so it holds across
+    CLI versions and token-endpoint hosts. Tries JSON first, then form encoding."""
+    if not (body and sess.fake_refresh):
+        return False
+    text = body.decode(errors="replace")
     try:
-        up = upstream_tls(host, port, sess.account_proxy)
-    except Exception as e:
-        log(f"upstream TLS to {host} failed: {e}")
-        return
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return (
+                obj.get("grant_type") == "refresh_token"
+                and obj.get("refresh_token") == sess.fake_refresh
+            )
+    except Exception:
+        pass
+    q = urllib.parse.parse_qs(text)
+    return q.get("grant_type") == ["refresh_token"] and q.get("refresh_token") == [
+        sess.fake_refresh
+    ]
+
+
+def local_refresh_response(sess):
+    """A locally synthesized token response carrying the machine's stable fake pair, as a
+    (status, headers, body) triple. Non-token fields mirror the last real grant when we hold it;
+    the fallback shape matches the real endpoint's and was validated against claude v2.1.233."""
+    expires_in = 60
+    if sess.expires_at:
+        expires_in = max(60, int(sess.expires_at - time.time()))
+    obj = dict(
+        sess.token_extras or {"token_type": "Bearer", "scope": "user:inference user:profile"}
+    )
+    obj["access_token"] = sess.fake_access
+    if sess.fake_refresh:
+        obj["refresh_token"] = sess.fake_refresh
+    obj["expires_in"] = expires_in
+    return (
+        b"HTTP/1.1 200 OK\r\n",
+        {"Content-Type": "application/json"},
+        json.dumps(obj).encode(),
+    )
+
+
+def absorb_refresh(get_upstream, method, path, headers, body, sess, user):
+    """Answer a machine's refresh with its stable fake pair. The pair never rotates, so no holder
+    is ever stranded by a sibling's refresh; the REAL chain is refreshed upstream only when it
+    nears expiry, single-flight per session however many holders ask at once. Returns a
+    (status, headers, body) triple."""
+    with sess.refresh_lock:
+        now = time.time()
+        if sess.expires_at and sess.expires_at - now > REFRESH_MARGIN:
+            log(f"{user}: absorbed refresh (real chain fresh for {int(sess.expires_at - now)}s)")
+            return local_refresh_response(sess)
+        if now - sess.last_refresh_fail < REFRESH_BACKOFF:
+            log(f"{user}: absorbed refresh (upstream refresh in backoff)")
+            return local_refresh_response(sess)
+        try:
+            upstream = get_upstream()
+            swap_auth_header(headers, sess)
+            send_request(upstream, method, path, headers, swap_request_body(body, sess))
+            resp = read_response(upstream)
+        except Exception as e:
+            resp = None
+            log(f"{user}: real refresh transport failed: {str(e)[:80]}")
+        if resp is None:
+            # Transient: the real chain may well still be valid — keep the machine on it and let
+            # the client's own retry find upstream recovered.
+            sess.last_refresh_fail = time.time()
+            return local_refresh_response(sess)
+        status, rh, raw = resp
+        try:
+            obj = json.loads(raw.decode(errors="replace"))
+        except Exception:
+            obj = None
+        if isinstance(obj, dict) and "access_token" in obj:
+            capture_real_tokens(sess, obj)
+            log(f"{user}: real chain refreshed; fake pair unchanged")
+            return local_refresh_response(sess)
+        # A definitive upstream refusal (e.g. 400 invalid_grant: the real chain is dead and needs
+        # a human re-login) passes through honestly — after the leak-safety swap.
+        sess.last_refresh_fail = time.time()
+        log(f"{user}: real refresh refused upstream: {status.decode(errors='replace').strip()}")
+        return status, rh, swap_response_body(raw, sess)
+
+
+def forward(get_upstream, method, path, headers, body, sess, user):
+    # Capture the client's view (pre-swap: fake credential) for the optional traffic dump.
+    dump_req_headers = dict(headers) if DUMP_DIR else None
+    dump_req_body = body if DUMP_DIR else None
+    if parse_refresh_grant(body, sess):
+        status, rh, out = absorb_refresh(get_upstream, method, path, headers, body, sess, user)
+    else:
+        body = swap_request_body(body, sess)
+        swap_auth_header(headers, sess)
+        upstream = get_upstream()
+        send_request(upstream, method, path, headers, body)
+        resp = read_response(upstream)
+        if resp is None:
+            return None
+        status, rh, raw = resp
+        out = swap_response_body(raw, sess)
+        threading.Thread(target=report_usage, args=(user, path, raw), daemon=True).start()
+    if DUMP_DIR:
+        threading.Thread(
+            target=dump_exchange,
+            args=(user, method, path, dump_req_headers, dump_req_body, status, dict(rh), out),
+            daemon=True,
+        ).start()
+    return assemble_response(status, rh, out)
+
+
+def handle_mitm(client_tls, host, port, sess, user):
+    # The upstream connection opens lazily, on the first request that actually needs forwarding —
+    # an absorbed refresh completes with no upstream dependency at all.
+    up_box = []
+
+    def get_upstream():
+        if not up_box:
+            up_box.append(upstream_tls(host, port, sess.account_proxy))
+        return up_box[0]
+
     try:
         while True:
             line = recv_line(client_tls)
@@ -515,7 +663,7 @@ def handle_mitm(client_tls, host, port, sess, user):
             if h is None:
                 break
             b = read_body(client_tls, h)
-            resp = forward(up, method, path, h, b, sess, user)
+            resp = forward(get_upstream, method, path, h, b, sess, user)
             if not resp:
                 break
             client_tls.sendall(resp)
@@ -524,10 +672,11 @@ def handle_mitm(client_tls, host, port, sess, user):
     except Exception as e:
         log(f"mitm {host}: {str(e)[:100]}")
     finally:
-        try:
-            up.close()
-        except Exception:
-            pass
+        for s in up_box:
+            try:
+                s.close()
+            except Exception:
+                pass
 
 
 def tunnel(a, b):
@@ -731,10 +880,12 @@ class ControlHandler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "accessToken required"})
             sess.real_access = access
             sess.real_refresh = body.get("refreshToken")
-            sess.fake_access = "sk-ant-oat01-" + secrets.token_hex(32)
-            sess.fake_refresh = (
-                "sk-ant-ort01-" + secrets.token_hex(32) if sess.real_refresh else None
-            )
+            # Mint-if-absent, like every capture path: an existing fake pair is stable (#67), so
+            # re-injecting a credential never invalidates tokens already in holders' hands.
+            if not sess.fake_access:
+                sess.fake_access = "sk-ant-oat01-" + secrets.token_hex(32)
+            if not sess.fake_refresh and sess.real_refresh:
+                sess.fake_refresh = "sk-ant-ort01-" + secrets.token_hex(32)
             sess.expires_at = body.get("expiresAt")
             sess.pending = None
             if sess.user:
