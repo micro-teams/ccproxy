@@ -315,8 +315,9 @@ jobs:
 
   # Boots the bundle, then spins a plain Debian container as a "machine", installs a given Claude Code
   # version, and drives provisioning + login all the way to AWAITING_CODE (an OAuth URL is scraped) —
-  # no real account needed. A matrix over pinned versions (native installer + npm) exercises both the
-  # fresh-wizard path and the already-onboarded `/login` path, over both install layouts.
+  # no real account needed. `installer` uses the standard `install.sh` (the latest release) so we keep
+  # confirming we stay compatible with the newest Claude Code; the pinned npm versions guard specific
+  # releases. Each leg exercises the fresh-wizard path and the already-onboarded `/login` path.
   machine-login-compat:
     needs: [package-zip]
     runs-on: ubuntu-latest
@@ -326,7 +327,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        claude: ["installer:2.1.233", "npm:2.1.222"]
+        claude: ["installer", "npm:2.1.222", "npm:2.1.233"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
