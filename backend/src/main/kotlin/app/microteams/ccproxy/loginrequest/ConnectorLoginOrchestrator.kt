@@ -101,12 +101,18 @@ class ConnectorLoginOrchestrator(
             // race a self-update. Set it in the process env (earliest, before Claude reads
             // settings)
             // as well as in the login settings file (writeLoginSettings) for good measure.
+            // HOME="$home": the connector process runs with HOME unset, so the shell's own $HOME is
+            // empty — a native install (claude at ~/.local/bin) would resolve to /.local/bin and
+            // not
+            // be found (dead pane, status 127, no OAuth URL). Set HOME to the resolved home and use
+            // it as an absolute path so both the native-install path and Claude's own ~/.claude
+            // lookup work. (npm installs land on the default PATH, so this is harmless for them.)
             val cmd =
                 listOf(
                     "bash",
                     "-lc",
-                    "DISABLE_AUTOUPDATER=1 PATH=\"\$HOME/.local/bin:\$PATH\" exec claude --settings " +
-                        "\"$home/.claude/ccproxy-login.json\"",
+                    "DISABLE_AUTOUPDATER=1 HOME=\"$home\" PATH=\"$home/.local/bin:\$PATH\" " +
+                        "exec claude --settings \"$home/.claude/ccproxy-login.json\"",
                 )
             val screen =
                 hub.openScreen(
