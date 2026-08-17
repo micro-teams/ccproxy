@@ -99,6 +99,12 @@ class ConnectorLoginOrchestrator(
                     "PATH=\"\$HOME/.local/bin:\$PATH\" exec claude --settings " +
                         "\"$home/.claude/ccproxy-login.json\"",
                 )
+            // A previous login that reached awaiting-code but was never completed (or abandoned)
+            // leaves its `claude` login pane running on the machine. Opening another on top stacks
+            // full bun runtimes; the newcomer can then starve and miss the 150s OAuth-URL window.
+            // Only ever run one login screen per machine: reap any stale one before opening this.
+            runCatching { hub.closeScreensOfKind(mid, "login") }
+
             val screen =
                 hub.openScreen(
                     mid,
@@ -438,6 +444,12 @@ class ConnectorLoginOrchestrator(
     }
 
     private fun failRequest(req: LoginRequest?, machine: Machine?) {
+        // Don't leave a half-open login pane behind on a failure — it would pile up on the next
+        // try.
+        val sid = req?.tmuxSession
+        if (req != null && machine != null && sid != null) {
+            runCatching { hub.closeScreen(machine.id.toString(), sid) }
+        }
         if (req != null) {
             req.status = LoginRequestStatus.FAILED
             loginRequestRepository.save(req)

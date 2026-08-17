@@ -194,6 +194,23 @@ class MachineHub {
         screens.remove(sid)
     }
 
+    /**
+     * Close every live screen of a given kind on a machine. Used to reap a prior login screen
+     * before opening a new one: a login started but never completed leaves its `claude` pane
+     * running, and piling more on top stacks heavyweight runtimes on the machine.
+     */
+    fun closeScreensOfKind(machineId: String, kind: String) {
+        val machine = machines[machineId] ?: return
+        machine.screens.values
+            .filter { it.kind == kind }
+            .map { it.sid }
+            .forEach { sid ->
+                machine.send(LinkMsg(t = "session.close", sid = sid))
+                machine.screens.remove(sid)
+                screens.remove(sid)
+            }
+    }
+
     /** Set an applet-observed variable (e.g. `mode` = "login"). */
     fun setVar(machineId: String, sid: String, name: String, value: Any?) {
         machine(machineId).send(LinkMsg(t = "var.set", sid = sid, name = name, value = value))
