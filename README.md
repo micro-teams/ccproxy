@@ -228,10 +228,12 @@ The same flow can be driven from the test SPA at `/`.
 
 ## What a machine must provide
 
-CCProxy drives the machine over SSH; it does **not** install any of the machine's own tooling. You
-must prepare each machine yourself before `POST /machine`. A machine must have, all of it:
+CCProxy bootstraps the machine by installing its **connector** (`curl <base>/install.sh | sh`), which
+drops the connector binary and a private `tmux`; from then on everything runs over the connector's
+dial-out link. The operator provides only **Claude Code** and (for an SSH-bootstrapped machine) SSH
+access — the installer handles the rest.
 
-**Access**
+**Access** (SSH-bootstrapped machines only; a hostless machine skips this and runs the installer by hand)
 
 - **SSH reachable** from the backend at `host:sshPort` (default port `22`).
 - A login user (`sshUser`, default `root`). If it is **not** `root`, that user must have
@@ -240,41 +242,38 @@ must prepare each machine yourself before `POST /machine`. A machine must have, 
 - The **operator SSH public key** (`GET /provisioning/ssh-pubkey`) present in that user's
   `~/.ssh/authorized_keys`.
 
-**Software on `PATH`** (a bare OS image has none of these — install them):
+**Software**
 
-| Needed | Why | How to install |
+| Needed | Why | Provided by |
 |---|---|---|
-| `claude` | the Claude Code CLI that is logged in and run | `curl -fsSL https://claude.ai/install.sh \| bash` (self-contained — bundles its own runtime, no separate Node.js needed) |
-| `tmux` | login runs Claude Code inside a tmux session | `apt-get install -y tmux` |
-| `update-ca-certificates` | installs the MITM CA into the trust store | `apt-get install -y ca-certificates` |
-| `bash`, `base64` | the provisioning script base64-decodes the CA onto disk | usually already present (`bash`, `coreutils`) |
+| `claude` | the Claude Code CLI that is logged in and run | **you** — `curl -fsSL https://claude.ai/install.sh \| bash` (self-contained; bundles its own runtime, no separate Node.js) |
+| `tmux` | login runs Claude Code inside a tmux session | `install.sh` (copies the machine's own tmux, else downloads the published static build); install manually only if it can fetch neither |
+| `bash`, `base64` | login writes the CA + login settings via `bash -lc` + `base64 -d` | preinstalled on every Linux (bash + coreutils) |
 
-Concrete setup for a fresh Debian/Ubuntu machine (run as the SSH user, with sudo if not root):
+Not required: **`update-ca-certificates`**. The connector trusts the MITM CA via `NODE_EXTRA_CA_CERTS`
+(a file it points the login session at), never the system trust store — so no CA-store tool is needed.
+(This was an SSH-era requirement.)
+
+So a fresh Debian/Ubuntu machine really just needs Claude Code + the operator key:
 
 ```sh
-apt-get update && apt-get install -y tmux ca-certificates curl
 curl -fsSL https://claude.ai/install.sh | bash          # Claude Code (self-contained)
-# then add the operator public key so CCProxy can SSH in:
+# add the operator public key so CCProxy can SSH in to install the connector:
 mkdir -p ~/.ssh && curl -s "$BACKEND/ccproxy/provisioning/ssh-pubkey" -H "Authorization: Bearer $TENANT_SECRET" \
   | sed -n 's/.*"publicKey":"\([^"]*\)".*/\1/p' >> ~/.ssh/authorized_keys
 ```
 
-> **Important — provisioning does NOT verify this.** `provision()` only installs the CA, sets the
-> proxy, and registers the session, so a machine with **no `claude` or `tmux`** still reaches
-> `AWAITING_LOGIN`. The missing tool is only discovered when you trigger **login**, which then fails
-> (e.g. `tmux: command not found`) and bounces the machine back to `AWAITING_LOGIN`. If a login flips
-> straight back to `AWAITING_LOGIN`, read the login-request's `error` — it is almost always a missing
-> package or a `sudo`/permission problem on the machine.
+> **`connect` preflights these.** `ccproxy-connector connect` (run at the end of the SSH bootstrap, or
+> by hand on a hostless machine) checks these requirements **before enrolling** and exits with a clear
+> "missing required tooling" error if `claude` (or tmux/base64/bash) is absent. For an SSH-bootstrapped
+> machine that failure surfaces as the machine's `ERROR` status + `error` on `GET /machine`, so a
+> missing package is visible **at add time** instead of only failing later at login. `ccproxy-connector
+> doctor` runs the same check without connecting.
 
-Provisioning then, over SSH:
-
-1. writes the CA to `/usr/local/share/ca-certificates/ccproxy-ca.crt` and runs
-   `update-ca-certificates`;
-2. appends to `/etc/environment`: `HTTPS_PROXY`/`HTTP_PROXY` (this machine's own proxy-auth against
-   the engine) and `NODE_EXTRA_CA_CERTS` pointing at the CA;
-3. registers the session with the engine.
-
-Login then runs Claude Code inside `tmux` with those env vars set explicitly on the session.
+Provisioning over SSH is one bootstrap: `curl <base>/install.sh | sh` (installs the connector +
+private tmux), then `ccproxy-connector connect … --token …` (preflights, enrols, dials in). The
+per-login CA and `HTTPS_PROXY`/`NODE_EXTRA_CA_CERTS` are set by the backend on each login session over
+the connector link — not written into `/etc/environment`.
 
 ---
 

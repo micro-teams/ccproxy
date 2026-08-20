@@ -158,18 +158,22 @@ type prereq struct {
 	install   string
 }
 
-// The client-machine requirements from the README's "What a machine must provide" table. No network
-// reachability is checked on purpose: the machine reaches Anthropic THROUGH the engine, never
-// directly, so probing api.anthropic.com from here would be the wrong test.
+// The machine's actual runtime requirements in the connector model. No network reachability is
+// checked on purpose: the machine reaches Anthropic THROUGH the engine, never directly, so probing
+// api.anthropic.com would be the wrong test. Deliberately NOT checked: update-ca-certificates — the
+// connector trusts the MITM CA via NODE_EXTRA_CA_CERTS (a file), never the system trust store, so
+// that tool is not needed at all (it was an SSH-era requirement).
 var machinePrereqs = []prereq{
 	{name: "claude", loginPATH: true, why: "the Claude Code CLI that is logged in and run",
 		install: "curl -fsSL https://claude.ai/install.sh | bash"},
+	// tmux is normally provided by install.sh (a copied system tmux or the published static build);
+	// this only fails if install.sh could fetch neither.
 	{name: "tmux", loginPATH: true, privTmux: true, why: "login runs Claude Code inside a tmux session",
-		install: "apt-get install -y tmux"},
-	{name: "update-ca-certificates", alts: []string{"update-ca-trust"},
-		why: "installs the MITM CA into the trust store", install: "apt-get install -y ca-certificates"},
-	{name: "base64", why: "the CA is decoded onto disk with base64", install: "coreutils (usually preinstalled)"},
-	{name: "bash", why: "the provisioning/login steps run under bash", install: "usually preinstalled"},
+		install: "apt-get install -y tmux (usually already handled by install.sh)"},
+	// base64 + bash are used by login (bash -lc + base64 -d write the CA and login settings). They
+	// ship with every Linux (coreutils + bash), so this is a belt-and-suspenders check.
+	{name: "base64", why: "login writes the CA/settings via base64 -d", install: "coreutils (preinstalled)"},
+	{name: "bash", why: "login steps run under bash -lc", install: "preinstalled"},
 }
 
 // resolves reports whether any of the given command names is available — on the connector's PATH,

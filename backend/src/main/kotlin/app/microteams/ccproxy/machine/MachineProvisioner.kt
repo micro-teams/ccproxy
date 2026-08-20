@@ -65,19 +65,29 @@ class MachineProvisioner(
                 config.provisioning.sshReadyTimeoutSeconds,
             )
 
-            // The one and only SSH command: install the connector and dial in. `connect` installs a
-            // boot service where there is one and falls back to a detached run where there isn't.
-            // Runs as the login user (no root/sudo): the binary lands in ~/.local/bin.
-            val remote =
-                "curl -fsSL '$base/install.sh' | sh && " +
-                    "PATH=\"\$HOME/.local/bin:\$PATH\" ccproxy-connector connect '$base' " +
-                    "--token '${machine.deviceToken}'"
+            // Install the connector on its own SSH command, as the login user (binary →
+            // ~/.local/bin),
+            // so its verbose output can't bury the connect error below in the machine's 1000-char
+            // error.
             operatorSsh.run(
                 machine.sshUser,
                 machine.host!!,
                 machine.sshPort,
-                remote,
-                timeoutSeconds = 180,
+                "curl -fsSL '$base/install.sh' | sh",
+                timeoutSeconds = 120,
+            )
+            // Then dial in. `connect` first PREFLIGHTS the machine's requirements (claude, tmux, …)
+            // and exits non-zero with a clear "missing required tooling" message if something is
+            // absent — which surfaces here as the machine's ERROR/error, visible on GET /machine,
+            // instead of only failing later at login. `connect` installs a boot service where there
+            // is one and falls back to a detached run where there isn't.
+            operatorSsh.run(
+                machine.sshUser,
+                machine.host!!,
+                machine.sshPort,
+                "PATH=\"\$HOME/.local/bin:\$PATH\" ccproxy-connector connect '$base' " +
+                    "--token '${machine.deviceToken}'",
+                timeoutSeconds = 120,
             )
 
             if (!waitOnline(machine.id!!.toString(), 90)) {
