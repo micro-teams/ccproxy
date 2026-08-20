@@ -96,6 +96,20 @@ jobs:
           python -m py_compile proxy-engine/*.py
           pip install pyflakes >/dev/null && python -m pyflakes proxy-engine/*.py
 
+  # The refresh-absorption contract (#67), proven live: boots the real engine against a mock
+  # Anthropic and drives a client through login capture, absorbed refreshes (stable fake pair),
+  # a 5-holder single-flight real rotation, and the honest invalid_grant passthrough. Stdlib +
+  # openssl only — no docker, no account, no network.
+  engine-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Refresh absorption test (live engine, mock Anthropic)
+        run: python proxy-engine/test_refresh_absorption.py
+
   # The machine-side connector: a thin brand shell over the shared micro-connector library. It is a
   # shipped build artifact — the control plane serves these binaries to real machines — so CI vets
   # it, cross-compiles the published targets, and uploads them for the bundle. The Go version comes
@@ -435,7 +449,7 @@ jobs:
   # in branch protection / auto-merge rules instead of listing each job.
   ci-success:
     name: CI success
-    needs: [build-jar, build-frontend, lint, connector, build-tmux, build-applet, package-zip, test-compose, machine-login-compat, machine-connector-dialin, machine-revoke]
+    needs: [build-jar, build-frontend, lint, engine-test, connector, build-tmux, build-applet, package-zip, test-compose, machine-login-compat, machine-connector-dialin, machine-revoke]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All required CI jobs passed."
