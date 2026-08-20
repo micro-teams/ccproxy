@@ -14,21 +14,21 @@ import javax.validation.Valid
  * @param buckets
  */
 data class UsageSummaryDTO(
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("since")
     @get:JsonProperty("since", required = true)
     val since: kotlin.Long,
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("until")
     @get:JsonProperty("until", required = true)
     val until: kotlin.Long,
-    @Schema(
-        example = "null",
-        required = true,
-        description = "bucket width, e.g. 60 for 1-minute buckets",
-    )
+    @Schema(required = true, description = "bucket width, e.g. 60 for 1-minute buckets")
+    @param:JsonProperty("bucketSeconds")
     @get:JsonProperty("bucketSeconds", required = true)
     val bucketSeconds: kotlin.Int,
     @field:Valid
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("buckets")
     @get:JsonProperty("buckets", required = true)
     val buckets: kotlin.collections.List<UsageBucketDTO>,
 ) {}

@@ -5,7 +5,8 @@ import io.swagger.v3.oas.annotations.media.Schema
 
 /** @param password */
 data class SuperadminLoginRequestDTO(
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("password")
     @get:JsonProperty("password", required = true)
     val password: kotlin.String
 ) {}

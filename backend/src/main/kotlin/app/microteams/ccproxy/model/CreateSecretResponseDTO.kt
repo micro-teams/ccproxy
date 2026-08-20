@@ -11,17 +11,16 @@ import io.swagger.v3.oas.annotations.media.Schema
  * @param label
  */
 data class CreateSecretResponseDTO(
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("id")
     @get:JsonProperty("id", required = true)
     val id: kotlin.Long,
-    @Schema(
-        example = "null",
-        required = true,
-        description = "the plaintext bearer secret; shown once",
-    )
+    @Schema(required = true, description = "the plaintext bearer secret; shown once")
+    @param:JsonProperty("secret")
     @get:JsonProperty("secret", required = true)
     val secret: kotlin.String,
-    @Schema(example = "null", description = "")
+    @Schema(description = "")
+    @param:JsonProperty("label")
     @get:JsonProperty("label")
     val label: kotlin.String? = null,
 ) {}

@@ -10,10 +10,12 @@ import io.swagger.v3.oas.annotations.media.Schema
  * @param expiresAt epoch seconds if known
  */
 data class SetupTokenStatusDTO(
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("present")
     @get:JsonProperty("present", required = true)
     val present: kotlin.Boolean,
-    @Schema(example = "null", description = "epoch seconds if known")
+    @Schema(description = "epoch seconds if known")
+    @param:JsonProperty("expiresAt")
     @get:JsonProperty("expiresAt")
     val expiresAt: kotlin.Long? = null,
 ) {}

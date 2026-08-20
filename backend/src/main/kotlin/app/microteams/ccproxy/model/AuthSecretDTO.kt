@@ -15,23 +15,29 @@ import javax.validation.Valid
  * @param lastUsedAt
  */
 data class AuthSecretDTO(
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("id")
     @get:JsonProperty("id", required = true)
     val id: kotlin.Long,
-    @Schema(example = "null", required = true, description = "tenant id or login-operator id")
+    @Schema(required = true, description = "tenant id or login-operator id")
+    @param:JsonProperty("ownerId")
     @get:JsonProperty("ownerId", required = true)
     val ownerId: kotlin.Long,
     @field:Valid
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("status")
     @get:JsonProperty("status", required = true)
     val status: AuthSecretStatusDTO,
-    @Schema(example = "null", description = "")
+    @Schema(description = "")
+    @param:JsonProperty("label")
     @get:JsonProperty("label")
     val label: kotlin.String? = null,
-    @Schema(example = "null", description = "")
+    @Schema(description = "")
+    @param:JsonProperty("createdAt")
     @get:JsonProperty("createdAt")
     val createdAt: java.time.OffsetDateTime? = null,
-    @Schema(example = "null", description = "")
+    @Schema(description = "")
+    @param:JsonProperty("lastUsedAt")
     @get:JsonProperty("lastUsedAt")
     val lastUsedAt: java.time.OffsetDateTime? = null,
 ) {}

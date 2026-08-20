@@ -11,17 +11,21 @@ import javax.validation.Valid
  * @param createdAt
  */
 data class TenantDTO(
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("id")
     @get:JsonProperty("id", required = true)
     val id: kotlin.Long,
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("name")
     @get:JsonProperty("name", required = true)
     val name: kotlin.String,
     @field:Valid
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("status")
     @get:JsonProperty("status", required = true)
     val status: TenantStatusDTO,
-    @Schema(example = "null", description = "")
+    @Schema(description = "")
+    @param:JsonProperty("createdAt")
     @get:JsonProperty("createdAt")
     val createdAt: java.time.OffsetDateTime? = null,
 ) {}

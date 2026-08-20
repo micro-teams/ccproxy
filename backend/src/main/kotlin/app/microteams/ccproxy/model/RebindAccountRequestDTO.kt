@@ -5,7 +5,8 @@ import io.swagger.v3.oas.annotations.media.Schema
 
 /** @param accountId */
 data class RebindAccountRequestDTO(
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("accountId")
     @get:JsonProperty("accountId", required = true)
     val accountId: kotlin.Long
 ) {}
