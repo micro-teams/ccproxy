@@ -10,7 +10,8 @@ import io.swagger.v3.oas.annotations.media.Schema
  * @param oauthToken
  */
 data class SetSetupTokenRequestDTO(
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("oauthToken")
     @get:JsonProperty("oauthToken", required = true)
     val oauthToken: kotlin.String
 ) {}

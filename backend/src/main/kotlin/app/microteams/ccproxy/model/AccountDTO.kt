@@ -1,6 +1,9 @@
 package app.microteams.ccproxy.model
 
+import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.annotation.JsonSetter
+import com.fasterxml.jackson.annotation.Nulls
 import io.swagger.v3.oas.annotations.media.Schema
 import javax.validation.Valid
 
@@ -18,30 +21,35 @@ import javax.validation.Valid
  * @param createdAt
  */
 data class AccountDTO(
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("id")
     @get:JsonProperty("id", required = true)
     val id: kotlin.Long,
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("email")
     @get:JsonProperty("email", required = true)
     val email: kotlin.String,
-    @Schema(
-        example = "null",
-        required = true,
-        description = "upstream proxy URL, e.g. http://egress-proxy:7890",
-    )
+    @Schema(required = true, description = "upstream proxy URL, e.g. http://egress-proxy:7890")
+    @param:JsonProperty("proxy")
     @get:JsonProperty("proxy", required = true)
     val proxy: kotlin.String,
     @field:Valid
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("status")
     @get:JsonProperty("status", required = true)
     val status: AccountStatusDTO,
-    @Schema(example = "null", description = "")
+    @Schema(description = "")
+    @param:JsonProperty("remark")
     @get:JsonProperty("remark")
     val remark: kotlin.String? = null,
-    @Schema(example = "null", description = "machines currently bound to this account")
+    @Schema(description = "machines currently bound to this account")
+    @field:JsonInclude(JsonInclude.Include.NON_NULL)
+    @field:JsonSetter(nulls = Nulls.SKIP)
+    @param:JsonProperty("machineCount")
     @get:JsonProperty("machineCount")
     val machineCount: kotlin.Int? = null,
-    @Schema(example = "null", description = "")
+    @Schema(description = "")
+    @param:JsonProperty("createdAt")
     @get:JsonProperty("createdAt")
     val createdAt: java.time.OffsetDateTime? = null,
 ) {}

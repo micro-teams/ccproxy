@@ -17,31 +17,40 @@ import io.swagger.v3.oas.annotations.media.Schema
  * @param cacheWriteTokens
  */
 data class UsageEntryDTO(
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("id")
     @get:JsonProperty("id", required = true)
     val id: kotlin.Long,
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("tenantId")
     @get:JsonProperty("tenantId", required = true)
     val tenantId: kotlin.Long,
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("machineId")
     @get:JsonProperty("machineId", required = true)
     val machineId: kotlin.Long,
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("model")
     @get:JsonProperty("model", required = true)
     val model: kotlin.String,
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("inputTokens")
     @get:JsonProperty("inputTokens", required = true)
     val inputTokens: kotlin.Long,
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("outputTokens")
     @get:JsonProperty("outputTokens", required = true)
     val outputTokens: kotlin.Long,
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("at")
     @get:JsonProperty("at", required = true)
     val at: java.time.OffsetDateTime,
-    @Schema(example = "null", description = "")
+    @Schema(description = "")
+    @param:JsonProperty("cacheReadTokens")
     @get:JsonProperty("cacheReadTokens")
     val cacheReadTokens: kotlin.Long? = null,
-    @Schema(example = "null", description = "")
+    @Schema(description = "")
+    @param:JsonProperty("cacheWriteTokens")
     @get:JsonProperty("cacheWriteTokens")
     val cacheWriteTokens: kotlin.Long? = null,
 ) {}

@@ -14,22 +14,28 @@ import io.swagger.v3.oas.annotations.media.Schema
  * @param nextStart
  */
 data class PageDTO(
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("pageSize")
     @get:JsonProperty("pageSize", required = true)
     val pageSize: kotlin.Int,
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("hasPrev")
     @get:JsonProperty("hasPrev", required = true)
     val hasPrev: kotlin.Boolean,
-    @Schema(example = "null", required = true, description = "")
+    @Schema(required = true, description = "")
+    @param:JsonProperty("hasMore")
     @get:JsonProperty("hasMore", required = true)
     val hasMore: kotlin.Boolean,
-    @Schema(example = "null", description = "")
+    @Schema(description = "")
+    @param:JsonProperty("pageStart")
     @get:JsonProperty("pageStart")
     val pageStart: kotlin.Long? = null,
-    @Schema(example = "null", description = "")
+    @Schema(description = "")
+    @param:JsonProperty("prevStart")
     @get:JsonProperty("prevStart")
     val prevStart: kotlin.Long? = null,
-    @Schema(example = "null", description = "")
+    @Schema(description = "")
+    @param:JsonProperty("nextStart")
     @get:JsonProperty("nextStart")
     val nextStart: kotlin.Long? = null,
 ) {}

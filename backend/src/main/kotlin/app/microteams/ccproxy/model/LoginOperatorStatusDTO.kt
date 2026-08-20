@@ -13,7 +13,10 @@ enum class LoginOperatorStatusDTO(@get:JsonValue val value: kotlin.String) {
         @JvmStatic
         @JsonCreator
         fun forValue(value: kotlin.String): LoginOperatorStatusDTO {
-            return values().first { it -> it.value == value }
+            return values().firstOrNull { it -> it.value == value }
+                ?: throw IllegalArgumentException(
+                    "Unexpected value '$value' for enum 'LoginOperatorStatusDTO'"
+                )
         }
     }
 }
