@@ -232,7 +232,9 @@ jobs:
           cp deploy/docker-compose.yml deploy/nginx.conf deploy/gen-env.sh deploy/README.md "$STAGE/"
           cp artifacts/create-sql/CREATE.sql "$STAGE/CREATE.sql"
           cp -r deploy/init "$STAGE/"
+          # Runtime files only — the engine's tests and bytecode caches must not ship in the bundle.
           cp -r proxy-engine "$STAGE/proxy-engine"
+          rm -rf "$STAGE/proxy-engine/__pycache__" "$STAGE"/proxy-engine/test_*.py
           cp artifacts/jar/*.jar "$STAGE/backend/backend.jar"
           cp -r artifacts/frontend-dist/. "$STAGE/frontend/dist/"
           chmod +x "$STAGE/gen-env.sh"
