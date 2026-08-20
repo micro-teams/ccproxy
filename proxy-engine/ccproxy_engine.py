@@ -48,6 +48,19 @@ CA_CERT = os.environ.get("CCPROXY_CA_CERT", "/keys/ca.crt")
 CA_KEY = os.environ.get("CCPROXY_CA_KEY", "/keys/ca.key")
 CERTS_DIR = os.environ.get("CCPROXY_CERTS_DIR", "/tmp/ccproxy-certs")
 MITM_DOMAINS = {"api.anthropic.com", "platform.claude.com"}
+# Idle keep-alive management for a decrypted MITM connection. CLIENT_IDLE_TIMEOUT is how long the
+# connection may sit BETWEEN requests before we reap it — kept well above the client's own keep-alive
+# reuse window so the proxy is never the shortest idle timeout on the path. (When it was, the client
+# would reuse a pooled socket we had already closed and the first request failed — the "connection
+# failed, works on retry" symptom.) Reading an already-started request uses CLIENT_ACTIVE_TIMEOUT.
+CLIENT_IDLE_TIMEOUT = int(os.environ.get("CCPROXY_CLIENT_IDLE_TIMEOUT", "900"))
+CLIENT_ACTIVE_TIMEOUT = int(os.environ.get("CCPROXY_CLIENT_ACTIVE_TIMEOUT", "120"))
+# Read timeout on the upstream (Anthropic) socket once connected — generous, so a long streamed
+# generation with a quiet stretch isn't mistaken for a dead connection. The connect itself stays 30s.
+UPSTREAM_TIMEOUT = int(os.environ.get("CCPROXY_UPSTREAM_TIMEOUT", "300"))
+# TCP keepalive on the long-lived sockets (both legs): probes keep an idle connection's NAT/firewall
+# mapping warm and surface a silently dropped peer proactively, instead of failing on the next use.
+TCP_KEEPIDLE = int(os.environ.get("CCPROXY_TCP_KEEPIDLE", "60"))
 # A refresh grant arriving while the real access token still has more than this many seconds of
 # life is answered locally without touching upstream. Must stay ABOVE the claude CLI's own
 # proactive-refresh margin (minutes), or a locally-answered client would immediately consider its
@@ -243,6 +256,19 @@ def gen_cert(domain):
 
 
 # ── Upstream connection through the session's account proxy ────────────────────
+def set_tcp_keepalive(sock):
+    """Enable TCP keepalive on a long-lived socket: keeps an idle connection's NAT/firewall mapping
+    alive and surfaces a dead peer proactively rather than on the next write. Options past
+    SO_KEEPALIVE are Linux-specific and applied best-effort."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, val in (("TCP_KEEPIDLE", TCP_KEEPIDLE), ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4)):
+            if hasattr(socket, name):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), val)
+    except OSError:
+        pass
+
+
 def upstream_tls(host, port, account_proxy):
     """Open a TLS connection to host:port, tunnelling through account_proxy (http://h:p)."""
     ctx = ssl.create_default_context()
@@ -263,6 +289,10 @@ def upstream_tls(host, port, account_proxy):
             raise ConnectionError(f"egress proxy refused CONNECT: {resp[:80]!r}")
     else:
         raw = socket.create_connection((host, port), timeout=30)
+    # Long-lived and reused across a client's requests: keep it warm and give reads room for a slow
+    # stream, rather than the 30s connect timeout that create_connection leaves on the socket.
+    set_tcp_keepalive(raw)
+    raw.settimeout(UPSTREAM_TIMEOUT)
     return ctx.wrap_socket(raw, server_hostname=host)
 
 
@@ -652,12 +682,18 @@ def handle_mitm(client_tls, host, port, sess, user):
 
     try:
         while True:
+            # Waiting for the next request on a kept-alive connection: allow a long idle gap so we
+            # never reap a connection the client still considers reusable.
+            client_tls.settimeout(CLIENT_IDLE_TIMEOUT)
             line = recv_line(client_tls)
             if line is None:
                 break
             parts = line.strip().split(b" ")
             if len(parts) < 3:
                 break
+            # A request has started; a stalled mid-request read shouldn't hold the connection open
+            # for the full idle window.
+            client_tls.settimeout(CLIENT_ACTIVE_TIMEOUT)
             method, path = parts[0].decode(), parts[1].decode()
             h = parse_headers(client_tls)
             if h is None:
@@ -760,6 +796,9 @@ def forward_plain_http(cs, parts):
 
 def handle_client(cs):
     try:
+        # The machine's connection is long-lived (keep-alive) whether MITM'd or tunnelled — keep it
+        # warm so an idle gap doesn't get its NAT mapping reaped.
+        set_tcp_keepalive(cs)
         line = recv_line(cs)
         if not line:
             return
@@ -789,7 +828,7 @@ def handle_client(cs):
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ctx.load_cert_chain(cf, kf)
             client_tls = ctx.wrap_socket(cs, server_side=True)
-            client_tls.settimeout(120)
+            # Idle/active timeouts are managed per-request inside handle_mitm.
             handle_mitm(client_tls, host, port, sess, user)
         else:
             # Anything we don't MITM (non-Anthropic domains, or unauthenticated) tunnels DIRECT — it
@@ -800,6 +839,7 @@ def handle_client(cs):
             # precise MITM path.
             cs.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             up = socket.create_connection((host, port), timeout=30)
+            set_tcp_keepalive(up)
             tunnel(cs, up)
     except Exception as e:
         log(f"client: {str(e)[:100]}")
