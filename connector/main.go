@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -48,6 +49,7 @@ func root() *cobra.Command {
 		enrollCmd(&cfgPath),
 		runCmd(&cfgPath),
 		connectCmd(&cfgPath),
+		doctorCmd(&cfgPath),
 		disconnectCmd(&cfgPath),
 		statusCmd(&cfgPath),
 		updateCmd(&cfgPath),
@@ -141,10 +143,120 @@ func resident(cfgPath string) service.Runner {
 	}
 }
 
+// ── machine preflight (README "What a machine must provide") ────────────────────
+// Neither provisioning nor enrolment verifies the machine's own tooling, so a machine missing e.g.
+// `claude` still enrolls and reaches AWAITING_LOGIN — the gap only surfaces later, cryptically, when
+// login runs (`tmux: command not found`, or claude not on the login PATH). This preflight checks the
+// README prerequisites up front so `connect` fails fast with a clear, actionable message instead.
+
+type prereq struct {
+	name      string   // primary command to look for
+	alts      []string // acceptable equivalents (same job on another distro)
+	loginPATH bool     // resolve through the login shell (bash -lc), matching how login invokes it
+	privTmux  bool     // also satisfied by the connector's own private tmux (installed by install.sh)
+	why       string
+	install   string
+}
+
+// The machine's actual runtime requirements in the connector model. No network reachability is
+// checked on purpose: the machine reaches Anthropic THROUGH the engine, never directly, so probing
+// api.anthropic.com would be the wrong test. Deliberately NOT checked: update-ca-certificates — the
+// connector trusts the MITM CA via NODE_EXTRA_CA_CERTS (a file), never the system trust store, so
+// that tool is not needed at all (it was an SSH-era requirement).
+var machinePrereqs = []prereq{
+	{name: "claude", loginPATH: true, why: "the Claude Code CLI that is logged in and run",
+		install: "curl -fsSL https://claude.ai/install.sh | bash"},
+	// tmux is normally provided by install.sh (a copied system tmux or the published static build);
+	// this only fails if install.sh could fetch neither.
+	{name: "tmux", loginPATH: true, privTmux: true, why: "login runs Claude Code inside a tmux session",
+		install: "apt-get install -y tmux (usually already handled by install.sh)"},
+	// base64 + bash are used by login (bash -lc + base64 -d write the CA and login settings). They
+	// ship with every Linux (coreutils + bash), so this is a belt-and-suspenders check.
+	{name: "base64", why: "login writes the CA/settings via base64 -d", install: "coreutils (preinstalled)"},
+	{name: "bash", why: "login steps run under bash -lc", install: "preinstalled"},
+}
+
+// resolves reports whether any of the given command names is available — on the connector's PATH,
+// and (when loginPATH is set) on the login shell's PATH, where the claude.ai installer's ~/.local/bin
+// actually lands.
+func resolves(names []string, loginPATH bool) bool {
+	for _, n := range names {
+		if _, err := exec.LookPath(n); err == nil {
+			return true
+		}
+		if loginPATH {
+			if err := exec.Command("bash", "-lc", "command -v "+n).Run(); err == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// privateTmux is where install.sh drops the connector's own tmux, next to the config file.
+func privateTmux(cfgPath string) string {
+	return filepath.Join(filepath.Dir(cfgPath), "bin", "tmux")
+}
+
+// preflight returns the required tools that are missing on this machine.
+func preflight(cfgPath string) []prereq {
+	var missing []prereq
+	for _, p := range machinePrereqs {
+		names := append([]string{p.name}, p.alts...)
+		if resolves(names, p.loginPATH) {
+			continue
+		}
+		if p.privTmux {
+			if fi, err := os.Stat(privateTmux(cfgPath)); err == nil && fi.Mode()&0o111 != 0 {
+				continue
+			}
+		}
+		missing = append(missing, p)
+	}
+	return missing
+}
+
+func preflightError(missing []prereq) error {
+	var b strings.Builder
+	b.WriteString("this machine is missing required tooling (README → \"What a machine must provide\"):\n")
+	for _, p := range missing {
+		b.WriteString(fmt.Sprintf("  - %s: %s\n      install: %s\n", p.name, p.why, p.install))
+	}
+	b.WriteString("install the above and re-run `connect`, or pass --skip-preflight to connect anyway")
+	return errors.New(b.String())
+}
+
+// doctorCmd runs the same preflight without connecting, so an operator can check a machine.
+func doctorCmd(cfgPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "doctor",
+		Short: "Check this machine meets the client-machine requirements (does not connect)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			missing := preflight(*cfgPath)
+			for _, p := range machinePrereqs {
+				mark := "ok"
+				for _, m := range missing {
+					if m.name == p.name {
+						mark = "MISSING"
+					}
+				}
+				fmt.Printf("  [%s] %s\n", mark, p.name)
+			}
+			if len(missing) > 0 {
+				return preflightError(missing)
+			}
+			fmt.Println("all client-machine requirements satisfied")
+			return nil
+		},
+	}
+}
+
 // connect enrols the machine if it is not already, then installs and starts the boot service so it
 // reconnects on every boot. This is the one command a freshly-installed machine is told to run.
 func connectCmd(cfgPath *string) *cobra.Command {
 	var token string
+	var skipPreflight bool
 	c := &cobra.Command{
 		Use:   "connect [base-url]",
 		Short: "Enrol (if needed) and stay connected across reboots",
@@ -156,6 +268,12 @@ func connectCmd(cfgPath *string) *cobra.Command {
 			}
 			if cfg.Base == "" {
 				return errors.New("no control-plane base URL: pass one, e.g. `connect https://host/ccproxy`")
+			}
+			// Surface a broken machine before it enrolls into a state that only fails later at login.
+			if !skipPreflight {
+				if missing := preflight(*cfgPath); len(missing) > 0 {
+					return preflightError(missing)
+				}
 			}
 			if cfg.Token == "" {
 				if err := enroll(*cfgPath, cfg, token); err != nil {
@@ -180,6 +298,7 @@ func connectCmd(cfgPath *string) *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&token, "token", "", "device token issued when the machine was created")
+	c.Flags().BoolVar(&skipPreflight, "skip-preflight", false, "skip the client-machine requirement checks")
 	return c
 }
 
