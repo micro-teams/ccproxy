@@ -76,11 +76,14 @@ super-admin: create a tenant + mint a tenant secret
 super-admin: create a login-operator + mint an operator secret
 
 tenant:      POST /machine            ── binds the machine to a free account, status=CREATED
-             (async) provision        ── SSH in: install CA, set HTTPS_PROXY + NODE_EXTRA_CA_CERTS,
-                                          register the session with the engine → status=AWAITING_LOGIN
+             (async) provision        ── SSH host: SSH in ONCE to install the connector + dial in
+                                          (curl install.sh | sh && ccproxy-connector connect); a
+                                          hostless machine skips this — the operator runs it by hand.
+                                          Online → status=AWAITING_LOGIN
 tenant:      POST /machine/{id}/login ── opens a login-request, status=LOGGING_IN
-             (async) prepare          ── tmux runs Claude Code, drives the first-run wizard, scrapes
-                                          the OAuth authorize URL → login-request AWAITING_CODE
+             (async) prepare          ── over the connector link: set the login CA + HTTPS_PROXY on
+                                          the session, run Claude Code in tmux (claude.js applet),
+                                          scrape the OAuth authorize URL → login-request AWAITING_CODE
 
 operator:    GET  /login-request      ── sees the pending request + the authorize URL
              (browser) open the URL, authenticate as the account identity, copy the "code#state"
@@ -108,7 +111,8 @@ flowchart TD
   admin(["super-admin"]) -->|password → JWT| nginx
   nginx -->|/| spa[test SPA]
   nginx -->|/ccproxy| backend["backend (Kotlin/Spring)"]
-  backend -->|SSH: install CA, set proxy, drive /login| machine["remote machine<br/>Claude Code (fake creds)"]
+  backend -->|SSH once: install the connector| machine["remote machine<br/>connector · Claude Code (fake creds)"]
+  machine -->|connector dial-out wss: login driving + control| backend
   backend -->|control API :9000| engine["proxy-engine (MITM)"]
   machine -->|HTTPS_PROXY :3128| engine
   engine -->|fake→real swap, per-account egress| egress["egress-proxy :7890"]
@@ -123,7 +127,7 @@ flowchart TD
 
 | Component | Tech | Role |
 |---|---|---|
-| **backend** | Kotlin / Spring Boot 3.4 | The control plane. Implements the API generated from `CCProxy-API.yml`, the three-role authz, the account pool, machine provisioning over SSH, and login orchestration. |
+| **backend** | Kotlin / Spring Boot 3.4 | The control plane. Implements the API generated from `CCProxy-API.yml`, the three-role authz, the account pool, machine bootstrap (a one-time SSH install of the connector), and login orchestration over the connector link. |
 | **proxy-engine** | Python (stdlib only) | The data plane. A forward proxy on `:3128` that MITMs Anthropic hosts per session, plus a control API on `:9000` the backend uses to register sessions and prime/read logins. Signs per-host leaf certs from the mounted CA. |
 | **egress-proxy** | Python (stdlib only) | The default per-account egress. A plain `CONNECT` proxy on `:7890` so a machine's API traffic and its browser login share one outbound IP. An account may instead point at any external proxy. |
 | **frontend** | React + Vite | A minimal test SPA that talks only to the public `/ccproxy` API. Useful for driving the flow by hand. |
@@ -204,7 +208,8 @@ OSEC=$(curl -s -X POST $B/login-operator/$OID/secret -H "$A" -H 'Content-Type: a
 # 4. the tenant learns the operator SSH public key to authorize on its machines
 curl -s $B/provisioning/ssh-pubkey -H "Authorization: Bearer $TSEC"
 
-# 5. the tenant registers a machine (host must be reachable from the backend over SSH)
+# 5. the tenant registers a machine (with an SSH host, reachable from the backend, the backend
+#    bootstraps it; omit "host" for a hostless machine and run the installer on it by hand)
 MID=$(curl -s -X POST $B/machine -H "Authorization: Bearer $TSEC" -H 'Content-Type: application/json' \
       -d '{"host":"my-host","label":"m1"}' | jq -r .id)
 #    poll until AWAITING_LOGIN:
@@ -281,9 +286,9 @@ the connector link — not written into `/etc/environment`.
 
 These are real behaviours discovered while validating the flow — worth knowing before touching it:
 
-- **Node ignores the system CA store.** Installing the CA with `update-ca-certificates` is not
-  enough for Claude Code; you must also set `NODE_EXTRA_CA_CERTS` to the CA file, or Node fails with
-  `UNABLE_TO_VERIFY_LEAF_SIGNATURE`.
+- **Node ignores the system CA store.** So the connector never installs the CA into it — it points
+  Claude Code at the CA file via `NODE_EXTRA_CA_CERTS`, set on the login session. Without that env
+  var Node fails with `UNABLE_TO_VERIFY_LEAF_SIGNATURE`.
 - **The engine's `keys/` is read-only**, so the per-host leaf-cert serial file is written into the
   engine's writable certs dir (`CCPROXY_CERTS_DIR`), not next to the CA.
 - **The CA is shipped to machines base64-encoded on one line**, not via a heredoc — a multi-line PEM
