@@ -16,6 +16,24 @@ import "./styles.css";
 type Role = "admin" | "tenant" | "operator";
 type Session = { role: Role; token: string };
 
+// Compact "resets in" countdown from an epoch-seconds reset time.
+function fmtReset(epoch?: number | null): string {
+  if (!epoch) return "?";
+  const secs = epoch - Math.floor(Date.now() / 1000);
+  if (secs <= 0) return "now";
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  return h > 0 ? `${h}h${m}m` : `${m}m`;
+}
+
+// Render one quota window as "NN% (resets in …)", flagging non-allowed status.
+function fmtQuota(util?: number | null, resetAt?: number | null, status?: string | null): string {
+  if (util == null) return "—";
+  const pct = `${Math.round(util * 100)}%`;
+  const warn = status && status !== "allowed" ? " ⚠" : "";
+  return `${pct}${warn} (${fmtReset(resetAt)})`;
+}
+
 const STORE_KEY = "ccproxy.session";
 
 function loadSession(): Session | null {
@@ -217,6 +235,18 @@ function AdminPanels({ tab, token }: { tab: string; token: string }) {
           { key: "remark", label: "remark" },
           { key: "status", label: "status" },
           { key: "machineCount", label: "machines" },
+          {
+            key: "quota.fiveHUtilization",
+            label: "5h quota",
+            render: (_v, r) =>
+              fmtQuota(r.quota?.fiveHUtilization, r.quota?.fiveHResetAt, r.quota?.fiveHStatus),
+          },
+          {
+            key: "quota.sevenDUtilization",
+            label: "7d quota",
+            render: (_v, r) =>
+              fmtQuota(r.quota?.sevenDUtilization, r.quota?.sevenDResetAt, r.quota?.sevenDStatus),
+          },
         ]}
         load={() => request("GET", "/account", { token })}
         createFields={[

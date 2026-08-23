@@ -42,6 +42,7 @@ class AccountService(
     private val machineRepository: MachineRepository,
     private val config: CCProxyConfig,
     private val credentialRepository: CredentialRepository,
+    private val rateLimitRepository: AccountRateLimitRepository,
 ) {
     fun get(id: IdType): Account =
         repository.findById(id).orElseThrow { NotFoundError("account", id) }
@@ -54,6 +55,18 @@ class AccountService(
             remark = a.remark,
             status = a.status.toDTO(),
             machineCount = machineRepository.countByAccountId(a.id!!).toInt(),
+            quota =
+                rateLimitRepository.findByAccountId(a.id!!)?.let { rl ->
+                    AccountQuotaDTO(
+                        fiveHUtilization = rl.fiveHUtilization,
+                        fiveHResetAt = rl.fiveHResetAt,
+                        fiveHStatus = rl.fiveHStatus,
+                        sevenDUtilization = rl.sevenDUtilization,
+                        sevenDResetAt = rl.sevenDResetAt,
+                        sevenDStatus = rl.sevenDStatus,
+                        observedAt = rl.observedAt?.atOffset(ZoneOffset.UTC),
+                    )
+                },
             createdAt = a.createdAt?.atOffset(ZoneOffset.UTC),
         )
 

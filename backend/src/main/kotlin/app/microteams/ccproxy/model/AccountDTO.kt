@@ -18,6 +18,7 @@ import javax.validation.Valid
  * @param status
  * @param remark
  * @param machineCount machines currently bound to this account
+ * @param quota
  * @param createdAt
  */
 data class AccountDTO(
@@ -48,6 +49,11 @@ data class AccountDTO(
     @param:JsonProperty("machineCount")
     @get:JsonProperty("machineCount")
     val machineCount: kotlin.Int? = null,
+    @field:Valid
+    @Schema(description = "")
+    @param:JsonProperty("quota")
+    @get:JsonProperty("quota")
+    val quota: AccountQuotaDTO? = null,
     @Schema(description = "")
     @param:JsonProperty("createdAt")
     @get:JsonProperty("createdAt")
