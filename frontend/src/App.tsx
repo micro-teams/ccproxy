@@ -277,6 +277,25 @@ function AdminPanels({ tab, token }: { tab: string; token: string }) {
           { key: "boundAccountEmail", label: "account" },
         ]}
         load={() => request("GET", "/machine", { token })}
+        actions={[
+          {
+            label: "switch account",
+            run: async (r) => {
+              const accountId = window.prompt(
+                `Switch machine ${r.id} (${r.boundAccountEmail ?? "unbound"}) to which account id?`,
+              );
+              if (!accountId) return;
+              const res = await request("POST", `/machine/${r.id}/switch-account`, {
+                token,
+                body: { accountId: Number(accountId) },
+              });
+              const note = res?.requiresManualLogin
+                ? "Target account has NO setup-token — an interactive /login was started. A login-operator must open the OAuth URL and paste the code to finish the switch."
+                : "Switched via setup-token (automatic — no operator needed).";
+              return { note, ...res };
+            },
+          },
+        ]}
       />
     );
   return <UsagePanel token={token} />;

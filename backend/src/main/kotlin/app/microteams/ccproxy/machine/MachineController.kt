@@ -142,6 +142,27 @@ class MachineController(
             )
         )
 
+    @Guard("switch-machine-account", "machine")
+    override fun switchMachineAccount(
+        @PathVariable("id") @ResourceId id: IdType,
+        @RequestBody switchAccountRequestDTO: SwitchAccountRequestDTO,
+    ): ResponseEntity<SwitchAccountResponseDTO> {
+        val accountId = switchAccountRequestDTO.accountId
+        // Rebind the pointer, then actually re-login so the live upstream credential switches
+        // (rebind alone only flips machine.accountId). Detect the flow before starting: an account
+        // with a setup-token activates automatically; otherwise an operator must finish /login.
+        machineService.rebindAccount(id, accountId)
+        val requiresManualLogin = !loginRequestService.accountHasSetupToken(accountId)
+        val loginRequest = loginRequestService.startForMachine(id)
+        return ResponseEntity.status(HttpStatus.ACCEPTED)
+            .body(
+                SwitchAccountResponseDTO(
+                    requiresManualLogin = requiresManualLogin,
+                    loginRequest = loginRequest,
+                )
+            )
+    }
+
     @Guard("reprovision-machine", "machine")
     override fun reprovisionMachine(
         @PathVariable("id") @ResourceId id: IdType

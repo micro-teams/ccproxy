@@ -12,6 +12,8 @@ import app.microteams.ccproxy.model.LoginRequestDTO
 import app.microteams.ccproxy.model.MachineDTO
 import app.microteams.ccproxy.model.MachineStatusDTO
 import app.microteams.ccproxy.model.RebindAccountRequestDTO
+import app.microteams.ccproxy.model.SwitchAccountRequestDTO
+import app.microteams.ccproxy.model.SwitchAccountResponseDTO
 import app.microteams.ccproxy.model.UpdateMachineRequestDTO
 import io.swagger.v3.oas.annotations.*
 import io.swagger.v3.oas.annotations.enums.*
@@ -349,6 +351,54 @@ interface MachineApi {
 
     @Operation(
         tags = ["machine"],
+        summary = "Switch a machine to a different account and re-login in one step (super-admin)",
+        operationId = "switchMachineAccount",
+        description =
+            """Rebinds the machine to `accountId` and immediately starts a login on it, so the machine actually switches the live upstream credential (rebind alone only flips the pointer). If the target account has a stored setup-token the switch is automatic (no operator); otherwise an interactive `/login` is started and `requiresManualLogin` is true — a login-operator must finish it. Fails with 409 if a login for this machine is already in progress.""",
+        responses =
+            [
+                ApiResponse(
+                    responseCode = "202",
+                    description = "Accepted",
+                    content =
+                        [
+                            Content(
+                                schema = Schema(implementation = SwitchAccountResponseDTO::class)
+                            )
+                        ],
+                ),
+                ApiResponse(
+                    responseCode = "404",
+                    description = "Not Found",
+                    content = [Content(schema = Schema(implementation = ErrorDTO::class))],
+                ),
+                ApiResponse(
+                    responseCode = "409",
+                    description = "Conflict (precondition not met)",
+                    content = [Content(schema = Schema(implementation = ErrorDTO::class))],
+                ),
+            ],
+        security = [SecurityRequirement(name = "superAdmin")],
+    )
+    @RequestMapping(
+        method = [RequestMethod.POST],
+        // "/machine/{id}/switch-account"
+        value = [PATH_SWITCH_MACHINE_ACCOUNT],
+        produces = ["application/json"],
+        consumes = ["application/json"],
+    )
+    fun switchMachineAccount(
+        @Parameter(description = "", required = true) @PathVariable("id") id: kotlin.Long,
+        @Parameter(description = "", required = true)
+        @Valid
+        @RequestBody
+        switchAccountRequestDTO: SwitchAccountRequestDTO,
+    ): ResponseEntity<SwitchAccountResponseDTO> {
+        return ResponseEntity(HttpStatus.NOT_IMPLEMENTED)
+    }
+
+    @Operation(
+        tags = ["machine"],
         summary = "Rename a machine",
         operationId = "updateMachine",
         description = """""",
@@ -394,6 +444,7 @@ interface MachineApi {
         const val PATH_REBIND_MACHINE_ACCOUNT: String = "/machine/{id}/account"
         const val PATH_REPROVISION_MACHINE: String = "/machine/{id}/reprovision"
         const val PATH_START_MACHINE_LOGIN: String = "/machine/{id}/login"
+        const val PATH_SWITCH_MACHINE_ACCOUNT: String = "/machine/{id}/switch-account"
         const val PATH_UPDATE_MACHINE: String = "/machine/{id}"
     }
 }
