@@ -445,10 +445,57 @@ def swap_response_body(body, sess):
     return text.encode() if changed else body
 
 
-def report_usage(user, path, resp_body):
+def report_ratelimit(user, resp_headers):
+    """Best-effort: scrape Anthropic's unified 5h/7d quota headers off a response and report the
+    latest snapshot per account. Separate try/except from token usage so neither can affect the
+    other or the forwarded response."""
+    try:
+        h = {}
+        for k, v in resp_headers.items():
+            kl = k.lower()
+            if kl.startswith("anthropic-ratelimit-unified-"):
+                h[kl] = v
+        if not h:
+            return
+
+        def num(key):
+            try:
+                return float(h[key]) if key in h else None
+            except Exception:
+                return None
+
+        def epoch(key):
+            try:
+                return int(h[key]) if key in h else None
+            except Exception:
+                return None
+
+        payload = {
+            "proxyUser": user,
+            "fiveHUtilization": num("anthropic-ratelimit-unified-5h-utilization"),
+            "fiveHResetAt": epoch("anthropic-ratelimit-unified-5h-reset"),
+            "fiveHStatus": h.get("anthropic-ratelimit-unified-5h-status"),
+            "sevenDUtilization": num("anthropic-ratelimit-unified-7d-utilization"),
+            "sevenDResetAt": epoch("anthropic-ratelimit-unified-7d-reset"),
+            "sevenDStatus": h.get("anthropic-ratelimit-unified-7d-status"),
+        }
+        req = urllib.request.Request(
+            f"{BACKEND_URL}/internal/ratelimit",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "X-Engine-Secret": CONTROL_SECRET},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5).read()
+    except Exception as e:
+        log(f"ratelimit report failed: {e}")
+
+
+def report_usage(user, path, resp_body, resp_headers=None):
     """Best-effort: extract token usage from a /v1/messages response and report it."""
     if "/v1/messages" not in path:
         return
+    if resp_headers is not None:
+        report_ratelimit(user, resp_headers)
     try:
         model = None
         inp = out = cr = cw = 0
@@ -660,7 +707,9 @@ def forward(get_upstream, method, path, headers, body, sess, user):
             return None
         status, rh, raw = resp
         out = swap_response_body(raw, sess)
-        threading.Thread(target=report_usage, args=(user, path, raw), daemon=True).start()
+        threading.Thread(
+            target=report_usage, args=(user, path, raw, rh), daemon=True
+        ).start()
     if DUMP_DIR:
         threading.Thread(
             target=dump_exchange,

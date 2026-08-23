@@ -843,8 +843,24 @@ components:
         remark: { type: string, nullable: true }
         status: { $ref: "#/components/schemas/AccountStatus" }
         machineCount: { type: integer, description: machines currently bound to this account }
+        quota: { $ref: "#/components/schemas/AccountQuota" }
         createdAt: { type: string, format: date-time, nullable: true }
       required: [id, email, proxy, status]
+    AccountQuota:
+      type: object
+      nullable: true
+      description: >-
+        Latest quota utilization scraped from Anthropic's `anthropic-ratelimit-unified-*` response
+        headers on this account's traffic. Read-only observability; null until any traffic has been
+        seen. Utilization is a 0..1 fraction of the window used; reset is epoch seconds.
+      properties:
+        fiveHUtilization: { type: number, format: double, nullable: true }
+        fiveHResetAt: { type: integer, format: int64, nullable: true }
+        fiveHStatus: { type: string, nullable: true }
+        sevenDUtilization: { type: number, format: double, nullable: true }
+        sevenDResetAt: { type: integer, format: int64, nullable: true }
+        sevenDStatus: { type: string, nullable: true }
+        observedAt: { type: string, format: date-time, nullable: true }
     CreateAccountRequest:
       type: object
       properties:
