@@ -63,6 +63,15 @@ class CCProxyConfig {
          */
         var proxyEndpoint: String = "proxy-engine:3128"
         /**
+         * Comma-separated hosts a machine must reach WITHOUT going through the MITM proxy, written
+         * as NO_PROXY/no_proxy in the machine's settings.json env. Loopback is the safe default so
+         * local services (MCP servers, the connector's own endpoints, health checks) aren't routed
+         * through :3128. Add internal hosts here if a deployment needs them to bypass the proxy.
+         * Note: node/undici matches NO_PROXY by hostname/suffix, not CIDR — list hostnames/IPs, not
+         * ranges.
+         */
+        var noProxy: String = "localhost,127.0.0.1,::1"
+        /**
          * The default upstream egress proxy stamped onto new accounts (the bundle's egress-proxy).
          */
         var defaultAccountProxy: String = "http://egress-proxy:7890"

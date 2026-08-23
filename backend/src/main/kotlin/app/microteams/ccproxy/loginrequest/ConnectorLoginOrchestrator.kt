@@ -336,6 +336,28 @@ class ConnectorLoginOrchestrator(
         writeFileOnMachine(machineId, caPath, pem)
     }
 
+    /**
+     * Write the proxy env into a settings.json `env` node. Sets HTTPS_PROXY/HTTP_PROXY/NO_PROXY in
+     * BOTH upper- and lowercase: different tools in Claude Code's process tree read different cases
+     * (node/undici honors either, but curl/git/python-requests in MCP servers or hooks read the
+     * lowercase forms), so setting only one case silently leaves some traffic unproxied or, for
+     * NO_PROXY, un-bypassed. NO_PROXY keeps loopback/local services off the MITM proxy.
+     */
+    private fun putProxyEnv(
+        env: com.fasterxml.jackson.databind.node.ObjectNode,
+        proxyUrl: String,
+        caPath: String,
+    ) {
+        val noProxy = config.engine.noProxy
+        env.put("HTTPS_PROXY", proxyUrl)
+        env.put("https_proxy", proxyUrl)
+        env.put("HTTP_PROXY", proxyUrl)
+        env.put("http_proxy", proxyUrl)
+        env.put("NO_PROXY", noProxy)
+        env.put("no_proxy", noProxy)
+        env.put("NODE_EXTRA_CA_CERTS", caPath)
+    }
+
     private fun writeLoginSettings(
         machineId: String,
         home: String,
@@ -346,9 +368,7 @@ class ConnectorLoginOrchestrator(
         env.put("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
         env.put("ANTHROPIC_AUTH_TOKEN", "")
         env.put("ANTHROPIC_API_KEY", "")
-        env.put("HTTPS_PROXY", proxyUrl)
-        env.put("HTTP_PROXY", proxyUrl)
-        env.put("NODE_EXTRA_CA_CERTS", caPath)
+        putProxyEnv(env, proxyUrl, caPath)
         // Never let the login Claude self-update mid-flight (see the launch cmd in prepare()).
         env.put("DISABLE_AUTOUPDATER", "1")
         val cfg = mapper.createObjectNode()
@@ -392,9 +412,7 @@ class ConnectorLoginOrchestrator(
             (cfg.get("env") as? com.fasterxml.jackson.databind.node.ObjectNode)
                 ?: mapper.createObjectNode()
         env.remove(listOf("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"))
-        env.put("HTTPS_PROXY", proxyUrl)
-        env.put("HTTP_PROXY", proxyUrl)
-        env.put("NODE_EXTRA_CA_CERTS", caPath)
+        putProxyEnv(env, proxyUrl, caPath)
         if (oauthToken != null) env.put("CLAUDE_CODE_OAUTH_TOKEN", oauthToken)
         cfg.replace("env", env)
         writeFileOnMachine(machineId, path, mapper.writeValueAsString(cfg))
