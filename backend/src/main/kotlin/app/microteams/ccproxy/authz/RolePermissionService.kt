@@ -97,6 +97,7 @@ class RolePermissionService {
                             "reprovision-machine",
                             "start-machine-login",
                             "rebind-machine-account",
+                            "switch-machine-account",
                             "get-machine-usage",
                         ),
                         "machine",

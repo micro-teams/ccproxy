@@ -70,6 +70,16 @@ class LoginRequestService(
      */
     fun getOwnerTenant(id: IdType): IdType = get(id).tenantId!!
 
+    /**
+     * Whether an account carries a stored setup-token, i.e. a login on it can activate
+     * automatically without an interactive operator /login. Same check `startForMachine` uses to
+     * pick the path.
+     */
+    fun accountHasSetupToken(accountId: IdType): Boolean =
+        credentialRepository
+            .findByScopeAndCredKey(CredentialScope.ACCOUNT, accountId.toString())
+            ?.setupToken != null
+
     fun toDTO(r: LoginRequest): LoginRequestDTO {
         val machine = machineRepository.findById(r.machineId!!).orElse(null)
         val account = r.accountId?.let { accountRepository.findById(it).orElse(null) }

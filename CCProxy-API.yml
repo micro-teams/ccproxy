@@ -464,6 +464,25 @@ paths:
         "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Machine" } } } }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /machine/{id}/switch-account:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    post:
+      tags: [machine]
+      operationId: switchMachineAccount
+      summary: Switch a machine to a different account and re-login in one step (super-admin)
+      description: >-
+        Rebinds the machine to `accountId` and immediately starts a login on it, so the machine
+        actually switches the live upstream credential (rebind alone only flips the pointer). If the
+        target account has a stored setup-token the switch is automatic (no operator); otherwise an
+        interactive `/login` is started and `requiresManualLogin` is true — a login-operator must
+        finish it. Fails with 409 if a login for this machine is already in progress.
+      security: [{ superAdmin: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SwitchAccountRequest" } } } }
+      responses:
+        "202": { description: Accepted, content: { application/json: { schema: { $ref: "#/components/schemas/SwitchAccountResponse" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
   /machine/{id}/reprovision:
     parameters: [ { $ref: "#/components/parameters/IdPath" } ]
     post:
@@ -937,6 +956,21 @@ components:
       properties:
         accountId: { type: integer, format: int64 }
       required: [accountId]
+    SwitchAccountRequest:
+      type: object
+      properties:
+        accountId: { type: integer, format: int64, description: account to switch this machine to }
+      required: [accountId]
+    SwitchAccountResponse:
+      type: object
+      properties:
+        requiresManualLogin:
+          type: boolean
+          description: >-
+            true if the target account has no setup-token, so an interactive /login was started and a
+            login-operator must finish it; false if the switch activated automatically via setup-token.
+        loginRequest: { $ref: "#/components/schemas/LoginRequest" }
+      required: [requiresManualLogin, loginRequest]
     ListMachinesResponse:
       type: object
       properties:
