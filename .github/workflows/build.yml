@@ -203,7 +203,7 @@ jobs:
         run: |
           set -euo pipefail
           # Pinned to the released applets tag — keep in step with connector/go.mod's cli version.
-          git clone --depth 1 --branch applets-v0.1.4 https://github.com/micro-teams/micro-connector.git mc
+          git clone --depth 1 --branch applets-v0.1.5 https://github.com/micro-teams/micro-connector.git mc
           cd mc/applets
           npm install
           node build.mjs
@@ -333,7 +333,10 @@ jobs:
   # version, and drives provisioning + login all the way to AWAITING_CODE (an OAuth URL is scraped) —
   # no real account needed. `installer` uses the standard `install.sh` (the latest release) so we keep
   # confirming we stay compatible with the newest Claude Code; the pinned npm versions guard specific
-  # releases. Each leg exercises the fresh-wizard path and the already-onboarded `/login` path.
+  # releases — `npm:2.1.251` pins the CURRENT Claude Code, whose new folder-trust / login TUI drove the
+  # micro-connector applets-v0.1.5 fix, so this leg is the dedicated regression guard for that version
+  # (a floating `installer` alone would silently drift off it). Each leg exercises the fresh-wizard path
+  # and the already-onboarded `/login` path.
   machine-login-compat:
     needs: [package-zip]
     runs-on: ubuntu-latest
@@ -343,7 +346,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        claude: ["installer", "npm:2.1.222", "npm:2.1.233"]
+        claude: ["installer", "npm:2.1.222", "npm:2.1.233", "npm:2.1.251"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
