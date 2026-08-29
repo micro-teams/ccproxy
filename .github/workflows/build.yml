@@ -109,6 +109,8 @@ jobs:
           python-version: "3.12"
       - name: Refresh absorption test (live engine, mock Anthropic)
         run: python proxy-engine/test_refresh_absorption.py
+      - name: Streaming large-body test (live engine, mock Anthropic)
+        run: python proxy-engine/test_streaming.py
 
   # The machine-side connector: a thin brand shell over the shared micro-connector library. It is a
   # shipped build artifact — the control plane serves these binaries to real machines — so CI vets
