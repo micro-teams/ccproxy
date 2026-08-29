@@ -72,6 +72,20 @@ REFRESH_BACKOFF = int(os.environ.get("CCPROXY_REFRESH_BACKOFF", "30"))
 # When set, every MITM'd (decrypted) request/response is mirrored under this directory, per machine.
 # Purely a side-channel copy — it never touches the bytes forwarded to the client.
 DUMP_DIR = os.environ.get("CCPROXY_DUMP_DIR", "")
+# Streaming relay tuning. Non-oauth traffic (/v1/messages, file up/downloads) is relayed chunk-by-
+# chunk between the two legs instead of being buffered whole — so a large transfer neither blows the
+# engine's memory nor stalls on quadratic byte-concatenation, and the client sees the first byte as
+# soon as upstream emits it. Two small bounded side-copies ("tees") are kept off the streamed bytes:
+# one for usage/quota metering of /v1/messages, one for the optional traffic dump. Neither ever
+# backpressures or caps the forwarded stream; they simply stop recording past their limit.
+STREAM_BLOCK = int(os.environ.get("CCPROXY_STREAM_BLOCK", "65536"))
+# Cap on the metering tee. A /v1/messages SSE response carries its usage in the trailing
+# message_delta, so metering needs the whole body — but only up to a sane ceiling; a response larger
+# than this is not a normal metered generation, so we skip its usage rather than buffer it.
+METER_CAP = int(os.environ.get("CCPROXY_METER_CAP", str(8 * 1024 * 1024)))
+# Cap on each dumped body (request and response). Keeps the side-channel dump from mirroring a
+# multi-hundred-MB transfer to disk; the head is enough to identify the exchange.
+DUMP_BODY_CAP = int(os.environ.get("CCPROXY_DUMP_BODY_CAP", str(256 * 1024)))
 
 os.makedirs(CERTS_DIR, exist_ok=True)
 _log_lock = threading.Lock()
@@ -308,13 +322,17 @@ def recv_line(s):
 
 
 def recv_exact(s, n):
-    d = b""
-    while len(d) < n:
-        c = s.recv(n - len(d))
+    # Accumulate into a list and join once: `d += c` on a growing bytes is O(n^2) (each += copies the
+    # whole buffer), which turns a large body read into minutes of pure memcpy; join is O(n).
+    parts = []
+    got = 0
+    while got < n:
+        c = s.recv(n - got)
         if not c:
             return None
-        d += c
-    return d
+        parts.append(c)
+        got += len(c)
+    return b"".join(parts)
 
 
 def parse_headers(s):
@@ -334,7 +352,7 @@ def parse_headers(s):
 
 def read_body(s, h):
     if h.get("Transfer-Encoding", "").lower() == "chunked":
-        body = b""
+        parts = []
         while True:
             line = recv_line(s)
             if line is None:
@@ -345,16 +363,16 @@ def read_body(s, h):
             try:
                 size = int(line, 16)
             except ValueError:
-                return body
+                return b"".join(parts)
             if size == 0:
                 recv_line(s)
                 break
             chunk = recv_exact(s, size)
             if chunk is None:
                 return None
-            body += chunk
+            parts.append(chunk)
             recv_line(s)
-        return body
+        return b"".join(parts)
     cl = int(h.get("Content-Length", 0))
     return recv_exact(s, cl) if cl > 0 else b""
 
@@ -719,6 +737,160 @@ def forward(get_upstream, method, path, headers, body, sess, user):
     return assemble_response(status, rh, out)
 
 
+# ── Streaming relay (large bodies) ───────────────────────────────────────────────
+def is_oauth_token_path(path):
+    """Only the OAuth token grant (login code-exchange + refresh) carries fake tokens in its BODY and
+    needs the delicate buffered swap/absorb path. Every other request authenticates via the
+    Authorization header alone, so its body can be relayed untouched — and streamed."""
+    return "oauth/token" in path.lower()
+
+
+def send_head(sock, first_line, headers):
+    """Write a request/status line (bytes, CRLF optional) plus headers, verbatim."""
+    out = [first_line if first_line.endswith(b"\r\n") else first_line + b"\r\n"]
+    for k, v in headers.items():
+        out.append(f"{k}: {v}\r\n".encode())
+    out.append(b"\r\n")
+    sock.sendall(b"".join(out))
+
+
+def _tee_add(tee, cap, state, data):
+    # state = [recorded_len, truncated]; record up to `cap` bytes of the body for side-channel use.
+    if cap <= 0:
+        return
+    if state[0] >= cap:
+        state[1] = True
+        return
+    take = data[: cap - state[0]]
+    tee.append(take)
+    state[0] += len(take)
+    if len(take) < len(data):
+        state[1] = True
+
+
+def relay_body(src, dst, headers, tee_cap=0, allow_eof=False):
+    """Relay a message body src->dst preserving its framing (chunked / Content-Length / EOF-
+    delimited), never holding more than one STREAM_BLOCK in flight. Returns (tee_bytes, truncated,
+    eof_used): tee_bytes is up to tee_cap bytes of the *decoded* body (chunk data or CL bytes) for
+    metering/dump, or None when tee_cap==0; eof_used is True when the body ran to connection close
+    (so the caller must not keep the connection alive)."""
+    tee = []
+    state = [0, False]
+    te = headers.get("Transfer-Encoding", "").lower()
+
+    def result(eof):
+        return (b"".join(tee) if tee_cap else None), state[1], eof
+
+    if "chunked" in te:
+        while True:
+            line = recv_line(src)
+            if line is None:
+                return result(False)
+            dst.sendall(line)
+            try:
+                size = int(line.strip().split(b";")[0], 16)
+            except ValueError:
+                return result(False)
+            if size == 0:
+                while True:  # relay trailers, then the terminating blank line
+                    t = recv_line(src)
+                    if not t:
+                        break
+                    dst.sendall(t)
+                    if t in (b"\r\n", b"\n"):
+                        break
+                return result(False)
+            remaining = size
+            while remaining > 0:
+                blk = src.recv(min(STREAM_BLOCK, remaining))
+                if not blk:
+                    return result(False)
+                dst.sendall(blk)
+                _tee_add(tee, tee_cap, state, blk)
+                remaining -= len(blk)
+            trail = recv_exact(src, 2)  # chunk-data CRLF
+            dst.sendall(trail if trail else b"\r\n")
+    cl = headers.get("Content-Length")
+    if cl is not None:
+        try:
+            remaining = int(cl)
+        except ValueError:
+            remaining = 0
+        while remaining > 0:
+            blk = src.recv(min(STREAM_BLOCK, remaining))
+            if not blk:
+                break
+            dst.sendall(blk)
+            _tee_add(tee, tee_cap, state, blk)
+            remaining -= len(blk)
+        return result(False)
+    if allow_eof:  # no CL, no chunked: body runs until upstream closes the connection
+        while True:
+            blk = src.recv(STREAM_BLOCK)
+            if not blk:
+                break
+            dst.sendall(blk)
+            _tee_add(tee, tee_cap, state, blk)
+        return result(True)
+    return result(False)
+
+
+def forward_streaming(get_upstream, method, path, headers, client_tls, sess, user):
+    """Relay one non-oauth exchange with both bodies STREAMED, not buffered. Only the Authorization
+    header is swapped (fake->real); bodies pass through verbatim. Returns True to keep the connection
+    alive for the next request, False to close it."""
+    dump_req_headers = dict(headers) if DUMP_DIR else None
+    dump_cap = DUMP_BODY_CAP if DUMP_DIR else 0
+    swap_auth_header(headers, sess)
+    try:
+        up = get_upstream()
+    except Exception as e:
+        log(f"{user}: upstream connect failed: {str(e)[:80]}")
+        return False
+    send_head(up, f"{method} {path} HTTP/1.1".encode(), headers)
+    req_tee, _, _ = relay_body(client_tls, up, headers, tee_cap=dump_cap, allow_eof=False)
+    status = recv_line(up)
+    if not status:
+        return False
+    rh = parse_headers(up)
+    if rh is None:
+        return False
+    send_head(client_tls, status, rh)
+    # A no-body response (HEAD, 1xx/204/304) carries no entity even without a zero Content-Length, so
+    # relaying it as EOF-delimited would block waiting for a close that keep-alive never sends.
+    try:
+        code = int(status.split()[1])
+    except (IndexError, ValueError):
+        code = 0
+    no_body = method == "HEAD" or code in (204, 304) or 100 <= code < 200
+    can_meter = False
+    if no_body:
+        resp_tee, truncated, eof_used = None, False, False
+    else:
+        # Meter /v1/messages by teeing the response body up to a cap — unless it's gzipped (can't
+        # parse a partial gzip stream) or bigger than the cap, in which case we still record quota
+        # headers.
+        can_meter = "/v1/messages" in path and rh.get("Content-Encoding", "").lower() != "gzip"
+        resp_cap = max(dump_cap, METER_CAP if can_meter else 0)
+        resp_tee, truncated, eof_used = relay_body(up, client_tls, rh, tee_cap=resp_cap, allow_eof=True)
+    if can_meter and resp_tee is not None and not truncated:
+        threading.Thread(target=report_usage, args=(user, path, resp_tee, rh), daemon=True).start()
+    elif "/v1/messages" in path:
+        threading.Thread(target=report_ratelimit, args=(user, rh), daemon=True).start()
+    if DUMP_DIR:
+        threading.Thread(
+            target=dump_exchange,
+            args=(user, method, path, dump_req_headers, (req_tee or b""), status, dict(rh),
+                  (resp_tee or b"")),
+            daemon=True,
+        ).start()
+    if eof_used:
+        return False
+    if "close" in (headers.get("Connection", "").lower(), rh.get("Connection", "").lower()):
+        return False
+    return True
+
+
 def handle_mitm(client_tls, host, port, sess, user):
     # The upstream connection opens lazily, on the first request that actually needs forwarding —
     # an absorbed refresh completes with no upstream dependency at all.
@@ -747,13 +919,20 @@ def handle_mitm(client_tls, host, port, sess, user):
             h = parse_headers(client_tls)
             if h is None:
                 break
-            b = read_body(client_tls, h)
-            resp = forward(get_upstream, method, path, h, b, sess, user)
-            if not resp:
-                break
-            client_tls.sendall(resp)
-            if h.get("Connection", "").lower() == "close":
-                break
+            if is_oauth_token_path(path):
+                # Delicate token-swap / refresh-absorb path: small bodies, kept fully buffered.
+                b = read_body(client_tls, h)
+                resp = forward(get_upstream, method, path, h, b, sess, user)
+                if not resp:
+                    break
+                client_tls.sendall(resp)
+                if h.get("Connection", "").lower() == "close":
+                    break
+            else:
+                # Everything else (/v1/messages, file up/downloads): stream both bodies so a large
+                # transfer neither buffers whole nor stalls on quadratic concatenation.
+                if not forward_streaming(get_upstream, method, path, h, client_tls, sess, user):
+                    break
     except Exception as e:
         log(f"mitm {host}: {str(e)[:100]}")
     finally:
