@@ -74,7 +74,11 @@ REFRESH_BACKOFF = int(os.environ.get("CCPROXY_REFRESH_BACKOFF", "30"))
 # next try. Without a retry the engine dropped the client connection with no response, which a proxy
 # in front (cheese) and Claude Code both surface as "ConnectionRefused". Retry the connect on a fresh
 # socket a few times before giving up.
-UPSTREAM_CONNECT_ATTEMPTS = int(os.environ.get("CCPROXY_UPSTREAM_CONNECT_ATTEMPTS", "3"))
+# The failures come in bursts and hit every client on the box at once, so retries are jittered (see
+# forward_streaming) to avoid every machine reconnecting in lockstep and deepening the burst. 6
+# attempts with sub-second jittered backoff keeps worst-case added latency to a couple seconds while
+# riding out a medium burst; a heavy sustained burst still needs a cleaner egress route, not retries.
+UPSTREAM_CONNECT_ATTEMPTS = int(os.environ.get("CCPROXY_UPSTREAM_CONNECT_ATTEMPTS", "6"))
 UPSTREAM_RETRY_BACKOFF = float(os.environ.get("CCPROXY_UPSTREAM_RETRY_BACKOFF", "0.25"))
 # When set, every MITM'd (decrypted) request/response is mirrored under this directory, per machine.
 # Purely a side-channel copy — it never touches the bytes forwarded to the client.
@@ -886,7 +890,10 @@ def forward_streaming(get_upstream, drop_upstream, method, path, headers, client
             log(f"{user}: upstream connect/send attempt "
                 f"{attempt + 1}/{UPSTREAM_CONNECT_ATTEMPTS} failed: {str(e)[:80]}")
             if attempt + 1 < UPSTREAM_CONNECT_ATTEMPTS:
-                time.sleep(UPSTREAM_RETRY_BACKOFF * (attempt + 1))
+                # Jitter in [0.5, 1.5): the failures hit every machine at once, so un-jittered
+                # backoff would have them all retry in lockstep and hammer the upstream in sync.
+                jitter = 0.5 + secrets.randbelow(1000) / 1000.0
+                time.sleep(UPSTREAM_RETRY_BACKOFF * (attempt + 1) * jitter)
     if up is None:
         send_error(client_tls, 502, "upstream connect failed after retries")
         return False
