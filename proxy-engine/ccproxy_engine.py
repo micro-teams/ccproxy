@@ -564,6 +564,75 @@ def report_usage(user, path, resp_body, resp_headers=None):
         log(f"usage report failed: {e}")
 
 
+def post_usage(user, model, inp, out, cr, cw):
+    """POST one metered turn's token counts to the backend. Best-effort."""
+    if not BACKEND_URL or not CONTROL_SECRET:
+        return
+    try:
+        payload = {
+            "proxyUser": user,
+            "model": model or "unknown",
+            "inputTokens": int(inp),
+            "outputTokens": int(out),
+            "cacheReadTokens": int(cr),
+            "cacheWriteTokens": int(cw),
+        }
+        req = urllib.request.Request(
+            f"{BACKEND_URL}/internal/usage",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "X-Engine-Secret": CONTROL_SECRET},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5).read()
+    except Exception as e:
+        log(f"usage report failed: {e}")
+
+
+class SseUsage:
+    """Scrape a /v1/messages turn's usage/model out of an SSE response INCREMENTALLY, as chunks stream
+    through — never holding the body. Anthropic puts input/cache tokens on message_start and the output
+    count on message_delta, so both ends must be seen; a head-capped copy would miss the tail on a long
+    turn. Only a single partial line is retained, so memory stays O(one SSE line)."""
+
+    def __init__(self):
+        self._buf = b""
+        self.model = None
+        self.inp = self.out = self.cr = self.cw = 0
+
+    def feed(self, chunk):
+        if not chunk:
+            return
+        self._buf += chunk
+        *lines, self._buf = self._buf.split(b"\n")
+        for ln in lines:
+            self._line(ln)
+        if len(self._buf) > (1 << 20):  # no newline in 1 MiB: not a usage line, don't hoard it
+            self._buf = b""
+
+    def close(self):
+        if self._buf:
+            self._line(self._buf)
+            self._buf = b""
+
+    def _line(self, raw):
+        s = raw.strip()
+        if not s.startswith(b"data:"):
+            return
+        try:
+            ev = json.loads(s[5:].strip())
+        except Exception:
+            return
+        msg = ev.get("message") or ev
+        if isinstance(msg, dict) and not self.model:
+            self.model = msg.get("model")
+        usage = (msg.get("usage") if isinstance(msg, dict) else None) or ev.get("usage")
+        if isinstance(usage, dict):
+            self.inp = usage.get("input_tokens", self.inp) or self.inp
+            self.out = usage.get("output_tokens", self.out) or self.out
+            self.cr = usage.get("cache_read_input_tokens", self.cr) or self.cr
+            self.cw = usage.get("cache_creation_input_tokens", self.cw) or self.cw
+
+
 # ── Traffic dump (optional, side-channel only) ───────────────────────────────────
 def dump_exchange(user, method, path, req_headers, req_body, status, resp_headers, resp_body):
     """Mirror one decrypted request/response to DUMP_DIR/<machine>/. Best-effort and always run in a
@@ -779,12 +848,13 @@ def _tee_add(tee, cap, state, data):
         state[1] = True
 
 
-def relay_body(src, dst, headers, tee_cap=0, allow_eof=False):
+def relay_body(src, dst, headers, tee_cap=0, allow_eof=False, tap=None):
     """Relay a message body src->dst preserving its framing (chunked / Content-Length / EOF-
     delimited), never holding more than one STREAM_BLOCK in flight. Returns (tee_bytes, truncated,
     eof_used): tee_bytes is up to tee_cap bytes of the *decoded* body (chunk data or CL bytes) for
     metering/dump, or None when tee_cap==0; eof_used is True when the body ran to connection close
-    (so the caller must not keep the connection alive)."""
+    (so the caller must not keep the connection alive). tap, if given, is called with every decoded
+    block for unbounded incremental metering (memory stays O(1), unlike the capped tee)."""
     tee = []
     state = [0, False]
     te = headers.get("Transfer-Encoding", "").lower()
@@ -818,6 +888,8 @@ def relay_body(src, dst, headers, tee_cap=0, allow_eof=False):
                     return result(False)
                 dst.sendall(blk)
                 _tee_add(tee, tee_cap, state, blk)
+                if tap:
+                    tap(blk)
                 remaining -= len(blk)
             trail = recv_exact(src, 2)  # chunk-data CRLF
             dst.sendall(trail if trail else b"\r\n")
@@ -842,6 +914,8 @@ def relay_body(src, dst, headers, tee_cap=0, allow_eof=False):
                 break
             dst.sendall(blk)
             _tee_add(tee, tee_cap, state, blk)
+            if tap:
+                tap(blk)
         return result(True)
     return result(False)
 
@@ -870,6 +944,16 @@ def forward_streaming(get_upstream, drop_upstream, method, path, headers, client
     """Relay one non-oauth exchange with both bodies STREAMED, not buffered. Only the Authorization
     header is swapped (fake->real); bodies pass through verbatim. Returns True to keep the connection
     alive for the next request, False to close it."""
+    is_messages = "/v1/messages" in path
+    # Ask upstream for an UNCOMPRESSED response on metered paths. Anthropic/Cloudflare otherwise return
+    # gzip/br/zstd, which the streaming meter cannot parse (br/zstd need libraries we don't carry, and
+    # a compressed stream yields no usage) — that silently dropped ALL usage metering. identity keeps
+    # the SSE plain text so it can be metered as it streams; the client advertised it as acceptable.
+    if is_messages:
+        for k in list(headers):
+            if k.lower() == "accept-encoding":
+                del headers[k]
+        headers["Accept-Encoding"] = "identity"
     dump_req_headers = dict(headers) if DUMP_DIR else None
     dump_cap = DUMP_BODY_CAP if DUMP_DIR else 0
     swap_auth_header(headers, sess)
@@ -912,20 +996,28 @@ def forward_streaming(get_upstream, drop_upstream, method, path, headers, client
     except (IndexError, ValueError):
         code = 0
     no_body = method == "HEAD" or code in (204, 304) or 100 <= code < 200
-    can_meter = False
+    # Meter /v1/messages by scraping usage from the SSE INCREMENTALLY as it streams (SseUsage via the
+    # relay tap) — no body is held, and both the input count (message_start) and the output count
+    # (message_delta, at the very end) are captured regardless of response size. Only when the response
+    # is uncompressed: we forced Accept-Encoding: identity above, but if upstream ignored that we can't
+    # parse it, so we fall back to recording quota headers only.
+    meter = SseUsage() if (is_messages and not no_body and not rh.get("Content-Encoding")) else None
     if no_body:
         resp_tee, truncated, eof_used = None, False, False
     else:
-        # Meter /v1/messages by teeing the response body up to a cap — unless it's gzipped (can't
-        # parse a partial gzip stream) or bigger than the cap, in which case we still record quota
-        # headers.
-        can_meter = "/v1/messages" in path and rh.get("Content-Encoding", "").lower() != "gzip"
-        resp_cap = max(dump_cap, METER_CAP if can_meter else 0)
-        resp_tee, truncated, eof_used = relay_body(up, client_tls, rh, tee_cap=resp_cap, allow_eof=True)
-    if can_meter and resp_tee is not None and not truncated:
-        threading.Thread(target=report_usage, args=(user, path, resp_tee, rh), daemon=True).start()
-    elif "/v1/messages" in path:
+        resp_tee, truncated, eof_used = relay_body(
+            up, client_tls, rh, tee_cap=dump_cap, allow_eof=True, tap=(meter.feed if meter else None)
+        )
+    if is_messages and not no_body:
         threading.Thread(target=report_ratelimit, args=(user, rh), daemon=True).start()
+        if meter is not None:
+            meter.close()
+            if meter.model or meter.inp or meter.out:
+                threading.Thread(
+                    target=post_usage,
+                    args=(user, meter.model, meter.inp, meter.out, meter.cr, meter.cw),
+                    daemon=True,
+                ).start()
     if DUMP_DIR:
         threading.Thread(
             target=dump_exchange,
