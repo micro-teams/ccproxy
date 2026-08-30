@@ -69,6 +69,13 @@ REFRESH_MARGIN = int(os.environ.get("CCPROXY_REFRESH_MARGIN", "3600"))
 # After a failed upstream refresh, don't retry upstream for this many seconds; refreshes arriving
 # meanwhile are answered locally so a transient Anthropic failure can't stampede the real chain.
 REFRESH_BACKOFF = int(os.environ.get("CCPROXY_REFRESH_BACKOFF", "30"))
+# The TLS handshake to Anthropic (through the egress hop) fails intermittently with a bare EOF —
+# measured ~1/3 of fresh connects during a bad window, and a reconnect almost always succeeds on the
+# next try. Without a retry the engine dropped the client connection with no response, which a proxy
+# in front (cheese) and Claude Code both surface as "ConnectionRefused". Retry the connect on a fresh
+# socket a few times before giving up.
+UPSTREAM_CONNECT_ATTEMPTS = int(os.environ.get("CCPROXY_UPSTREAM_CONNECT_ATTEMPTS", "3"))
+UPSTREAM_RETRY_BACKOFF = float(os.environ.get("CCPROXY_UPSTREAM_RETRY_BACKOFF", "0.25"))
 # When set, every MITM'd (decrypted) request/response is mirrored under this directory, per machine.
 # Purely a side-channel copy — it never touches the bytes forwarded to the client.
 DUMP_DIR = os.environ.get("CCPROXY_DUMP_DIR", "")
@@ -835,19 +842,54 @@ def relay_body(src, dst, headers, tee_cap=0, allow_eof=False):
     return result(False)
 
 
-def forward_streaming(get_upstream, method, path, headers, client_tls, sess, user):
+def send_error(client_tls, code, message):
+    """Answer the client with a minimal, retryable JSON error instead of dropping the connection.
+    A bare drop is read as ConnectionRefused by a fronting proxy and by Claude Code; a real HTTP
+    status is something they can retry."""
+    body = json.dumps(
+        {"type": "error", "error": {"type": "api_error", "message": f"ccproxy: {message}"}}
+    ).encode()
+    reason = {400: "Bad Request", 502: "Bad Gateway", 503: "Service Unavailable"}.get(code, "Error")
+    head = (
+        f"HTTP/1.1 {code} {reason}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode()
+    try:
+        client_tls.sendall(head + body)
+    except Exception:
+        pass
+
+
+def forward_streaming(get_upstream, drop_upstream, method, path, headers, client_tls, sess, user):
     """Relay one non-oauth exchange with both bodies STREAMED, not buffered. Only the Authorization
     header is swapped (fake->real); bodies pass through verbatim. Returns True to keep the connection
     alive for the next request, False to close it."""
     dump_req_headers = dict(headers) if DUMP_DIR else None
     dump_cap = DUMP_BODY_CAP if DUMP_DIR else 0
     swap_auth_header(headers, sess)
-    try:
-        up = get_upstream()
-    except Exception as e:
-        log(f"{user}: upstream connect failed: {str(e)[:80]}")
+    # Establish upstream and send the request head, retrying on a fresh connection. Both the initial
+    # TLS handshake to Anthropic and a reused-but-since-closed keep-alive socket fail here
+    # intermittently; a reconnect almost always succeeds. Safe to retry: no client body has been read
+    # yet, so there is nothing to replay.
+    head = f"{method} {path} HTTP/1.1".encode()
+    up = None
+    for attempt in range(UPSTREAM_CONNECT_ATTEMPTS):
+        try:
+            up = get_upstream()
+            send_head(up, head, headers)
+            break
+        except Exception as e:
+            drop_upstream()
+            up = None
+            log(f"{user}: upstream connect/send attempt "
+                f"{attempt + 1}/{UPSTREAM_CONNECT_ATTEMPTS} failed: {str(e)[:80]}")
+            if attempt + 1 < UPSTREAM_CONNECT_ATTEMPTS:
+                time.sleep(UPSTREAM_RETRY_BACKOFF * (attempt + 1))
+    if up is None:
+        send_error(client_tls, 502, "upstream connect failed after retries")
         return False
-    send_head(up, f"{method} {path} HTTP/1.1".encode(), headers)
     req_tee, _, _ = relay_body(client_tls, up, headers, tee_cap=dump_cap, allow_eof=False)
     status = recv_line(up)
     if not status:
@@ -901,6 +943,16 @@ def handle_mitm(client_tls, host, port, sess, user):
             up_box.append(upstream_tls(host, port, sess.account_proxy))
         return up_box[0]
 
+    def drop_upstream():
+        # Discard the cached upstream socket so the next get_upstream() reconnects — used when a
+        # connect or a reused keep-alive socket fails and the exchange wants a fresh one.
+        while up_box:
+            s = up_box.pop()
+            try:
+                s.close()
+            except Exception:
+                pass
+
     try:
         while True:
             # Waiting for the next request on a kept-alive connection: allow a long idle gap so we
@@ -931,7 +983,9 @@ def handle_mitm(client_tls, host, port, sess, user):
             else:
                 # Everything else (/v1/messages, file up/downloads): stream both bodies so a large
                 # transfer neither buffers whole nor stalls on quadratic concatenation.
-                if not forward_streaming(get_upstream, method, path, h, client_tls, sess, user):
+                if not forward_streaming(
+                    get_upstream, drop_upstream, method, path, h, client_tls, sess, user
+                ):
                     break
     except Exception as e:
         log(f"mitm {host}: {str(e)[:100]}")
