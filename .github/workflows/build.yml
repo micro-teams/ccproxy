@@ -111,6 +111,10 @@ jobs:
         run: python proxy-engine/test_refresh_absorption.py
       - name: Streaming large-body test (live engine, mock Anthropic)
         run: python proxy-engine/test_streaming.py
+      - name: Upstream connect-retry test (live engine, flaky mock Anthropic)
+        run: python proxy-engine/test_upstream_retry.py
+      - name: Streaming usage-metering test (live engine, mock Anthropic + backend)
+        run: python proxy-engine/test_metering.py
 
   # The machine-side connector: a thin brand shell over the shared micro-connector library. It is a
   # shipped build artifact — the control plane serves these binaries to real machines — so CI vets
