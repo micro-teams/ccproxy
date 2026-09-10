@@ -879,26 +879,31 @@ def _tee_add(tee, cap, state, data):
         state[1] = True
 
 
-def relay_body(src, dst, headers, tee_cap=0, allow_eof=False, tap=None, on_first=None):
+def relay_body(src, dst, headers, tee_cap=0, allow_eof=False, tap=None, mark=None):
     """Relay a message body src->dst preserving its framing (chunked / Content-Length / EOF-
     delimited), never holding more than one STREAM_BLOCK in flight. Returns (tee_bytes, truncated,
     eof_used): tee_bytes is up to tee_cap bytes of the *decoded* body (chunk data or CL bytes) for
     metering/dump, or None when tee_cap==0; eof_used is True when the body ran to connection close
     (so the caller must not keep the connection alive). tap, if given, is called with every decoded
-    block for unbounded incremental metering (memory stays O(1), unlike the capped tee)."""
+    block for unbounded incremental metering (memory stays O(1), unlike the capped tee).
+    mark(label), if given, is called once around the FIRST body block with these labels, so a caller
+    can time the boundaries precisely: 'upstream_first_body' (first body bytes received from src),
+    'client_write_start' (about to write that block to dst) and 'client_write_done' (dst accepted
+    it — i.e. the write did not block, or unblocked)."""
     tee = []
     state = [0, False]
     te = headers.get("Transfer-Encoding", "").lower()
-    _first = [on_first]
+    _marked = [False]
 
-    def _fire():  # fire on_first exactly once, when the first body block is handed to dst
-        cb = _first[0]
-        if cb is not None:
-            _first[0] = None
-            try:
-                cb()
-            except Exception:
-                pass
+    def _send_first(blk):  # send the first body block, timestamping the upstream/client boundaries
+        if mark and not _marked[0]:
+            _marked[0] = True
+            mark("upstream_first_body")
+            mark("client_write_start")
+            dst.sendall(blk)
+            mark("client_write_done")
+        else:
+            dst.sendall(blk)
 
     def result(eof):
         return (b"".join(tee) if tee_cap else None), state[1], eof
@@ -927,8 +932,7 @@ def relay_body(src, dst, headers, tee_cap=0, allow_eof=False, tap=None, on_first
                 blk = src.recv(min(STREAM_BLOCK, remaining))
                 if not blk:
                     return result(False)
-                _fire()
-                dst.sendall(blk)
+                _send_first(blk)
                 _tee_add(tee, tee_cap, state, blk)
                 if tap:
                     tap(blk)
@@ -945,8 +949,7 @@ def relay_body(src, dst, headers, tee_cap=0, allow_eof=False, tap=None, on_first
             blk = src.recv(min(STREAM_BLOCK, remaining))
             if not blk:
                 break
-            _fire()
-            dst.sendall(blk)
+            _send_first(blk)
             _tee_add(tee, tee_cap, state, blk)
             remaining -= len(blk)
         return result(False)
@@ -955,8 +958,7 @@ def relay_body(src, dst, headers, tee_cap=0, allow_eof=False, tap=None, on_first
             blk = src.recv(STREAM_BLOCK)
             if not blk:
                 break
-            _fire()
-            dst.sendall(blk)
+            _send_first(blk)
             _tee_add(tee, tee_cap, state, blk)
             if tap:
                 tap(blk)
@@ -990,20 +992,29 @@ def forward_streaming(get_upstream, drop_upstream, method, path, headers, client
     alive for the next request, False to close it."""
     is_messages = "/v1/messages" in path
     # ── per-request timing (single monotonic clock; no bodies/creds ever recorded) ──
-    t0 = time.monotonic()
+    # Marks are named for the exact boundary they capture, so no phase conflates upstream body-wait
+    # with client-write blocking. Emitted once in the finally, so error / timeout / retry-exhaustion
+    # paths are recorded too.
     utc0 = time.time()
     req_id = headers.get("x-client-request-id") or headers.get("request-id") or ""
-    t_upsend = t_reqbody = t_ttfb = t_head = None
-    firstchunk = [None]
-    retries = 0
+    M = {}  # label -> monotonic mark
+    retries = [0]  # count of FAILED upstream connect/send attempts (non-zero even when exhausted)
+    status_code = [0]
     meter = None
-    _emitted = [False]
+    emitted = [False]
 
-    def _emit(status_code):
-        if _emitted[0] or not TIMING_LOG:
+    def mark(label):
+        M[label] = time.monotonic()
+
+    def emit():
+        if emitted[0] or not TIMING_LOG:
             return
-        _emitted[0] = True
-        t_end = time.monotonic()
+        emitted[0] = True
+        end = time.monotonic()
+
+        def seg(a, b):
+            return _ms(M.get(a), M.get(b))
+
         log_timing({
             "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(utc0))
             + ".%03dZ" % int((utc0 % 1) * 1000),
@@ -1011,113 +1022,127 @@ def forward_streaming(get_upstream, drop_upstream, method, path, headers, client
             "machine": user,
             "model": getattr(meter, "model", "") or "",
             "path": path,
-            "status": status_code,
-            "retries": retries,
+            "status": status_code[0],
+            "retries": retries[0],
             "ms": {
-                "recv_to_upstream_send": _ms(t0, t_upsend),
-                "req_body_upload": _ms(t_upsend, t_reqbody),
-                "upstream_ttfb": _ms(t_reqbody, t_ttfb),
-                "resp_head_to_client": _ms(t_ttfb, t_head),
-                "head_to_first_chunk": _ms(t_head, firstchunk[0]),
-                "stream_body": _ms(firstchunk[0], t_end),
-                "total": _ms(t0, t_end),
+                # request received -> request head sent upstream (includes connect + retry backoff)
+                "recv_to_upstream_send": seg("recv", "upstream_send"),
+                # request body streamed up to upstream
+                "req_body_upload": seg("upstream_send", "req_uploaded"),
+                # upload done -> upstream response STATUS LINE received (not yet the body)
+                "upstream_status_line_wait": seg("req_uploaded", "upstream_status"),
+                # status line -> full response headers parsed
+                "upstream_headers_wait": seg("upstream_status", "upstream_headers"),
+                # headers parsed -> response head written to client
+                "client_head_write": seg("upstream_headers", "client_head_done"),
+                # response head sent -> FIRST BODY BLOCK received from upstream (real body/token wait)
+                "upstream_first_body_wait": seg("client_head_done", "upstream_first_body"),
+                # first body block: client write start -> write accepted (client-side write blocking)
+                "client_first_write": seg("client_write_start", "client_write_done"),
+                # first client write done -> body fully relayed
+                "stream_body": seg("client_write_done", "end"),
+                "total": _ms(M.get("recv"), end),
             },
         })
-    # Ask upstream for an UNCOMPRESSED response on metered paths. Anthropic/Cloudflare otherwise return
-    # gzip/br/zstd, which the streaming meter cannot parse (br/zstd need libraries we don't carry, and
-    # a compressed stream yields no usage) — that silently dropped ALL usage metering. identity keeps
-    # the SSE plain text so it can be metered as it streams; the client advertised it as acceptable.
-    if is_messages:
-        for k in list(headers):
-            if k.lower() == "accept-encoding":
-                del headers[k]
-        headers["Accept-Encoding"] = "identity"
-    dump_req_headers = dict(headers) if DUMP_DIR else None
-    dump_cap = DUMP_BODY_CAP if DUMP_DIR else 0
-    swap_auth_header(headers, sess)
-    # Establish upstream and send the request head, retrying on a fresh connection. Both the initial
-    # TLS handshake to Anthropic and a reused-but-since-closed keep-alive socket fail here
-    # intermittently; a reconnect almost always succeeds. Safe to retry: no client body has been read
-    # yet, so there is nothing to replay.
-    head = f"{method} {path} HTTP/1.1".encode()
-    up = None
-    for attempt in range(UPSTREAM_CONNECT_ATTEMPTS):
-        try:
-            up = get_upstream()
-            send_head(up, head, headers)
-            t_upsend = time.monotonic()
-            retries = attempt
-            break
-        except Exception as e:
-            drop_upstream()
-            up = None
-            log(f"{user}: upstream connect/send attempt "
-                f"{attempt + 1}/{UPSTREAM_CONNECT_ATTEMPTS} failed: {str(e)[:80]}")
-            if attempt + 1 < UPSTREAM_CONNECT_ATTEMPTS:
-                # Jitter in [0.5, 1.5): the failures hit every machine at once, so un-jittered
-                # backoff would have them all retry in lockstep and hammer the upstream in sync.
-                jitter = 0.5 + secrets.randbelow(1000) / 1000.0
-                time.sleep(UPSTREAM_RETRY_BACKOFF * (attempt + 1) * jitter)
-    if up is None:
-        _emit(502)
-        send_error(client_tls, 502, "upstream connect failed after retries")
-        return False
-    req_tee, _, _ = relay_body(client_tls, up, headers, tee_cap=dump_cap, allow_eof=False)
-    t_reqbody = time.monotonic()
-    status = recv_line(up)
-    t_ttfb = time.monotonic()
-    if not status:
-        _emit(0)
-        return False
-    rh = parse_headers(up)
-    if rh is None:
-        _emit(0)
-        return False
-    send_head(client_tls, status, rh)
-    t_head = time.monotonic()
-    # A no-body response (HEAD, 1xx/204/304) carries no entity even without a zero Content-Length, so
-    # relaying it as EOF-delimited would block waiting for a close that keep-alive never sends.
+
+    mark("recv")
     try:
-        code = int(status.split()[1])
-    except (IndexError, ValueError):
-        code = 0
-    no_body = method == "HEAD" or code in (204, 304) or 100 <= code < 200
-    # Meter /v1/messages by scraping usage from the SSE INCREMENTALLY as it streams (SseUsage via the
-    # relay tap) — no body is held, and both the input count (message_start) and the output count
-    # (message_delta, at the very end) are captured regardless of response size. Only when the response
-    # is uncompressed: we forced Accept-Encoding: identity above, but if upstream ignored that we can't
-    # parse it, so we fall back to recording quota headers only.
-    meter = SseUsage() if (is_messages and not no_body and not rh.get("Content-Encoding")) else None
-    if no_body:
-        resp_tee, truncated, eof_used = None, False, False
-    else:
-        resp_tee, truncated, eof_used = relay_body(
-            up, client_tls, rh, tee_cap=dump_cap, allow_eof=True, tap=(meter.feed if meter else None),
-            on_first=lambda: firstchunk.__setitem__(0, time.monotonic()),
-        )
-    if is_messages and not no_body:
-        threading.Thread(target=report_ratelimit, args=(user, rh), daemon=True).start()
-        if meter is not None:
-            meter.close()
-            if meter.model or meter.inp or meter.out:
-                threading.Thread(
-                    target=post_usage,
-                    args=(user, meter.model, meter.inp, meter.out, meter.cr, meter.cw),
-                    daemon=True,
-                ).start()
-    _emit(code)
-    if DUMP_DIR:
-        threading.Thread(
-            target=dump_exchange,
-            args=(user, method, path, dump_req_headers, (req_tee or b""), status, dict(rh),
-                  (resp_tee or b"")),
-            daemon=True,
-        ).start()
-    if eof_used:
-        return False
-    if "close" in (headers.get("Connection", "").lower(), rh.get("Connection", "").lower()):
-        return False
-    return True
+        # Ask upstream for an UNCOMPRESSED response on metered paths. Anthropic/Cloudflare otherwise
+        # return gzip/br/zstd, which the streaming meter cannot parse (br/zstd need libraries we don't
+        # carry, and a compressed stream yields no usage) — that silently dropped ALL usage metering.
+        # identity keeps the SSE plain text so it can be metered as it streams; the client accepted it.
+        if is_messages:
+            for k in list(headers):
+                if k.lower() == "accept-encoding":
+                    del headers[k]
+            headers["Accept-Encoding"] = "identity"
+        dump_req_headers = dict(headers) if DUMP_DIR else None
+        dump_cap = DUMP_BODY_CAP if DUMP_DIR else 0
+        swap_auth_header(headers, sess)
+        # Establish upstream and send the request head, retrying on a fresh connection. Both the
+        # initial TLS handshake to Anthropic and a reused-but-since-closed keep-alive socket fail here
+        # intermittently; a reconnect almost always succeeds. Safe to retry: no client body has been
+        # read yet, so there is nothing to replay.
+        head = f"{method} {path} HTTP/1.1".encode()
+        up = None
+        for attempt in range(UPSTREAM_CONNECT_ATTEMPTS):
+            try:
+                up = get_upstream()
+                send_head(up, head, headers)
+                mark("upstream_send")
+                break
+            except Exception as e:
+                retries[0] += 1
+                drop_upstream()
+                up = None
+                log(f"{user}: upstream connect/send attempt "
+                    f"{attempt + 1}/{UPSTREAM_CONNECT_ATTEMPTS} failed: {str(e)[:80]}")
+                if attempt + 1 < UPSTREAM_CONNECT_ATTEMPTS:
+                    # Jitter in [0.5, 1.5): the failures hit every machine at once, so un-jittered
+                    # backoff would have them retry in lockstep and hammer the upstream in sync.
+                    jitter = 0.5 + secrets.randbelow(1000) / 1000.0
+                    time.sleep(UPSTREAM_RETRY_BACKOFF * (attempt + 1) * jitter)
+        if up is None:
+            status_code[0] = 502
+            send_error(client_tls, 502, "upstream connect failed after retries")
+            return False
+        req_tee, _, _ = relay_body(client_tls, up, headers, tee_cap=dump_cap, allow_eof=False)
+        mark("req_uploaded")
+        status = recv_line(up)
+        mark("upstream_status")
+        if not status:
+            return False
+        rh = parse_headers(up)
+        mark("upstream_headers")
+        if rh is None:
+            return False
+        send_head(client_tls, status, rh)
+        mark("client_head_done")
+        # A no-body response (HEAD, 1xx/204/304) carries no entity even without a zero Content-Length,
+        # so relaying it as EOF-delimited would block waiting for a close keep-alive never sends.
+        try:
+            code = int(status.split()[1])
+        except (IndexError, ValueError):
+            code = 0
+        status_code[0] = code
+        no_body = method == "HEAD" or code in (204, 304) or 100 <= code < 200
+        # Meter /v1/messages by scraping usage from the SSE INCREMENTALLY as it streams (SseUsage via
+        # the relay tap) — no body is held, and both the input (message_start) and output
+        # (message_delta) counts are captured regardless of size. Only when the response is
+        # uncompressed: we forced identity above, but if upstream ignored that we can't parse it.
+        meter = SseUsage() if (is_messages and not no_body and not rh.get("Content-Encoding")) else None
+        if no_body:
+            resp_tee, truncated, eof_used = None, False, False
+        else:
+            resp_tee, truncated, eof_used = relay_body(
+                up, client_tls, rh, tee_cap=dump_cap, allow_eof=True,
+                tap=(meter.feed if meter else None), mark=mark,
+            )
+        mark("end")
+        if is_messages and not no_body:
+            threading.Thread(target=report_ratelimit, args=(user, rh), daemon=True).start()
+            if meter is not None:
+                meter.close()
+                if meter.model or meter.inp or meter.out:
+                    threading.Thread(
+                        target=post_usage,
+                        args=(user, meter.model, meter.inp, meter.out, meter.cr, meter.cw),
+                        daemon=True,
+                    ).start()
+        if DUMP_DIR:
+            threading.Thread(
+                target=dump_exchange,
+                args=(user, method, path, dump_req_headers, (req_tee or b""), status, dict(rh),
+                      (resp_tee or b"")),
+                daemon=True,
+            ).start()
+        if eof_used:
+            return False
+        if "close" in (headers.get("Connection", "").lower(), rh.get("Connection", "").lower()):
+            return False
+        return True
+    finally:
+        emit()
 
 
 def handle_mitm(client_tls, host, port, sess, user):

@@ -290,9 +290,9 @@ def main():
                   rec.get("machine") == "m1" and rec.get("status") == 200 and rec.get("retries") == 0,
                   str(rec)[:160])
             check("timing: total duration is positive", (ms.get("total") or 0) > 0, str(ms))
-            check("timing: upstream_ttfb captured", ms.get("upstream_ttfb") is not None, str(ms))
-            check("timing: first-chunk-to-client captured",
-                  ms.get("head_to_first_chunk") is not None or ms.get("stream_body") is not None, str(ms))
+            check("timing: upstream first-body wait captured",
+                  ms.get("upstream_first_body_wait") is not None, str(ms))
+            check("timing: client first-write captured", ms.get("client_first_write") is not None, str(ms))
             check("timing: NO body/credential fields leaked",
                   not any(k in json.dumps(rec).lower() for k in ("authorization", "bearer", "real-access", '"body"')),
                   str(rec)[:160])
