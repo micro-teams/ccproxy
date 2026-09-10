@@ -115,6 +115,8 @@ jobs:
         run: python proxy-engine/test_upstream_retry.py
       - name: Streaming usage-metering test (live engine, mock Anthropic + backend)
         run: python proxy-engine/test_metering.py
+      - name: Request-timing test (live engine, delayed-body / client-stall / timeout / retry-exhaustion)
+        run: python proxy-engine/test_timing.py
 
   # The machine-side connector: a thin brand shell over the shared micro-connector library. It is a
   # shipped build artifact — the control plane serves these binaries to real machines — so CI vets
