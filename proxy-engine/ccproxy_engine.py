@@ -80,6 +80,11 @@ REFRESH_BACKOFF = int(os.environ.get("CCPROXY_REFRESH_BACKOFF", "30"))
 # riding out a medium burst; a heavy sustained burst still needs a cleaner egress route, not retries.
 UPSTREAM_CONNECT_ATTEMPTS = int(os.environ.get("CCPROXY_UPSTREAM_CONNECT_ATTEMPTS", "6"))
 UPSTREAM_RETRY_BACKOFF = float(os.environ.get("CCPROXY_UPSTREAM_RETRY_BACKOFF", "0.25"))
+# Idle seconds before a raw CONNECT tunnel (non-MITM, non-Anthropic traffic) is reaped. Only trips
+# when NEITHER direction moves a byte for this long; an active transfer keeps resetting it. Kept well
+# above a normal request/response think-gap so a client that pauses mid-connection isn't cut off; dead
+# peers are also caught by the TCP keepalive set on both sockets.
+TUNNEL_IDLE = float(os.environ.get("CCPROXY_TUNNEL_IDLE", "300"))
 # When set, every MITM'd (decrypted) request/response is mirrored under this directory, per machine.
 # Purely a side-channel copy — it never touches the bytes forwarded to the client.
 DUMP_DIR = os.environ.get("CCPROXY_DUMP_DIR", "")
@@ -1097,27 +1102,48 @@ def handle_mitm(client_tls, host, port, sess, user):
 
 
 def tunnel(a, b):
-    a.setblocking(False)
-    b.setblocking(False)
-    pipes = {a: b, b: a}
-    try:
-        while True:
-            r, _, _ = select.select([a, b], [], [], 60)
-            if not r:
-                break
-            for s in r:
-                data = s.recv(8192)
+    # Full-duplex raw relay for CONNECT tunnels (non-MITM traffic). One blocking pump thread per
+    # direction: the sockets MUST stay blocking so sendall() waits for send-buffer space under
+    # backpressure. The previous single-select loop set the sockets NON-blocking and then called
+    # sendall() — on a non-blocking socket a full send buffer makes sendall() raise EAGAIN instead of
+    # waiting, and the bare except tore the whole tunnel down. Small bodies fit the socket buffer and
+    # slipped through; a large upload (~>2 MB, one tcp_wmem window) always died mid-stream. Blocking
+    # sendall fixes that. select() is used only to bound idle time; recv after a readable select
+    # returns promptly, and sendall stays blocking so no partial-write desync can happen.
+    a.setblocking(True)
+    b.setblocking(True)
+
+    def pump(src, dst):
+        try:
+            while True:
+                r, _, _ = select.select([src], [], [], TUNNEL_IDLE)
+                if not r:
+                    break  # idle too long — reap
+                data = src.recv(65536)
                 if not data:
-                    return
-                pipes[s].sendall(data)
-    except Exception:
-        pass
-    finally:
-        for s in (a, b):
+                    break  # peer closed this direction
+                dst.sendall(data)
+        except Exception:
+            pass
+        finally:
+            # Half-close the write side so the peer sees a clean EOF for this direction; the opposite
+            # pump keeps running until its own EOF, preserving a half-closed download/upload.
             try:
-                s.close()
+                dst.shutdown(socket.SHUT_WR)
             except Exception:
                 pass
+
+    t1 = threading.Thread(target=pump, args=(a, b), daemon=True)
+    t2 = threading.Thread(target=pump, args=(b, a), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    for s in (a, b):
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
 def fetch_session(user):
