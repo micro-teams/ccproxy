@@ -162,6 +162,7 @@ def main():
         CCPROXY_CA_CERT=ca_crt,
         CCPROXY_CA_KEY=ca_key,
         CCPROXY_CERTS_DIR=f"{WORK}/certs",
+        CCPROXY_TIMING_LOG=f"{WORK}/timing.jsonl",
     )
     engine = subprocess.Popen([sys.executable, f"{HERE}/ccproxy_engine.py"], env=env)
     try:
@@ -276,6 +277,25 @@ def main():
         # near-linear. Generous ceiling so the assertion is about "not stalling", not raw throughput.
         check(f"streamed {2*BODY_MB}MB round-trip fast (no O(n^2) stall): {elapsed:.1f}s",
               elapsed < 30, f"{elapsed:.1f}s")
+
+        # ── request-level timing log ──
+        time.sleep(0.3)  # emitted synchronously on the request thread, just before the dump thread
+        tl = f"{WORK}/timing.jsonl"
+        recs = [json.loads(x) for x in open(tl).read().splitlines()] if os.path.exists(tl) else []
+        check("timing: a record was written", len(recs) >= 1, str(recs)[:80])
+        if recs:
+            rec = recs[-1]
+            ms = rec.get("ms", {})
+            check("timing: machine + status + retries present",
+                  rec.get("machine") == "m1" and rec.get("status") == 200 and rec.get("retries") == 0,
+                  str(rec)[:160])
+            check("timing: total duration is positive", (ms.get("total") or 0) > 0, str(ms))
+            check("timing: upstream_ttfb captured", ms.get("upstream_ttfb") is not None, str(ms))
+            check("timing: first-chunk-to-client captured",
+                  ms.get("head_to_first_chunk") is not None or ms.get("stream_body") is not None, str(ms))
+            check("timing: NO body/credential fields leaked",
+                  not any(k in json.dumps(rec).lower() for k in ("authorization", "bearer", "real-access", '"body"')),
+                  str(rec)[:160])
 
         if FAILURES:
             print(f"\n{len(FAILURES)} FAILURE(S): {FAILURES}")

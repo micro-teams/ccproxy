@@ -80,6 +80,11 @@ REFRESH_BACKOFF = int(os.environ.get("CCPROXY_REFRESH_BACKOFF", "30"))
 # riding out a medium burst; a heavy sustained burst still needs a cleaner egress route, not retries.
 UPSTREAM_CONNECT_ATTEMPTS = int(os.environ.get("CCPROXY_UPSTREAM_CONNECT_ATTEMPTS", "6"))
 UPSTREAM_RETRY_BACKOFF = float(os.environ.get("CCPROXY_UPSTREAM_RETRY_BACKOFF", "0.25"))
+# Idle seconds before a raw CONNECT tunnel (non-MITM, non-Anthropic traffic) is reaped. Only trips
+# when NEITHER direction moves a byte for this long; an active transfer keeps resetting it. Kept well
+# above a normal request/response think-gap so a client that pauses mid-connection isn't cut off; dead
+# peers are also caught by the TCP keepalive set on both sockets.
+TUNNEL_IDLE = float(os.environ.get("CCPROXY_TUNNEL_IDLE", "300"))
 # When set, every MITM'd (decrypted) request/response is mirrored under this directory, per machine.
 # Purely a side-channel copy — it never touches the bytes forwarded to the client.
 DUMP_DIR = os.environ.get("CCPROXY_DUMP_DIR", "")
@@ -97,9 +102,35 @@ METER_CAP = int(os.environ.get("CCPROXY_METER_CAP", str(8 * 1024 * 1024)))
 # Cap on each dumped body (request and response). Keeps the side-channel dump from mirroring a
 # multi-hundred-MB transfer to disk; the head is enough to identify the exchange.
 DUMP_BODY_CAP = int(os.environ.get("CCPROXY_DUMP_BODY_CAP", str(256 * 1024)))
+# Request-level structured timing. One JSON line per streamed exchange with per-phase durations
+# (measured on a single monotonic clock) plus the UTC wall time, client request id, machine, model,
+# status and upstream retry count — enough to line up with a client's own trace and to split latency
+# into proxy vs upstream. NEVER records request/response bodies or credentials. Disabled unless a
+# path is available: explicit CCPROXY_TIMING_LOG, else a sibling of the dump dir when dumping is on.
+TIMING_LOG = os.environ.get("CCPROXY_TIMING_LOG", "")
+if not TIMING_LOG and DUMP_DIR:
+    TIMING_LOG = os.path.join(os.path.dirname(DUMP_DIR.rstrip("/")) or ".", "request_timing.jsonl")
 
 os.makedirs(CERTS_DIR, exist_ok=True)
 _log_lock = threading.Lock()
+_timing_lock = threading.Lock()
+
+
+def _ms(a, b):
+    # milliseconds between two monotonic marks, or None if either mark is missing
+    return None if a is None or b is None else round((b - a) * 1000, 1)
+
+
+def log_timing(rec):
+    if not TIMING_LOG:
+        return
+    try:
+        line = json.dumps(rec, separators=(",", ":"), ensure_ascii=False) + "\n"
+        with _timing_lock:
+            with open(TIMING_LOG, "a") as f:
+                f.write(line)
+    except Exception:
+        pass
 
 
 def log(msg):
@@ -848,7 +879,7 @@ def _tee_add(tee, cap, state, data):
         state[1] = True
 
 
-def relay_body(src, dst, headers, tee_cap=0, allow_eof=False, tap=None):
+def relay_body(src, dst, headers, tee_cap=0, allow_eof=False, tap=None, on_first=None):
     """Relay a message body src->dst preserving its framing (chunked / Content-Length / EOF-
     delimited), never holding more than one STREAM_BLOCK in flight. Returns (tee_bytes, truncated,
     eof_used): tee_bytes is up to tee_cap bytes of the *decoded* body (chunk data or CL bytes) for
@@ -858,6 +889,16 @@ def relay_body(src, dst, headers, tee_cap=0, allow_eof=False, tap=None):
     tee = []
     state = [0, False]
     te = headers.get("Transfer-Encoding", "").lower()
+    _first = [on_first]
+
+    def _fire():  # fire on_first exactly once, when the first body block is handed to dst
+        cb = _first[0]
+        if cb is not None:
+            _first[0] = None
+            try:
+                cb()
+            except Exception:
+                pass
 
     def result(eof):
         return (b"".join(tee) if tee_cap else None), state[1], eof
@@ -886,6 +927,7 @@ def relay_body(src, dst, headers, tee_cap=0, allow_eof=False, tap=None):
                 blk = src.recv(min(STREAM_BLOCK, remaining))
                 if not blk:
                     return result(False)
+                _fire()
                 dst.sendall(blk)
                 _tee_add(tee, tee_cap, state, blk)
                 if tap:
@@ -903,6 +945,7 @@ def relay_body(src, dst, headers, tee_cap=0, allow_eof=False, tap=None):
             blk = src.recv(min(STREAM_BLOCK, remaining))
             if not blk:
                 break
+            _fire()
             dst.sendall(blk)
             _tee_add(tee, tee_cap, state, blk)
             remaining -= len(blk)
@@ -912,6 +955,7 @@ def relay_body(src, dst, headers, tee_cap=0, allow_eof=False, tap=None):
             blk = src.recv(STREAM_BLOCK)
             if not blk:
                 break
+            _fire()
             dst.sendall(blk)
             _tee_add(tee, tee_cap, state, blk)
             if tap:
@@ -945,6 +989,40 @@ def forward_streaming(get_upstream, drop_upstream, method, path, headers, client
     header is swapped (fake->real); bodies pass through verbatim. Returns True to keep the connection
     alive for the next request, False to close it."""
     is_messages = "/v1/messages" in path
+    # ── per-request timing (single monotonic clock; no bodies/creds ever recorded) ──
+    t0 = time.monotonic()
+    utc0 = time.time()
+    req_id = headers.get("x-client-request-id") or headers.get("request-id") or ""
+    t_upsend = t_reqbody = t_ttfb = t_head = None
+    firstchunk = [None]
+    retries = 0
+    meter = None
+    _emitted = [False]
+
+    def _emit(status_code):
+        if _emitted[0] or not TIMING_LOG:
+            return
+        _emitted[0] = True
+        t_end = time.monotonic()
+        log_timing({
+            "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(utc0))
+            + ".%03dZ" % int((utc0 % 1) * 1000),
+            "req_id": req_id,
+            "machine": user,
+            "model": getattr(meter, "model", "") or "",
+            "path": path,
+            "status": status_code,
+            "retries": retries,
+            "ms": {
+                "recv_to_upstream_send": _ms(t0, t_upsend),
+                "req_body_upload": _ms(t_upsend, t_reqbody),
+                "upstream_ttfb": _ms(t_reqbody, t_ttfb),
+                "resp_head_to_client": _ms(t_ttfb, t_head),
+                "head_to_first_chunk": _ms(t_head, firstchunk[0]),
+                "stream_body": _ms(firstchunk[0], t_end),
+                "total": _ms(t0, t_end),
+            },
+        })
     # Ask upstream for an UNCOMPRESSED response on metered paths. Anthropic/Cloudflare otherwise return
     # gzip/br/zstd, which the streaming meter cannot parse (br/zstd need libraries we don't carry, and
     # a compressed stream yields no usage) — that silently dropped ALL usage metering. identity keeps
@@ -967,6 +1045,8 @@ def forward_streaming(get_upstream, drop_upstream, method, path, headers, client
         try:
             up = get_upstream()
             send_head(up, head, headers)
+            t_upsend = time.monotonic()
+            retries = attempt
             break
         except Exception as e:
             drop_upstream()
@@ -979,16 +1059,22 @@ def forward_streaming(get_upstream, drop_upstream, method, path, headers, client
                 jitter = 0.5 + secrets.randbelow(1000) / 1000.0
                 time.sleep(UPSTREAM_RETRY_BACKOFF * (attempt + 1) * jitter)
     if up is None:
+        _emit(502)
         send_error(client_tls, 502, "upstream connect failed after retries")
         return False
     req_tee, _, _ = relay_body(client_tls, up, headers, tee_cap=dump_cap, allow_eof=False)
+    t_reqbody = time.monotonic()
     status = recv_line(up)
+    t_ttfb = time.monotonic()
     if not status:
+        _emit(0)
         return False
     rh = parse_headers(up)
     if rh is None:
+        _emit(0)
         return False
     send_head(client_tls, status, rh)
+    t_head = time.monotonic()
     # A no-body response (HEAD, 1xx/204/304) carries no entity even without a zero Content-Length, so
     # relaying it as EOF-delimited would block waiting for a close that keep-alive never sends.
     try:
@@ -1006,7 +1092,8 @@ def forward_streaming(get_upstream, drop_upstream, method, path, headers, client
         resp_tee, truncated, eof_used = None, False, False
     else:
         resp_tee, truncated, eof_used = relay_body(
-            up, client_tls, rh, tee_cap=dump_cap, allow_eof=True, tap=(meter.feed if meter else None)
+            up, client_tls, rh, tee_cap=dump_cap, allow_eof=True, tap=(meter.feed if meter else None),
+            on_first=lambda: firstchunk.__setitem__(0, time.monotonic()),
         )
     if is_messages and not no_body:
         threading.Thread(target=report_ratelimit, args=(user, rh), daemon=True).start()
@@ -1018,6 +1105,7 @@ def forward_streaming(get_upstream, drop_upstream, method, path, headers, client
                     args=(user, meter.model, meter.inp, meter.out, meter.cr, meter.cw),
                     daemon=True,
                 ).start()
+    _emit(code)
     if DUMP_DIR:
         threading.Thread(
             target=dump_exchange,
@@ -1097,27 +1185,48 @@ def handle_mitm(client_tls, host, port, sess, user):
 
 
 def tunnel(a, b):
-    a.setblocking(False)
-    b.setblocking(False)
-    pipes = {a: b, b: a}
-    try:
-        while True:
-            r, _, _ = select.select([a, b], [], [], 60)
-            if not r:
-                break
-            for s in r:
-                data = s.recv(8192)
+    # Full-duplex raw relay for CONNECT tunnels (non-MITM traffic). One blocking pump thread per
+    # direction: the sockets MUST stay blocking so sendall() waits for send-buffer space under
+    # backpressure. The previous single-select loop set the sockets NON-blocking and then called
+    # sendall() — on a non-blocking socket a full send buffer makes sendall() raise EAGAIN instead of
+    # waiting, and the bare except tore the whole tunnel down. Small bodies fit the socket buffer and
+    # slipped through; a large upload (~>2 MB, one tcp_wmem window) always died mid-stream. Blocking
+    # sendall fixes that. select() is used only to bound idle time; recv after a readable select
+    # returns promptly, and sendall stays blocking so no partial-write desync can happen.
+    a.setblocking(True)
+    b.setblocking(True)
+
+    def pump(src, dst):
+        try:
+            while True:
+                r, _, _ = select.select([src], [], [], TUNNEL_IDLE)
+                if not r:
+                    break  # idle too long — reap
+                data = src.recv(65536)
                 if not data:
-                    return
-                pipes[s].sendall(data)
-    except Exception:
-        pass
-    finally:
-        for s in (a, b):
+                    break  # peer closed this direction
+                dst.sendall(data)
+        except Exception:
+            pass
+        finally:
+            # Half-close the write side so the peer sees a clean EOF for this direction; the opposite
+            # pump keeps running until its own EOF, preserving a half-closed download/upload.
             try:
-                s.close()
+                dst.shutdown(socket.SHUT_WR)
             except Exception:
                 pass
+
+    t1 = threading.Thread(target=pump, args=(a, b), daemon=True)
+    t2 = threading.Thread(target=pump, args=(b, a), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    for s in (a, b):
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
 def fetch_session(user):
