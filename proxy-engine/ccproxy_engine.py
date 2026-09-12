@@ -29,6 +29,7 @@ machine, and are never returned over the control API.
 import gzip
 import json
 import os
+import re
 import secrets
 import select
 import socket
@@ -97,6 +98,23 @@ METER_CAP = int(os.environ.get("CCPROXY_METER_CAP", str(8 * 1024 * 1024)))
 # Cap on each dumped body (request and response). Keeps the side-channel dump from mirroring a
 # multi-hundred-MB transfer to disk; the head is enough to identify the exchange.
 DUMP_BODY_CAP = int(os.environ.get("CCPROXY_DUMP_BODY_CAP", str(256 * 1024)))
+# Temporary shared-quota throttle: reject /v1/messages for models in these families with a clear,
+# retryable error instead of forwarding upstream (so a blocked call costs nothing — no upstream
+# connection is even opened). Comma-separated family substrings, case-insensitive, matched against
+# the model string. EMPTY BY DEFAULT (gate off) — this is a runtime policy, not a code default, so a
+# fresh deploy/test run is never silently gated; turn it on live via the control API without a
+# redeploy: PUT /config {"blockedModelFamilies": "opus,fable"} (see ControlHandler), or set
+# CCPROXY_BLOCKED_MODEL_FAMILIES if you do want it on from process start.
+BLOCKED_MODEL_FAMILIES = [
+    f.strip().lower()
+    for f in os.environ.get("CCPROXY_BLOCKED_MODEL_FAMILIES", "").split(",")
+    if f.strip()
+]
+# The model name sits in the first ~100 bytes of every Claude Code / Anthropic-SDK request body, so
+# peeking this many bytes is enough to gate WITHOUT buffering the (possibly huge) rest — the same
+# streaming-body discipline as the rest of this file (see forward_streaming / relay_body).
+MODEL_SNIFF_CAP = int(os.environ.get("CCPROXY_MODEL_SNIFF_CAP", "4096"))
+_MODEL_RE = re.compile(rb'"model"\s*:\s*"([^"]{1,80})"')
 
 os.makedirs(CERTS_DIR, exist_ok=True)
 _log_lock = threading.Lock()
@@ -920,12 +938,14 @@ def relay_body(src, dst, headers, tee_cap=0, allow_eof=False, tap=None):
     return result(False)
 
 
-def send_error(client_tls, code, message):
+def send_error(client_tls, code, message, error_type="api_error"):
     """Answer the client with a minimal, retryable JSON error instead of dropping the connection.
     A bare drop is read as ConnectionRefused by a fronting proxy and by Claude Code; a real HTTP
-    status is something they can retry."""
+    status is something they can retry. error_type follows Anthropic's own error shape
+    (invalid_request_error is the non-transient one — some clients use it to decide whether a retry
+    can possibly help)."""
     body = json.dumps(
-        {"type": "error", "error": {"type": "api_error", "message": f"ccproxy: {message}"}}
+        {"type": "error", "error": {"type": error_type, "message": f"ccproxy: {message}"}}
     ).encode()
     reason = {400: "Bad Request", 502: "Bad Gateway", 503: "Service Unavailable"}.get(code, "Error")
     head = (
@@ -940,11 +960,67 @@ def send_error(client_tls, code, message):
         pass
 
 
+def sniff_and_gate_model(client_tls, method, headers):
+    """Peek the start of a /v1/messages request body — where the model name always sits — and decide
+    whether to forward it at all, WITHOUT buffering the (possibly large) rest of the body. This is
+    what lets a blocked request cost nothing: rejected before an upstream connection is even opened.
+
+    Only handles the Content-Length-framed case (what every Anthropic SDK / Claude Code client sends
+    for this endpoint); chunked or bodyless requests fall through unexamined. Any ambiguity — no CL,
+    model not found within the peeked prefix, an empty block list — FAILS OPEN (never blocks), so a
+    sniffing miss can only under-enforce the policy, never wrongly reject a real request.
+
+    Returns (peeked_bytes, remaining_body_len, reject_message_or_None). remaining_body_len is None
+    when nothing was peeked (caller's usual whole-body relay is untouched); otherwise it is the exact
+    count of body bytes still unread on client_tls, however small (including 0)."""
+    if not BLOCKED_MODEL_FAMILIES or method != "POST":
+        return b"", None, None
+    if headers.get("Transfer-Encoding", "").lower() == "chunked":
+        return b"", None, None
+    try:
+        content_length = int(headers.get("Content-Length", -1))
+    except ValueError:
+        return b"", None, None
+    if content_length <= 0:
+        return b"", None, None
+    peek_len = min(content_length, MODEL_SNIFF_CAP)
+    peeked = recv_exact(client_tls, peek_len)
+    if peeked is None:
+        # Client hung up mid-body; let the normal relay path discover and report that the same way
+        # it always has (peeked bytes are lost either way, so there is nothing left to forward).
+        return b"", 0, None
+    remaining = content_length - len(peeked)
+    m = _MODEL_RE.search(peeked)
+    if not m:
+        return peeked, remaining, None
+    model = m.group(1).decode("ascii", "replace").lower()
+    if any(fam in model for fam in BLOCKED_MODEL_FAMILIES):
+        return peeked, remaining, (
+            f'model "{model}" is temporarily disabled to save the shared quota — please use a '
+            f"sonnet model instead"
+        )
+    return peeked, remaining, None
+
+
 def forward_streaming(get_upstream, drop_upstream, method, path, headers, client_tls, sess, user):
     """Relay one non-oauth exchange with both bodies STREAMED, not buffered. Only the Authorization
     header is swapped (fake->real); bodies pass through verbatim. Returns True to keep the connection
     alive for the next request, False to close it."""
     is_messages = "/v1/messages" in path
+    # Shared-quota model throttle (see BLOCKED_MODEL_FAMILIES): peek the body's leading bytes for a
+    # blocked model BEFORE opening any upstream connection, so a rejected call is entirely free — no
+    # Anthropic request, no quota spent. body_prefix is whatever was peeked (possibly the WHOLE body,
+    # for a small request) and must still be forwarded below if allowed; body_prefix_remaining is how
+    # many more body bytes are still unread on the client socket (None if nothing was peeked, meaning
+    # the usual whole-body relay path is untouched).
+    body_prefix, body_prefix_remaining, reject_msg = b"", None, None
+    if is_messages:
+        body_prefix, body_prefix_remaining, reject_msg = sniff_and_gate_model(
+            client_tls, method, headers
+        )
+    if reject_msg:
+        send_error(client_tls, 400, reject_msg, error_type="invalid_request_error")
+        return False
     # Ask upstream for an UNCOMPRESSED response on metered paths. Anthropic/Cloudflare otherwise return
     # gzip/br/zstd, which the streaming meter cannot parse (br/zstd need libraries we don't carry, and
     # a compressed stream yields no usage) — that silently dropped ALL usage metering. identity keeps
@@ -959,8 +1035,9 @@ def forward_streaming(get_upstream, drop_upstream, method, path, headers, client
     swap_auth_header(headers, sess)
     # Establish upstream and send the request head, retrying on a fresh connection. Both the initial
     # TLS handshake to Anthropic and a reused-but-since-closed keep-alive socket fail here
-    # intermittently; a reconnect almost always succeeds. Safe to retry: no client body has been read
-    # yet, so there is nothing to replay.
+    # intermittently; a reconnect almost always succeeds. Safe to retry: the only client body bytes
+    # read so far (body_prefix, above) are held in memory for replay, not yet forwarded anywhere —
+    # nothing has to be re-read from the client to retry.
     head = f"{method} {path} HTTP/1.1".encode()
     up = None
     for attempt in range(UPSTREAM_CONNECT_ATTEMPTS):
@@ -981,7 +1058,25 @@ def forward_streaming(get_upstream, drop_upstream, method, path, headers, client
     if up is None:
         send_error(client_tls, 502, "upstream connect failed after retries")
         return False
-    req_tee, _, _ = relay_body(client_tls, up, headers, tee_cap=dump_cap, allow_eof=False)
+    if body_prefix_remaining is None:
+        # Nothing was peeked (not a metered POST, chunked, no/zero Content-Length, or the model gate
+        # is disabled) — the original untouched whole-body relay.
+        req_tee, _, _ = relay_body(client_tls, up, headers, tee_cap=dump_cap, allow_eof=False)
+    else:
+        # Forward the peeked prefix first (already consumed from the client, buffered in memory),
+        # then relay whatever body remains with the same framing/tee discipline as relay_body's
+        # Content-Length branch, just starting from a shorter remaining count.
+        up.sendall(body_prefix)
+        if body_prefix_remaining > 0:
+            rest_headers = dict(headers)
+            rest_headers["Content-Length"] = str(body_prefix_remaining)
+            rest_tee, _, _ = relay_body(
+                client_tls, up, rest_headers,
+                tee_cap=max(0, dump_cap - len(body_prefix)), allow_eof=False,
+            )
+        else:
+            rest_tee = None
+        req_tee = (body_prefix[:dump_cap] + (rest_tee or b"")) if dump_cap else None
     status = recv_line(up)
     if not status:
         return False
@@ -1276,12 +1371,33 @@ class ControlHandler(BaseHTTPRequestHandler):
             if not sess:
                 return self._json(404, {"error": "no session"})
             return self._json(200, {"hasCredential": bool(sess.fake_access), "expiresAt": sess.expires_at})
+        if self.path == "/config":
+            return self._json(200, {"blockedModelFamilies": BLOCKED_MODEL_FAMILIES})
         return self._json(404, {"error": "not found"})
 
     def do_PUT(self):
         if not self._auth_ok():
             return self._json(403, {"error": "forbidden"})
         parts = self.path.strip("/").split("/")
+        # /config — live-toggle the shared-quota model throttle without a redeploy. Accepts either a
+        # comma-separated string (same format as CCPROXY_BLOCKED_MODEL_FAMILIES) or a list; an empty
+        # value disables the gate. Family match is a case-insensitive substring against the model
+        # name (see sniff_and_gate_model), so e.g. "opus" also catches "claude-opus-5".
+        if self.path == "/config":
+            global BLOCKED_MODEL_FAMILIES
+            body = self._body()
+            if "blockedModelFamilies" not in body:
+                return self._json(400, {"error": "blockedModelFamilies required"})
+            raw = body["blockedModelFamilies"]
+            if isinstance(raw, str):
+                fams = [f.strip().lower() for f in raw.split(",") if f.strip()]
+            elif isinstance(raw, list):
+                fams = [str(f).strip().lower() for f in raw if str(f).strip()]
+            else:
+                return self._json(400, {"error": "blockedModelFamilies must be a string or list"})
+            BLOCKED_MODEL_FAMILIES = fams
+            log(f"control: blocked model families set to {BLOCKED_MODEL_FAMILIES or '(none)'}")
+            return self._json(200, {"ok": True, "blockedModelFamilies": BLOCKED_MODEL_FAMILIES})
         if len(parts) == 2 and parts[0] == "sessions":
             body = self._body()
             REGISTRY.put(parts[1], body.get("proxyPassword", ""), body.get("accountProxy"))
