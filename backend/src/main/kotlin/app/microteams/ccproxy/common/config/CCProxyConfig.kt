@@ -37,6 +37,43 @@ class CCProxyConfig {
     /** The MITM CA the machines must trust; installed over SSH during provisioning. */
     var ca: Ca = Ca()
 
+    /**
+     * Settings for the in-process Kotlin data-plane (`dataplane` package) — the port of
+     * proxy-engine/ccproxy_engine.py into this backend. Disabled by default: today's deployment
+     * still runs the Python proxy-engine as the real MITM data plane, and this in-process engine is
+     * a parallel implementation meant for shadow-mode comparison before any cutover. Flip
+     * `ccproxy.dataplane.enabled=true` to actually bind its listener.
+     */
+    var dataplane: Dataplane = Dataplane()
+
+    class Dataplane {
+        /** Whether to start the in-process MITM proxy listener at all. */
+        var enabled: Boolean = false
+        /** Port the MITM proxy listens on. Same default as proxy-engine's CCPROXY_PROXY_PORT. */
+        var proxyPort: Int = 3128
+        /** PEM CA cert/key used to sign per-domain leaf certs (CCPROXY_CA_CERT/CCPROXY_CA_KEY). */
+        var caCertPath: String = "/keys/ca.crt"
+        var caKeyPath: String = "/keys/ca.key"
+        /** Where generated per-domain leaf key+cert pairs are cached on disk. */
+        var certsDir: String = "/tmp/ccproxy-certs-kt"
+        var mitmDomains: Set<String> = setOf("api.anthropic.com", "platform.claude.com")
+        var clientIdleTimeoutMs: Int = 900_000
+        var clientActiveTimeoutMs: Int = 120_000
+        var upstreamTimeoutMs: Int = 300_000
+        var upstreamConnectAttempts: Int = 6
+        var upstreamRetryBackoffMs: Long = 250
+        var refreshMarginSeconds: Long = 3600
+        var refreshBackoffSeconds: Long = 30
+        var streamBlock: Int = 65536
+        var meterCap: Int = 8 * 1024 * 1024
+        var modelSniffCap: Int = 4096
+        /**
+         * Comma-separated model-family substrings to reject before opening an upstream connection.
+         * Empty = gate off. Live-toggleable via DataplaneControlService.setBlockedModelFamilies.
+         */
+        var blockedModelFamilies: String = ""
+    }
+
     class Provisioning {
         /**
          * Operator SSH public key the tenant injects into a machine before registering it. If
