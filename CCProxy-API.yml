@@ -13,7 +13,7 @@ servers:
 # What CCProxy is
 # ─────────────────────────────────────────────────────────────────────────────
 # CCProxy lets a remote "machine" run an ordinary, interactive Claude Code while the REAL OAuth
-# credentials NEVER live on that machine. A MITM proxy (the proxy-engine, port 3128) sits between
+# credentials NEVER live on that machine. A MITM proxy (the backend's in-process dataplane, port 3128) sits between
 # the machine's Claude Code and Anthropic and swaps a per-machine FAKE credential for the machine's
 # own REAL credential on the wire. The machine only ever holds the fake one, so it cannot be stolen
 # to bypass metering.
@@ -440,7 +440,7 @@ paths:
       operationId: deleteMachine
       summary: Tear a machine down (drops its proxy mapping and fake↔real credential)
       description: >-
-        Revocation is confirmed, not best-effort: a 204 means the proxy-engine no longer serves this
+        Revocation is confirmed, not best-effort: a 204 means the dataplane no longer serves this
         machine's session AND its durable credential is gone, so the machine's fake token can never
         spend again — including across engine restarts. If the engine cannot confirm dropping the
         live session, the call fails with 502 and NOTHING is deleted; retry until you get the 204.
@@ -449,7 +449,7 @@ paths:
       responses:
         "204": { description: No Content — the credential is verifiably revoked }
         "404": { $ref: "#/components/responses/NotFound" }
-        "502": { description: proxy-engine did not confirm the revocation; nothing was deleted — retry, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "502": { description: dataplane did not confirm the revocation; nothing was deleted — retry, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
 
   /machine/{id}/account:
     parameters: [ { $ref: "#/components/parameters/IdPath" } ]
@@ -574,7 +574,7 @@ paths:
         The operator, after authenticating as the account in the browser, pastes the real
         authorization code here (as `code` and `state`, or the combined `code#state`). The backend saves
         the real code, generates a FAKE code, drives the waiting Claude Code (in the machine's tmux) to
-        paste it, and the proxy-engine swaps fake→real on the wire — capturing the real tokens and
+        paste it, and the dataplane swaps fake→real on the wire — capturing the real tokens and
         handing the machine fake ones. On success the request lands `completed` and the machine becomes
         `ready`. Never returns any token.
       security: [{ loginOperatorSecret: [] }]

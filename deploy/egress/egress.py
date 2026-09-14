@@ -4,8 +4,9 @@ egress-proxy — the bundle's default upstream proxy.
 
 A minimal HTTP proxy (CONNECT tunnelling) that simply forwards through the host's own network. It is
 the "default proxy to fill in" for accounts before any per-account network separation exists: an
-account's `proxy` defaults to http://egress-proxy:7890, and the MITM engine makes its upstream
-Anthropic connections through it. Swap the account's proxy for a real per-account egress later.
+account's `proxy` defaults to http://egress-proxy:7890, and the backend's dataplane makes its
+upstream Anthropic connections through it. Swap the account's proxy for a real per-account egress
+later.
 """
 import os
 import select

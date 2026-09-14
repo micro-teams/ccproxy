@@ -7,8 +7,8 @@
  *               proxy; only Anthropic traffic uses that egress. A non-CONNECT request (plain-HTTP
  *               forward-proxy, e.g. to a newapi-style gateway) is passed through directly too.
  *
- *               Gated behind ccproxy.dataplane.enabled (default false): this in-process engine is a
- *               parallel implementation for shadow-mode testing, not yet the live data plane.
+ *               This is the live MITM data plane (cutover 2026-09-14) — starts unconditionally on
+ *               application ready. The former standalone Python proxy-engine is gone.
  *
  *  Author(s):
  *      Nictheboy Li    <nictheboy@outlook.com>
@@ -27,14 +27,18 @@ import java.nio.charset.StandardCharsets
 import java.util.Base64
 import java.util.concurrent.Executors
 import javax.net.ssl.SSLSocket
+import org.rucca.cheese.common.config.ApplicationConfig
 import org.slf4j.LoggerFactory
 import org.springframework.boot.context.event.ApplicationReadyEvent
 import org.springframework.context.event.EventListener
+import org.springframework.core.Ordered
+import org.springframework.core.annotation.Order
 import org.springframework.stereotype.Component
 
 @Component
 class ProxyServer(
     private val config: CCProxyConfig,
+    private val applicationConfig: ApplicationConfig,
     private val registry: SessionRegistry,
     private val sessionStore: SessionStore,
     private val mapper: ObjectMapper,
@@ -47,15 +51,24 @@ class ProxyServer(
     private lateinit var certAuthority: CertAuthority
     private lateinit var mitmHandler: MitmHandler
 
+    // HIGHEST_PRECEDENCE: BackendApplication's own ApplicationReadyEvent listener calls
+    // SpringApplication.exit() in the shutdown-on-startup (schema-export) case, closing the context
+    // synchronously mid-multicast — this must run AFTER us, or our own @EventListener adapter fails
+    // resolving this bean against an already-closed context. See BackendApplication.kt's comment.
     @EventListener(ApplicationReadyEvent::class)
+    @Order(Ordered.HIGHEST_PRECEDENCE)
     fun start() {
-        val dp = config.dataplane
-        if (!dp.enabled) {
-            log.info(
-                "dataplane: disabled (ccproxy.dataplane.enabled=false); not starting :${dp.proxyPort}"
-            )
+        // Skip in the schema-export ("./mvnw package" runs the jar once with
+        // application.shutdown-on-startup=true to regenerate CREATE.sql, see backend/pom.xml's
+        // delete-create-sql execution) — that run also fires ApplicationReadyEvent and immediately
+        // closes the context; racing a real ServerSocket bind + accept loop against that shutdown
+        // is
+        // pointless and, depending on listener order, crashes the schema-export run outright.
+        if (applicationConfig.shutdownOnStartup) {
+            log.info("dataplane: shutdown-on-startup is set (schema export run); not starting")
             return
         }
+        val dp = config.dataplane
         certAuthority = CertAuthority(dp.caCertPath, dp.caKeyPath, dp.certsDir)
         mitmHandler = MitmHandler(dp, mapper, reporting, controlService)
         val ss = ServerSocket(dp.proxyPort)

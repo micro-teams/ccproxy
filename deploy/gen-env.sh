@@ -23,19 +23,18 @@ POSTGRES_PASSWORD=$(secret 40)
 JWT_SECRET=$(secret 64)
 # The platform operator's login password (super-admin). Read it back from this file to log in.
 SUPERADMIN_PASSWORD=$(secret 24)
-# Shared secret the backend and the proxy-engine authenticate their control channel with.
-ENGINE_SECRET=$(secret 40)
 
 # Host port the gateway (nginx) listens on. Put your TLS-terminating reverse proxy in front of it.
 NGINX_HTTP_PORT=80
 
-# Address machines are told to use as their HTTPS_PROXY (the MITM engine). The default docker
-# hostname only works for machines ON this compose network. For machines OUTSIDE it (the normal
-# case), set this to a host:port those machines can reach — e.g. this host's LAN/public address —
-# and make sure ENGINE_PROXY_PORT below is reachable there. It is auth-protected, not an open proxy.
-ENGINE_PROXY_ENDPOINT=proxy-engine:3128
-# Host port the MITM engine is published on (must match the host:port in ENGINE_PROXY_ENDPOINT when
-# that points at this host).
+# Address machines are told to use as their HTTPS_PROXY (the backend's own in-process MITM data
+# plane). The default docker hostname only works for machines ON this compose network. For machines
+# OUTSIDE it (the normal case), set this to a host:port those machines can reach — e.g. this host's
+# LAN/public address — and make sure ENGINE_PROXY_PORT below is reachable there. It is
+# auth-protected, not an open proxy.
+ENGINE_PROXY_ENDPOINT=backend:3128
+# Host port the MITM listener is published on (must match the host:port in ENGINE_PROXY_ENDPOINT
+# when that points at this host).
 ENGINE_PROXY_PORT=3128
 EOF
 chmod 600 .env
@@ -50,8 +49,9 @@ if [ ! -f keys/operator ]; then
     echo "Generated operator provisioning keypair at ./keys/operator(.pub)."
 fi
 
-# The MITM CA the proxy-engine signs per-domain leaf certs with, and that machines must trust. The
-# backend serves ca.crt (/ccproxy/provisioning/ca-cert) and installs it over SSH during provisioning.
+# The MITM CA the backend's dataplane signs per-domain leaf certs with, and that machines must
+# trust. The backend serves ca.crt (/ccproxy/provisioning/ca-cert) and installs it over SSH during
+# provisioning.
 if [ ! -f keys/ca.key ]; then
     openssl genrsa -out keys/ca.key 2048 >/dev/null 2>&1
     openssl req -x509 -new -nodes -key keys/ca.key -sha256 -days 3650 \
