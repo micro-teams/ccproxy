@@ -16,6 +16,7 @@ import app.microteams.ccproxy.common.error.EngineUnavailableError
 import app.microteams.ccproxy.common.helper.PageHelper
 import app.microteams.ccproxy.credential.CredentialRepository
 import app.microteams.ccproxy.credential.CredentialScope
+import app.microteams.ccproxy.dataplane.DataplaneControlService
 import app.microteams.ccproxy.model.*
 import java.security.SecureRandom
 import java.time.LocalDateTime
@@ -30,7 +31,7 @@ class MachineService(
     private val machineRepository: MachineRepository,
     private val accountRepository: AccountRepository,
     private val provisioner: MachineProvisioner,
-    private val engineClient: EngineClient,
+    private val dataplaneControl: DataplaneControlService,
     private val config: CCProxyConfig,
     private val hub: app.microteams.ccproxy.machine.link.MachineHub,
     private val credentialRepository: CredentialRepository,
@@ -118,20 +119,21 @@ class MachineService(
 
     /**
      * Delete = revoke this machine's ticket, verifiably. A 204 must MEAN the credential can never
-     * spend again, so the engine drop is not best-effort: if the engine cannot confirm removing the
-     * live session, we fail the whole call (502, transaction rolled back, nothing deleted) instead
-     * of returning success while the session keeps serving. The durable SESSION credential row is
-     * soft-deleted in the same transaction — the engine reloads every row at startup, so a row left
-     * behind would resurrect the revoked ticket (proxy auth + real tokens) on the next engine
-     * restart. Everything is keyed by this machine's proxyUser; no other machine is touched.
+     * spend again. The dataplane session drop is in-process now (no network hop to fail), but is
+     * still wrapped: any unexpected exception fails the whole call (502, transaction rolled back,
+     * nothing deleted) instead of returning success while the session keeps serving. The durable
+     * SESSION credential row is soft-deleted in the same transaction — the dataplane reloads every
+     * row at startup, so a row left behind would resurrect the revoked ticket (proxy auth + real
+     * tokens) on the next restart. Everything is keyed by this machine's proxyUser; no other
+     * machine is touched.
      */
     fun deleteMachine(id: IdType) {
         val m = getMachine(id)
         try {
-            engineClient.removeSession(m.proxyUser!!)
+            dataplaneControl.removeSession(m.proxyUser!!)
         } catch (e: Exception) {
             throw EngineUnavailableError(
-                "proxy-engine did not confirm dropping session ${m.proxyUser}: ${e.message} — " +
+                "dataplane did not confirm dropping session ${m.proxyUser}: ${e.message} — " +
                     "the credential may still be live; machine $id was NOT deleted, retry"
             )
         }

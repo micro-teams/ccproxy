@@ -8,8 +8,8 @@
 #
 # It exercises the login drive on one machine: a fresh first-run wizard, an already-onboarded /login,
 # a newapi-in-settings machine (login must reach official anyway, via the login-only settings file),
-# engine-restart self-heal, and the DB token-persistence round-trip. The whole thing goes over the
-# connector — the backend no longer SSH-drives tmux.
+# and backend-restart self-heal (the in-process dataplane reloads sessions from the DB). The whole
+# thing goes over the connector — the backend no longer SSH-drives tmux.
 #
 # Usage: machine-login-smoke.sh <install-spec>
 #   install-spec = "installer"      -> curl https://claude.ai/install.sh | bash   (latest, unpinned)
@@ -139,43 +139,21 @@ docker exec "$MACHINE" bash -lc 'python3 -c "import json,os;print(json.load(open
   { echo "FAIL: an incomplete login modified the real settings.json (should be untouched)"; exit 1; }
 echo "PASS round2b: login reached official; real settings.json newapi untouched"
 
-echo "== round 3: engine restart self-heal (lazy session fetch, no re-bootstrap) =="
-# The engine keeps sessions in memory; restarting wipes them and it refetches from the backend on the
-# first connection. The connector's control link (to the backend) is untouched by an engine restart,
-# so the machine stays online — a fresh login must still reach awaitingCode.
-docker compose restart proxy-engine >/dev/null 2>&1
-for _ in $(seq 1 20); do
-  h="$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q proxy-engine)" 2>/dev/null || true)"
+echo "== round 3: backend restart self-heal (lazy session fetch, no re-bootstrap) =="
+# The in-process dataplane (2026-09-14 cutover: no more standalone proxy-engine) keeps sessions in
+# memory; restarting the backend wipes them and SessionStore reloads from the DB on the first
+# connection. The connector reconnects its control link on its own, so the machine comes back online
+# — a fresh login must still reach awaitingCode. This single round now also covers what used to be a
+# separate round 4 (a lower-level python3-into-proxy-engine persist/reload probe): that probe is gone
+# because there is no standalone engine process left to exec into, and this round already exercises
+# the same DB-backed restart-recovery path end to end, through the real login flow.
+docker compose restart backend >/dev/null 2>&1
+for _ in $(seq 1 30); do
+  h="$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q backend)" 2>/dev/null || true)"
   [ "$h" = "healthy" ] && break
   sleep 2
 done
-expect_awaiting_code "$MID" "round3-engine-restart-selfheal" || exit 1
-
-echo "== round 4: token-persistence round-trip through the backend DB =="
-# Persist under a REAL machine's proxy user: the credential-ingest write now refuses a user with no
-# live machine (the revoked-ticket guard), so a synthetic key would 404. Machine $MID's proxy user is
-# m$MID (MachineService sets proxyUser = "m<id>").
-PU="m$MID"
-POUT="$(docker compose exec -T -w /app -e PU="$PU" proxy-engine python3 - <<'PY'
-import os, ccproxy_engine as e
-u = os.environ["PU"]
-s = e.REGISTRY.put(u, "pw", "http://egress-proxy:7890")
-s.real_access, s.real_refresh = "RA", "RR"
-s.fake_access, s.fake_refresh, s.expires_at = "FA", "FR", 999
-e.persist_session(u, s)              # write-through to the backend DB
-e.REGISTRY._by_user.clear()          # simulate a restart wiping memory
-e.load_all_from_db()                 # reload from the DB (source of truth)
-s2 = e.REGISTRY.get(u)
-ok = bool(s2 and s2.real_refresh == "RR" and s2.fake_access == "FA" and s2.expires_at == 999)
-print("PERSIST_OK" if ok else "PERSIST_FAIL")
-PY
-)"
-docker compose exec -T -e PU="$PU" postgres sh -c \
-  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "DELETE FROM ccproxy.credential WHERE scope='\''SESSION'\'' AND cred_key='\''$PU'\'';"' \
-  >/dev/null 2>&1 || true
-case "$POUT" in
-  *PERSIST_OK*) echo "PASS round4-token-persistence" ;;
-  *) echo "FAIL round4-token-persistence: $POUT"; exit 1 ;;
-esac
+[ "$h" = "healthy" ] || { echo "FAIL: backend never became healthy after restart"; exit 1; }
+expect_awaiting_code "$MID" "round3-backend-restart-selfheal" || exit 1
 
 echo "ALL PASS [$INSTALL]"

@@ -166,7 +166,7 @@ interface LoginRequestApi {
         summary = "Submit the real authorization code obtained from the browser",
         operationId = "submitLoginCode",
         description =
-            """The operator, after authenticating as the account in the browser, pastes the real authorization code here (as `code` and `state`, or the combined `code#state`). The backend saves the real code, generates a FAKE code, drives the waiting Claude Code (in the machine's tmux) to paste it, and the proxy-engine swaps fake→real on the wire — capturing the real tokens and handing the machine fake ones. On success the request lands `completed` and the machine becomes `ready`. Never returns any token.""",
+            """The operator, after authenticating as the account in the browser, pastes the real authorization code here (as `code` and `state`, or the combined `code#state`). The backend saves the real code, generates a FAKE code, drives the waiting Claude Code (in the machine's tmux) to paste it, and the dataplane swaps fake→real on the wire — capturing the real tokens and handing the machine fake ones. On success the request lands `completed` and the machine becomes `ready`. Never returns any token.""",
         responses =
             [
                 ApiResponse(

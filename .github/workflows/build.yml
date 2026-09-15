@@ -10,9 +10,10 @@ on:
     - cron: "0 0 * * *"
   workflow_dispatch:
 
-# Builds the backend, the test frontend, and lints the scripts + the proxy-engine, packages a
-# deployment bundle, then proves the bundle boots by bringing the docker-compose cluster up and
-# waiting for every service to be healthy.
+# Builds the backend (which now includes the in-process MITM dataplane — the standalone Python
+# proxy-engine is gone, cutover 2026-09-14), the test frontend, and lints the scripts + the egress
+# proxy, packages a deployment bundle, then proves the bundle boots by bringing the docker-compose
+# cluster up and waiting for every service to be healthy — with no proxy-engine service in the mix.
 
 jobs:
   build-jar:
@@ -91,36 +92,16 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - name: Syntax + lint the proxy-engine (stdlib-only Python)
+      - name: Syntax + lint the egress proxy (stdlib-only Python; the MITM engine is Kotlin now)
         run: |
-          python -m py_compile proxy-engine/*.py
-          pip install pyflakes >/dev/null && python -m pyflakes proxy-engine/*.py
-
-  # The refresh-absorption contract (#67), proven live: boots the real engine against a mock
-  # Anthropic and drives a client through login capture, absorbed refreshes (stable fake pair),
-  # a 5-holder single-flight real rotation, and the honest invalid_grant passthrough. Stdlib +
-  # openssl only — no docker, no account, no network.
-  engine-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-      - name: Refresh absorption test (live engine, mock Anthropic)
-        run: python proxy-engine/test_refresh_absorption.py
-      - name: Streaming large-body test (live engine, mock Anthropic)
-        run: python proxy-engine/test_streaming.py
-      - name: Upstream connect-retry test (live engine, flaky mock Anthropic)
-        run: python proxy-engine/test_upstream_retry.py
-      - name: Streaming usage-metering test (live engine, mock Anthropic + backend)
-        run: python proxy-engine/test_metering.py
+          python -m py_compile deploy/egress/egress.py
+          pip install pyflakes >/dev/null && python -m pyflakes deploy/egress/egress.py
 
   # The machine-side connector: a thin brand shell over the shared micro-connector library. It is a
   # shipped build artifact — the control plane serves these binaries to real machines — so CI vets
   # it, cross-compiles the published targets, and uploads them for the bundle. The Go version comes
   # from go.mod (in lockstep with the shared library).
-  connector:
+  build-connector:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -223,7 +204,7 @@ jobs:
           path: applet-dist
 
   package-zip:
-    needs: [build-jar, build-frontend, lint, connector, build-tmux, build-applet]
+    needs: [build-jar, build-frontend, lint, build-connector, build-tmux, build-applet]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -238,9 +219,10 @@ jobs:
           cp deploy/docker-compose.yml deploy/nginx.conf deploy/gen-env.sh deploy/README.md "$STAGE/"
           cp artifacts/create-sql/CREATE.sql "$STAGE/CREATE.sql"
           cp -r deploy/init "$STAGE/"
-          # Runtime files only — the engine's tests and bytecode caches must not ship in the bundle.
-          cp -r proxy-engine "$STAGE/proxy-engine"
-          rm -rf "$STAGE/proxy-engine/__pycache__" "$STAGE"/proxy-engine/test_*.py
+          # The default egress proxy (stdlib Python, forwards through the host network). The MITM
+          # engine itself is the backend.jar now — no separate proxy-engine directory to ship.
+          mkdir -p "$STAGE/egress"
+          cp deploy/egress/egress.py "$STAGE/egress/egress.py"
           cp artifacts/jar/*.jar "$STAGE/backend/backend.jar"
           cp -r artifacts/frontend-dist/. "$STAGE/frontend/dist/"
           chmod +x "$STAGE/gen-env.sh"
@@ -322,6 +304,27 @@ jobs:
           echo "== the claude.js driver applet is mounted for the backend =="
           docker compose exec -T backend sh -c 'test -s /app/applets/claude.js && grep -q screenReady /app/applets/claude.js'
           echo "applet OK"
+      - name: No standalone MITM service — the dataplane is in-process with the backend
+        working-directory: ccproxy-deploy
+        run: |
+          set -eu
+          # Positive proof of the 2026-09-14 cutover: nothing named proxy-engine in the compose file.
+          if docker compose config --services | grep -qx proxy-engine; then
+            echo "FAIL: a proxy-engine service still exists in docker-compose.yml"; exit 1
+          fi
+          echo "confirmed: no proxy-engine service"
+      - name: MITM proxy listener works on :3128 with no proxy-engine container
+        working-directory: ccproxy-deploy
+        run: |
+          set -eu
+          PORT="$(grep -E '^ENGINE_PROXY_PORT=' .env | cut -d= -f2 || true)"; PORT="${PORT:-3128}"
+          # A non-Anthropic host tunnels DIRECT regardless of proxy-auth (see ProxyServer routing) —
+          # this alone proves the CONNECT listener is alive and speaking the same wire protocol
+          # machines already use, entirely from the backend process (no separate MITM container).
+          CODE="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 \
+            --proxy "http://ci:ci@localhost:$PORT" https://example.com/)"
+          [ "$CODE" = 200 ] || { echo "FAIL: CONNECT-tunnelled request to example.com got $CODE, want 200"; exit 1; }
+          echo "dataplane MITM listener OK (direct-tunnel path verified end to end)"
       - name: Cluster status
         if: always()
         working-directory: ccproxy-deploy
@@ -460,7 +463,7 @@ jobs:
   # in branch protection / auto-merge rules instead of listing each job.
   ci-success:
     name: CI success
-    needs: [build-jar, build-frontend, lint, engine-test, connector, build-tmux, build-applet, package-zip, test-compose, machine-login-compat, machine-connector-dialin, machine-revoke]
+    needs: [build-jar, build-frontend, lint, build-connector, build-tmux, build-applet, package-zip, test-compose, machine-login-compat, machine-connector-dialin, machine-revoke]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All required CI jobs passed."

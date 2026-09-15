@@ -34,6 +34,7 @@ it**.
 
 - `backend/` — Kotlin/Spring. Borrowed authz stays under `org.rucca.cheese`; everything else is
   `app.microteams.ccproxy`. Domains: `authz`, `tenant`, `loginoperator`, `account`, `machine`,
-  `loginrequest`, `usage`, `provisioning`, `superadmin`, `ping`.
-- `proxy-engine/` — the MITM data plane + default egress proxy (stdlib Python).
+  `loginrequest`, `usage`, `provisioning`, `superadmin`, `ping`, `dataplane` (the in-process MITM —
+  there is no standalone proxy-engine anymore; cutover 2026-09-14).
+- `deploy/egress/` — the default egress proxy (stdlib Python).
 - `deploy/` — the docker-compose bundle (see `deploy/README.md`).

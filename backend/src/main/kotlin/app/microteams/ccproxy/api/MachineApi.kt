@@ -77,7 +77,7 @@ interface MachineApi {
         summary = "Tear a machine down (drops its proxy mapping and fake↔real credential)",
         operationId = "deleteMachine",
         description =
-            """Revocation is confirmed, not best-effort: a 204 means the proxy-engine no longer serves this machine's session AND its durable credential is gone, so the machine's fake token can never spend again — including across engine restarts. If the engine cannot confirm dropping the live session, the call fails with 502 and NOTHING is deleted; retry until you get the 204. Only this machine's credential is touched; every other machine is unaffected.""",
+            """Revocation is confirmed, not best-effort: a 204 means the dataplane no longer serves this machine's session AND its durable credential is gone, so the machine's fake token can never spend again — including across engine restarts. If the engine cannot confirm dropping the live session, the call fails with 502 and NOTHING is deleted; retry until you get the 204. Only this machine's credential is touched; every other machine is unaffected.""",
         responses =
             [
                 ApiResponse(
@@ -92,7 +92,7 @@ interface MachineApi {
                 ApiResponse(
                     responseCode = "502",
                     description =
-                        "proxy-engine did not confirm the revocation; nothing was deleted — retry",
+                        "dataplane did not confirm the revocation; nothing was deleted — retry",
                     content = [Content(schema = Schema(implementation = ErrorDTO::class))],
                 ),
             ],

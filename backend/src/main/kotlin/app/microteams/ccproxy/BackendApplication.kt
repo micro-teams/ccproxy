@@ -26,6 +26,16 @@ import org.springframework.context.annotation.Bean
 @SpringBootApplication(scanBasePackages = ["app.microteams.ccproxy", "org.rucca.cheese"])
 @EnableConfigurationProperties(ApplicationConfig::class)
 class BackendApplication(private val applicationConfig: ApplicationConfig) {
+    // This listener calls SpringApplication.exit(), which closes the context synchronously
+    // mid-multicast. Any other ApplicationReadyEvent listener (e.g. dataplane's ProxyServer) must
+    // run BEFORE this one, or its @EventListener method fails resolving its own bean against an
+    // already-closed context (IllegalStateException: context has been closed already) — this bit us
+    // when the dataplane's listener was added (2026-09-14). @Order here has no effect on a plain
+    // ApplicationListener bean vs. an @EventListener-annotated method's adapter order, so the fix
+    // is
+    // on the OTHER side: ProxyServer.start() is annotated @Order(HIGHEST_PRECEDENCE) to guarantee
+    // it
+    // runs first.
     @Bean
     fun applicationReadyListener(): ApplicationListener<ApplicationReadyEvent> {
         return ApplicationListener { event ->

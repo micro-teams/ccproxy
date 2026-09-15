@@ -96,6 +96,13 @@
             <scope>runtime</scope>
         </dependency>
         <dependency>
+            <!-- dataplane: CA-signed per-domain leaf cert generation for the Kotlin MITM engine
+                 (replaces proxy-engine's `openssl` shell-outs). -->
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bcpkix-jdk18on</artifactId>
+            <version>1.79</version>
+        </dependency>
+        <dependency>
             <groupId>javax.servlet</groupId>
             <artifactId>servlet-api</artifactId>
             <version>2.5</version>

@@ -2,9 +2,10 @@
 
 CCProxy lets a remote machine run an ordinary, interactive **Claude Code** on a normal Anthropic
 plan while the **real OAuth credentials never live on that machine**. A man-in-the-middle proxy (the
-*proxy-engine*) sits between the machine's Claude Code and Anthropic and swaps a per-machine **fake**
-credential for the machine's own **real** credential on the wire. The machine can talk to Claude
-normally, but it never holds a token it could exfiltrate, and every machine is metered independently.
+backend's in-process **dataplane**) sits between the machine's Claude Code and Anthropic and swaps a
+per-machine **fake** credential for the machine's own **real** credential on the wire. The machine
+can talk to Claude normally, but it never holds a token it could exfiltrate, and every machine is
+metered independently.
 
 > **The hard rule:** one machine = one independent Claude Code login, exactly like a person using
 > Claude Code on their own computer. Real tokens are per-machine and are never shared across
@@ -42,10 +43,10 @@ Claude Code authenticates with an OAuth flow that yields per-user tokens. If you
 to a fleet of machines you lose per-machine metering and any machine can walk off with the
 credential. CCProxy keeps the credential off the machine:
 
-1. Each machine is pointed at the proxy-engine via `HTTPS_PROXY` and trusts a CCProxy-owned CA.
-2. When a machine logs in, the engine intercepts the OAuth **code exchange**: Claude Code on the
-   machine only ever sees a **fake** authorization code and **fake** tokens minted by the engine.
-3. The engine holds the mapping fake ⟷ real and rewrites it on every request the machine makes to
+1. Each machine is pointed at the backend's dataplane via `HTTPS_PROXY` and trusts a CCProxy-owned CA.
+2. When a machine logs in, the dataplane intercepts the OAuth **code exchange**: Claude Code on the
+   machine only ever sees a **fake** authorization code and **fake** tokens minted by the dataplane.
+3. The dataplane holds the mapping fake ⟷ real and rewrites it on every request the machine makes to
    Anthropic, so from Anthropic's side the traffic is a normal, authenticated session, and from the
    machine's side the real token never appears.
 4. All of a machine's traffic (and the browser login) egresses through one **account egress proxy**
@@ -113,11 +114,9 @@ flowchart TD
   nginx -->|/ccproxy| backend["backend (Kotlin/Spring)"]
   backend -->|SSH once: install the connector| machine["remote machine<br/>connector · Claude Code (fake creds)"]
   machine -->|connector dial-out wss: login driving + control| backend
-  backend -->|control API :9000| engine["proxy-engine (MITM)"]
-  machine -->|HTTPS_PROXY :3128| engine
-  engine -->|fake→real swap, per-account egress| egress["egress-proxy :7890"]
+  machine -->|HTTPS_PROXY :3128| backend
+  backend -->|fake→real swap, per-account egress, in-process dataplane| egress["egress-proxy :7890"]
   egress --> anthropic["api.anthropic.com / claude.com / platform.claude.com"]
-  engine -->|usage callback| backend
   backend --> pg[("Postgres — schema: ccproxy")]
 ```
 
@@ -127,23 +126,22 @@ flowchart TD
 
 | Component | Tech | Role |
 |---|---|---|
-| **backend** | Kotlin / Spring Boot 3.4 | The control plane. Implements the API generated from `CCProxy-API.yml`, the three-role authz, the account pool, machine bootstrap (a one-time SSH install of the connector), and login orchestration over the connector link. |
-| **proxy-engine** | Python (stdlib only) | The data plane. A forward proxy on `:3128` that MITMs Anthropic hosts per session, plus a control API on `:9000` the backend uses to register sessions and prime/read logins. Signs per-host leaf certs from the mounted CA. |
+| **backend** | Kotlin / Spring Boot 3.4 | Both the control plane AND the data plane. Implements the API generated from `CCProxy-API.yml`, the three-role authz, the account pool, machine bootstrap (a one-time SSH install of the connector), login orchestration over the connector link, AND the in-process MITM `dataplane` package — a forward proxy on `:3128` that MITMs Anthropic hosts per session, signing per-host leaf certs from the mounted CA. There is no separate proxy-engine process (cutover 2026-09-14). |
 | **egress-proxy** | Python (stdlib only) | The default per-account egress. A plain `CONNECT` proxy on `:7890` so a machine's API traffic and its browser login share one outbound IP. An account may instead point at any external proxy. |
 | **frontend** | React + Vite | A minimal test SPA that talks only to the public `/ccproxy` API. Useful for driving the flow by hand. |
 | **nginx** | — | Gateway on `:80`: `/` → SPA, `/ccproxy` → backend. |
 | **postgres** | — | State, in the `ccproxy` schema. |
 
-### proxy-engine control API (used by the backend, secret-guarded)
+### dataplane control surface (in-process — `DataplaneControlService`)
 
 - register a session: `proxyUser`, `proxyPassword`, and the account egress proxy.
 - prime the next token exchange for a session with `realCode → fakeCode` (+ state).
 - read whether a session has captured a credential yet (and when it expires).
-- usage the backend polls and attributes to machines.
+- usage recorded directly (no loopback HTTP — see `dataplane.DataplaneReporting`).
 
-The engine keys everything by **`proxyUser`** (a stable `m{machineId}` handle). Sessions live **in
-memory** — restarting the engine drops them, so a machine must be re-provisioned (which re-registers
-its session) after an engine restart.
+Everything is keyed by **`proxyUser`** (a stable `m{machineId}` handle). Sessions live **in memory**,
+write-through persisted to the `credential` table on every capture — restarting the backend reloads
+every live machine's session from Postgres, so a machine keeps working without re-provisioning.
 
 ---
 
@@ -151,7 +149,7 @@ its session) after an engine restart.
 
 The deployable artifact is a **bundle** produced by CI (`ccproxy-deploy`) or assembled from
 `deploy/`. It contains `docker-compose.yml`, `nginx.conf`, `gen-env.sh`, `CREATE.sql`, `init/`,
-`backend/backend.jar`, `frontend/dist/`, and `proxy-engine/`.
+`backend/backend.jar`, `frontend/dist/`, and `egress/`.
 
 ```sh
 cd ccproxy-deploy        # the unpacked bundle (or the repo's deploy/ dir)
@@ -161,21 +159,22 @@ docker compose up -d --wait
 
 `gen-env.sh` generates, if absent:
 
-- `.env` — `SUPERADMIN_PASSWORD`, `ENGINE_SECRET`, the published `NGINX_HTTP_PORT` (default 80), and
+- `.env` — `SUPERADMIN_PASSWORD`, the published `NGINX_HTTP_PORT` (default 80), and
   `ENGINE_PROXY_ENDPOINT` / `ENGINE_PROXY_PORT` (see below).
-- `keys/ca.crt` + `keys/ca.key` — the MITM CA the engine signs leaf certs with and machines trust.
+- `keys/ca.crt` + `keys/ca.key` — the MITM CA the backend's dataplane signs leaf certs with and
+  machines trust.
 - `keys/operator` + `keys/operator.pub` — the SSH keypair the backend uses to reach machines.
 - `app_data/` — Postgres data.
 
-**`keys/` is mounted read-only** into the backend and engine. The gateway listens on
+**`keys/` is mounted read-only** into the backend. The gateway listens on
 `http://localhost:${NGINX_HTTP_PORT}`; the API is under `/ccproxy`, the SPA at `/`.
 
 Read the super-admin password with `grep SUPERADMIN_PASSWORD .env`.
 
-### The engine must be reachable from your machines
+### The MITM listener must be reachable from your machines
 
 Each machine is handed `HTTPS_PROXY=http://m{id}:…@${ENGINE_PROXY_ENDPOINT}`. The default
-`proxy-engine:3128` is a **docker-internal hostname that only resolves for machines on this compose
+`backend:3128` is a **docker-internal hostname that only resolves for machines on this compose
 network** (e.g. sibling containers). For any machine **outside** the compose network — the normal
 case — set `ENGINE_PROXY_ENDPOINT` in `.env` to a `host:port` that machine can actually reach (this
 host's LAN or public address), and keep `ENGINE_PROXY_PORT` published there. The port is
@@ -305,20 +304,22 @@ These are real behaviours discovered while validating the flow — worth knowing
 - **Claude Code is launched via a login shell** (`bash -lc claude`) so the machine user's profile
   `PATH` is loaded — the `claude.ai` installer puts `claude` in `~/.local/bin`, which is not on a
   non-interactive SSH `PATH`, so a bare `claude` would exit and kill the tmux session.
-- **The engine must be reachable from the machine.** Machines outside the compose network need
-  `ENGINE_PROXY_ENDPOINT` set to a routable `host:port` (see Deployment); the docker-internal
-  `proxy-engine:3128` default only works for in-network machines.
-- **Engine sessions are in memory.** After an engine restart, re-provision machines to re-register
-  their sessions.
-- **Optional traffic dump.** With `CCPROXY_DUMP_DIR` set (the bundle points it at
-  `app_data/dumps/`, on by default; set `ENGINE_DUMP_DIR=` in `.env` to turn it off), the engine
-  mirrors every decrypted request/response to `app_data/dumps/<machine>/*.http`. It records the
-  machine's view (fake credential — real tokens are never written to disk) and runs in a daemon
-  thread, so it never affects the bytes forwarded to the client. It can grow large — prune it.
-- **The engine currently buffers whole responses** before returning them (it reads the full body to
-  swap tokens and recompute Content-Length), so a streaming response reaches the client in one shot
-  rather than incrementally. Fine for correctness and short calls; making it a true chunk-by-chunk
-  passthrough for non-token endpoints would be a separate change.
+- **The MITM listener must be reachable from the machine.** Machines outside the compose network
+  need `ENGINE_PROXY_ENDPOINT` set to a routable `host:port` (see Deployment); the docker-internal
+  `backend:3128` default only works for in-network machines.
+- **Dataplane sessions are in memory, write-through persisted to Postgres.** A backend restart
+  reloads every live machine's session from the `credential` table on startup — no re-provisioning
+  needed (unlike the old standalone engine, whose in-memory sessions needed a lazy re-fetch keyed off
+  the next connection; the in-process dataplane does the equivalent load-all on `ApplicationReadyEvent`).
+- **No traffic dump today.** The old standalone proxy-engine could mirror every decrypted
+  request/response to `app_data/dumps/<machine>/*.http` (`CCPROXY_DUMP_DIR`) — this was load-bearing
+  for past incident forensics (e.g. diagnosing the 2026-09-11 account ban). The Kotlin `dataplane`
+  port (2026-09-14 cutover) does **not** carry this feature forward; it's a known gap, not a design
+  decision — re-add it if/when forensic dumps are needed again.
+- **The dataplane streams both request and response bodies** chunk-by-chunk (never buffers a whole
+  body) for every non-oauth-token exchange, including `/v1/messages` — an improvement over the old
+  Python engine's history (it started fully-buffered and only later got a true streaming pass; the
+  Kotlin port started streaming from day one, per its own port notes).
 - **`CREATE.sql` is generated at build time** (from entity metadata) and is not versioned; CI ships
   it into the bundle as an artifact.
 
@@ -340,10 +341,12 @@ Frontend:
 cd frontend && npm ci && npm run build
 ```
 
-CI (`.github/workflows/build.yml`) builds the backend (`mvnw install`, which also enforces spotless
-formatting and regenerates the API), builds the frontend, lints the shell scripts and the
-stdlib-only `proxy-engine`, packages the deployment bundle, and then **proves the bundle boots** by
-bringing the whole docker-compose cluster up and waiting for every service to be healthy.
+CI (`.github/workflows/build.yml`) builds the backend (`mvnw install`, which also runs its unit
+tests — including the `dataplane` package's — enforces spotless formatting, and regenerates the
+API), builds the frontend, lints the shell scripts and the stdlib-only egress proxy, packages the
+deployment bundle, and then **proves the bundle boots** by bringing the whole docker-compose cluster
+up (with no `proxy-engine` service) and waiting for every service to be healthy, including an actual
+CONNECT-proxy smoke test against the backend's `:3128` MITM listener.
 
 **Toolchain note:** the backend is pinned to **Kotlin 2.1.10** via the **Spring Boot 3.4** line, and
 `io.ktor` is held at a Kotlin-2.1-compatible version. Bumping either Spring Boot to 4.x or ktor to
@@ -362,7 +365,7 @@ those two are marked `ignore` in `dependabot.yml`.
   egress proxy, are visible only to the super-admin.
 - **Secrets are opaque bearer tokens** minted by the super-admin and revocable.
 - **Trust is scoped:** machines trust only the CCProxy CA for the MITM; the CA private key stays on
-  the server (read-only-mounted into backend and engine).
+  the server (read-only-mounted into the backend, which is the only process that touches it now).
 
 ---
 
@@ -371,10 +374,9 @@ those two are marked `ignore` in `dependabot.yml`.
 | | |
 |---|---|
 | **`CCProxy-API.yml`** | the single API contract; the backend's `app.microteams.ccproxy.api.*Api` and the frontend client are generated from it |
-| **`backend/`** | Kotlin / Spring Boot. The borrowed authz framework keeps its `org.rucca.cheese.auth` package; everything else is `app.microteams.ccproxy` |
-| **`proxy-engine/`** | the MITM data plane (`ccproxy_engine.py`) + the default egress proxy (`egress.py`), stdlib Python |
+| **`backend/`** | Kotlin / Spring Boot. The borrowed authz framework keeps its `org.rucca.cheese.auth` package; everything else is `app.microteams.ccproxy`, including the in-process MITM `dataplane` package |
 | **`frontend/`** | React + Vite test SPA (calls only the public `/ccproxy` API) |
-| **`deploy/`** | the docker-compose bundle (nginx + backend + proxy-engine + egress-proxy + postgres) and `gen-env.sh` |
+| **`deploy/`** | the docker-compose bundle (nginx + backend + egress-proxy + postgres) and `gen-env.sh`; `deploy/egress/egress.py` is the default egress proxy, stdlib Python |
 
 ---
 
@@ -382,4 +384,5 @@ those two are marked `ignore` in `dependabot.yml`.
 
 Derived from [`micro-cloud`](https://github.com/micro-teams/micro-cloud): same stack, CI structure,
 and bundle-deploy pattern, with the Proxmox / provisioning / newapi domain removed and the MITM
-engine added.
+data plane added. The MITM data plane started as a standalone Python `proxy-engine` process and was
+folded into the Kotlin backend on 2026-09-14 — see `backend/src/main/kotlin/.../ccproxy/dataplane/`.

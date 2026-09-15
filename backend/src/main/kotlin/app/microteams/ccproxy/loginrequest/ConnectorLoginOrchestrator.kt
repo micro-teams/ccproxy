@@ -24,7 +24,7 @@ import app.microteams.ccproxy.account.AccountRepository
 import app.microteams.ccproxy.common.config.CCProxyConfig
 import app.microteams.ccproxy.credential.CredentialRepository
 import app.microteams.ccproxy.credential.CredentialScope
-import app.microteams.ccproxy.machine.EngineClient
+import app.microteams.ccproxy.dataplane.DataplaneControlService
 import app.microteams.ccproxy.machine.Machine
 import app.microteams.ccproxy.machine.MachineRepository
 import app.microteams.ccproxy.machine.MachineStatus
@@ -43,7 +43,7 @@ class ConnectorLoginOrchestrator(
     private val loginRequestRepository: LoginRequestRepository,
     private val machineRepository: MachineRepository,
     private val accountRepository: AccountRepository,
-    private val engineClient: EngineClient,
+    private val dataplaneControl: DataplaneControlService,
     private val credentialRepository: CredentialRepository,
     private val hub: MachineHub,
     private val appletStore: app.microteams.ccproxy.connector.AppletStore,
@@ -70,7 +70,7 @@ class ConnectorLoginOrchestrator(
                     ?: throw IllegalStateException("machine ${machine.id} has no bound account")
             // The engine needs a registered session to MITM this machine's official traffic and
             // capture the real token; the account supplies the egress proxy the session uses.
-            engineClient.registerSession(
+            dataplaneControl.registerSession(
                 machine.proxyUser!!,
                 machine.proxyPassword!!,
                 account.proxy!!,
@@ -178,13 +178,18 @@ class ConnectorLoginOrchestrator(
                 cred?.setupToken
                     ?: throw IllegalStateException("account $accountId has no setup-token")
 
-            engineClient.registerSession(
+            dataplaneControl.registerSession(
                 machine.proxyUser!!,
                 machine.proxyPassword!!,
                 account.proxy!!,
             )
             val fakeToken =
-                engineClient.setCredential(machine.proxyUser!!, setupToken, cred.expiresAt)
+                dataplaneControl.setCredential(
+                    machine.proxyUser!!,
+                    setupToken,
+                    refreshToken = null, // a setup-token has no refresh_token
+                    expiresAt = cred.expiresAt,
+                )
 
             val home = resolveHome(mid)
             val caPath = "$home/.claude/ccproxy-ca.crt"
@@ -235,7 +240,7 @@ class ConnectorLoginOrchestrator(
             req.fakeCode = fakeCode
             loginRequestRepository.save(req)
 
-            engineClient.primeLogin(machine.proxyUser!!, realCode, state, fakeCode)
+            dataplaneControl.primeLogin(machine.proxyUser!!, realCode, state, fakeCode)
             val pasted = if (state.isNullOrBlank()) fakeCode else "$fakeCode#$state"
             // The driver's `say` bracketed-pastes the code and submits it a couple of frames later
             // —
@@ -245,14 +250,15 @@ class ConnectorLoginOrchestrator(
             var expiresAt: Long? = null
             for (i in 0 until 30) {
                 Thread.sleep(2000)
-                val result = engineClient.getLoginResult(machine.proxyUser!!)
+                val result = dataplaneControl.getLoginResult(machine.proxyUser!!)
                 if (result.hasCredential) {
                     expiresAt = result.expiresAt
                     break
                 }
             }
             if (
-                expiresAt == null && !engineClient.getLoginResult(machine.proxyUser!!).hasCredential
+                expiresAt == null &&
+                    !dataplaneControl.getLoginResult(machine.proxyUser!!).hasCredential
             ) {
                 throw IllegalStateException("credential did not materialize")
             }
