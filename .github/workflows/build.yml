@@ -516,7 +516,10 @@ jobs:
   # in branch protection / auto-merge rules instead of listing each job.
   ci-success:
     name: CI success
-    needs: [build-jar, build-frontend, lint, build-connector, build-tmux, build-applet, package-zip, test-compose, machine-login-compat, machine-connector-dialin, machine-revoke]
+    # Only the leaves of the dependency DAG: everything else (build-jar, build-origin,
+    # build-frontend, lint, build-connector, build-tmux, build-applet, package-zip) is already
+    # required transitively by these four, and a failure/skip anywhere upstream skips them too.
+    needs: [test-compose, machine-login-compat, machine-connector-dialin, machine-revoke]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All required CI jobs passed."
