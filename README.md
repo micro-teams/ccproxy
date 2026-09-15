@@ -311,11 +311,17 @@ These are real behaviours discovered while validating the flow — worth knowing
   reloads every live machine's session from the `credential` table on startup — no re-provisioning
   needed (unlike the old standalone engine, whose in-memory sessions needed a lazy re-fetch keyed off
   the next connection; the in-process dataplane does the equivalent load-all on `ApplicationReadyEvent`).
-- **No traffic dump today.** The old standalone proxy-engine could mirror every decrypted
-  request/response to `app_data/dumps/<machine>/*.http` (`CCPROXY_DUMP_DIR`) — this was load-bearing
-  for past incident forensics (e.g. diagnosing the 2026-09-11 account ban). The Kotlin `dataplane`
-  port (2026-09-14 cutover) does **not** carry this feature forward; it's a known gap, not a design
-  decision — re-add it if/when forensic dumps are needed again.
+- **Optional traffic dump (`dataplane.Dump`), on by default.** Mirrors every decrypted
+  request/response to `app_data/dumps/<machine>/<yyyy-MM-dd>.ndjson` — the client's (fake-credential)
+  view, real tokens never written. Redesigned on the 2026-09-15 cutover from the old engine's
+  one-`.http`-file-per-exchange layout to NDJSON, one HAR ("HTTP Archive" — a standard, JSON-native
+  format) entry-shaped JSON object per line, rolling per machine per day: standard (widely parseable,
+  not a private format), comprehensive (every header recorded unclipped), and far more compressible
+  (fewer, larger files with near-identical structure per line, vs. hundreds of thousands of small
+  files) than the old layout. Bodies are capped (`dataplane.dumpBodyCap`, default 256KB) via the same
+  capped-tee mechanism `relayBody` already uses for metering — the dump can never cause a full-body
+  buffer, even for a long SSE stream. Set `ENGINE_DUMP_DIR=` (empty) in `.env` to disable; it can grow
+  large — prune it.
 - **The dataplane streams both request and response bodies** chunk-by-chunk (never buffers a whole
   body) for every non-oauth-token exchange, including `/v1/messages` — an improvement over the old
   Python engine's history (it started fully-buffered and only later got a true streaming pass; the

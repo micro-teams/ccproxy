@@ -51,6 +51,7 @@ services:
         "ccproxy.ca.cert-path":"/keys/ca.crt",
         "ccproxy.dataplane.ca-cert-path":"/keys/ca.crt",
         "ccproxy.dataplane.ca-key-path":"/keys/ca.key",
+        "ccproxy.dataplane.dump-dir":"${ENGINE_DUMP_DIR-/dump}",
         "application.applets-dir":"/app/applets",
         "application.connector-public-base":"${CONNECTOR_PUBLIC_BASE:-http://nginx/ccproxy}"}
     healthcheck:
@@ -64,6 +65,9 @@ services:
       # Operator SSH keys + MITM CA (gen-env.sh creates ./keys/). The in-process dataplane reads
       # ca.crt/ca.key straight from here — same mount that used to be shared with proxy-engine.
       - ./keys:/keys:ro
+      # Optional NDJSON traffic dump (dataplane.Dump), on by default — mirrors the old proxy-engine's
+      # CCPROXY_DUMP_DIR mount. Set ENGINE_DUMP_DIR= (empty) in .env to disable. Grows large; prune.
+      - ./app_data/dumps:/dump
       # The connector distribution the backend serves at /connector/latest/<target>/<artifact>:
       # the cross-compiled ccproxy-connector binaries + static tmux, laid out as
       # connector/<target>/{ccproxy-connector,tmux}. A shipped, replaceable part of the bundle

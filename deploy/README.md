@@ -49,6 +49,7 @@ account's `proxy` to a distinct upstream — the schema already supports it.
 | `JWT_SECRET` | signs/verifies session tokens |
 | `SUPERADMIN_PASSWORD` | the super-admin login password |
 | `ENGINE_PROXY_ENDPOINT` / `ENGINE_PROXY_PORT` | where a machine's `HTTPS_PROXY` points (the backend's MITM listener) |
+| `ENGINE_DUMP_DIR` | traffic dump directory inside the backend container (default `/dump`, bind-mounted from `app_data/dumps`); set empty to disable |
 | `NGINX_HTTP_PORT` | host port the gateway listens on (default 80) |
 
 ## Domain-independent

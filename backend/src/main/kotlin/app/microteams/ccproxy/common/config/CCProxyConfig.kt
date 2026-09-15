@@ -68,6 +68,15 @@ class CCProxyConfig {
          * Empty = gate off. Live-toggleable via DataplaneControlService.setBlockedModelFamilies.
          */
         var blockedModelFamilies: String = ""
+        /**
+         * Root directory for the optional NDJSON traffic dump (one HAR-entry-shaped JSON object per
+         * line, per machine, rolling daily — see dataplane.Dump). Empty = disabled. Side-channel
+         * only, records the client's fake-credential view; never affects the forwarded bytes or
+         * blocks the relay (best-effort, off the hot path).
+         */
+        var dumpDir: String = ""
+        /** Cap on each captured body (request and response) mirrored into the dump. */
+        var dumpBodyCap: Int = 256 * 1024
     }
 
     class Provisioning {
