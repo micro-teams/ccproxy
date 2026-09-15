@@ -60,6 +60,44 @@ jobs:
           name: create-sql
           path: backend/CREATE.sql
 
+  # The MultiPath origin: the server end of the substrate, a separate process in front of the
+  # backend (2026-09-15). It is the only thing in this repository that pulls from GitHub Packages,
+  # so it carries the token plumbing the rest of the repo does not need.
+  build-origin:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    defaults:
+      run:
+        working-directory: origin
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          java-version: "21"
+          distribution: "temurin"
+          cache: "maven"
+          cache-dependency-path: origin/pom.xml
+          # Credentials for the `github` repository declared in origin/pom.xml, written to
+          # ~/.m2/settings.xml — where Maven looks on its own, so `./mvnw package` stays `./mvnw
+          # package`.
+          server-id: github
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_TOKEN
+      - name: Build the origin
+        run: ./mvnw package
+        env:
+          MAVEN_USERNAME: ${{ github.actor }}
+          MAVEN_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload the origin jar
+        uses: actions/upload-artifact@v7
+        with:
+          retention-days: 1
+          name: origin-jar
+          path: origin/target/ccproxy-origin-*.jar
+
   build-frontend:
     runs-on: ubuntu-latest
     defaults:
@@ -204,7 +242,7 @@ jobs:
           path: applet-dist
 
   package-zip:
-    needs: [build-jar, build-frontend, lint, build-connector, build-tmux, build-applet]
+    needs: [build-jar, build-origin, build-frontend, lint, build-connector, build-tmux, build-applet]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -215,7 +253,7 @@ jobs:
         run: |
           set -euo pipefail
           STAGE=ccproxy-deploy
-          mkdir -p "$STAGE/backend" "$STAGE/frontend"
+          mkdir -p "$STAGE/backend" "$STAGE/frontend" "$STAGE/origin"
           cp deploy/docker-compose.yml deploy/nginx.conf deploy/gen-env.sh deploy/README.md "$STAGE/"
           cp artifacts/create-sql/CREATE.sql "$STAGE/CREATE.sql"
           cp -r deploy/init "$STAGE/"
@@ -224,6 +262,8 @@ jobs:
           mkdir -p "$STAGE/egress"
           cp deploy/egress/egress.py "$STAGE/egress/egress.py"
           cp artifacts/jar/*.jar "$STAGE/backend/backend.jar"
+          # The MultiPath origin (2026-09-15): the substrate's server end, splices to backend:3128.
+          cp artifacts/origin-jar/*.jar "$STAGE/origin/origin.jar"
           cp -r artifacts/frontend-dist/. "$STAGE/frontend/dist/"
           chmod +x "$STAGE/gen-env.sh"
           # The connector distribution the backend serves: the cross-compiled ccproxy-connector
@@ -325,6 +365,19 @@ jobs:
             --proxy "http://ci:ci@localhost:$PORT" https://example.com/)"
           [ "$CODE" = 200 ] || { echo "FAIL: CONNECT-tunnelled request to example.com got $CODE, want 200"; exit 1; }
           echo "dataplane MITM listener OK (direct-tunnel path verified end to end)"
+      - name: MultiPath origin is up and nginx routes /mt/link to it
+        working-directory: ccproxy-deploy
+        run: |
+          set -eu
+          docker compose ps origin --format '{{.Health}}' | grep -qx healthy
+          echo "origin container healthy"
+          PORT="$(grep -E '^NGINX_HTTP_PORT=' .env | cut -d= -f2 || true)"; PORT="${PORT:-80}"
+          # A plain GET (no Upgrade header) to a WebSocket-only location the origin serves gets
+          # rejected by the origin's own link handshake, not by nginx — a 404/502 here would mean
+          # nginx never reached the origin at all. Any non-000 status proves the round trip worked.
+          CODE="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 "http://localhost:$PORT/mt/link")"
+          [ "$CODE" != "000" ] || { echo "FAIL: /mt/link unreachable through nginx"; exit 1; }
+          echo "nginx -> origin routing OK (got HTTP $CODE)"
       - name: Cluster status
         if: always()
         working-directory: ccproxy-deploy
