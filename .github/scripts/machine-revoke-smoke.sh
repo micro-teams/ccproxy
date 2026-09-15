@@ -36,7 +36,10 @@ PU1="m$MID1"
 echo "machine: $MID1 (session $PU1)"
 
 echo "== simulate a completed login: plant a durable SESSION credential row directly =="
-psql_ccproxy "INSERT INTO ccproxy.credential (scope, cred_key, proxy_password, account_proxy, real_access, real_refresh, fake_access, fake_refresh, expires_at) VALUES ('SESSION','$PU1','pw1','','real-access-1','real-refresh-1','fake-access-1','fake-refresh-1',9999999999);" >/dev/null
+# id has no DB-side default (Hibernate SEQUENCE-strategy generator, not a serial column) — supply
+# one explicitly. now() epoch-ish value keeps it far outside the range the app itself hands out.
+CRED_ID="$(psql_ccproxy "SELECT (extract(epoch from now())*1000)::bigint;")"
+psql_ccproxy "INSERT INTO ccproxy.credential (id, scope, cred_key, proxy_password, account_proxy, real_access, real_refresh, fake_access, fake_refresh, expires_at, created_at, updated_at) VALUES ($CRED_ID,'SESSION','$PU1','pw1','','real-access-1','real-refresh-1','fake-access-1','fake-refresh-1',9999999999,now(),now());" >/dev/null
 ROWS="$(psql_ccproxy "SELECT count(*) FROM ccproxy.credential WHERE scope='SESSION' AND cred_key='$PU1' AND deleted_at IS NULL;")"
 [ "$ROWS" = "1" ] || { echo "FAIL: credential row not planted (count=$ROWS)"; exit 1; }
 echo "ok: credential row planted"
