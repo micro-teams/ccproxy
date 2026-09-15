@@ -79,9 +79,8 @@ class ConnectorLoginOrchestrator(
             val home = resolveHome(mid)
             val caPath = "$home/.claude/ccproxy-ca.crt"
             writeCaCert(mid, caPath)
-            val proxyUrl =
-                "http://${machine.proxyUser}:${machine.proxyPassword}@${config.engine.proxyEndpoint}"
-            writeLoginSettings(mid, home, proxyUrl, caPath)
+            writeProxyCredential(mid, home, machine.proxyUser!!, machine.proxyPassword!!)
+            writeLoginSettings(mid, home, localProxyUrl(), caPath)
 
             // Launch the login Claude with the login-only settings (CLI-scope, above the machine's
             // own settings.json), driven by the shared claude.js applet in login mode. The pane
@@ -194,9 +193,8 @@ class ConnectorLoginOrchestrator(
             val home = resolveHome(mid)
             val caPath = "$home/.claude/ccproxy-ca.crt"
             writeCaCert(mid, caPath)
-            val proxyUrl =
-                "http://${machine.proxyUser}:${machine.proxyPassword}@${config.engine.proxyEndpoint}"
-            configureOfficialProxy(mid, proxyUrl, caPath, oauthToken = fakeToken)
+            writeProxyCredential(mid, home, machine.proxyUser!!, machine.proxyPassword!!)
+            configureOfficialProxy(mid, localProxyUrl(), caPath, oauthToken = fakeToken)
             markOnboardingComplete(mid)
 
             machine.hasCredential = true
@@ -285,9 +283,8 @@ class ConnectorLoginOrchestrator(
             // /login.
             val home = resolveHome(mid)
             val caPath = "$home/.claude/ccproxy-ca.crt"
-            val proxyUrl =
-                "http://${machine.proxyUser}:${machine.proxyPassword}@${config.engine.proxyEndpoint}"
-            configureOfficialProxy(mid, proxyUrl, caPath, oauthToken = null)
+            writeProxyCredential(mid, home, machine.proxyUser!!, machine.proxyPassword!!)
+            configureOfficialProxy(mid, localProxyUrl(), caPath, oauthToken = null)
             markOnboardingComplete(mid)
 
             machine.hasCredential = true
@@ -328,6 +325,34 @@ class ConnectorLoginOrchestrator(
                     "'$absPath.ccproxy.tmp' && mv -f '$absPath.ccproxy.tmp' '$absPath'",
             )
         if (r.exit != 0) throw IllegalStateException("write $absPath failed: ${r.stderr.take(200)}")
+    }
+
+    /** No credentials in this URL — see CCProxyConfig.Engine.localProxyPort. */
+    private fun localProxyUrl(): String = "http://127.0.0.1:${config.engine.localProxyPort}"
+
+    /**
+     * Write proxyUser/proxyPassword to the connector's OWN machine-local file, not the env any
+     * child process of Claude Code (MCP servers, hooks, tool calls) can read. The connector's local
+     * proxy reads this file per-CONNECT and attaches Proxy-Authorization itself — settings.json's
+     * HTTPS_PROXY (see localProxyUrl) carries no secret at all. Rides the same
+     * already-authenticated connector channel (hub.exec, the device-token control WebSocket) that
+     * already writes the CA cert and settings.json — no new endpoint, no new auth mechanism.
+     */
+    private fun writeProxyCredential(
+        machineId: String,
+        home: String,
+        proxyUser: String,
+        proxyPassword: String,
+    ) {
+        val json =
+            mapper.writeValueAsString(
+                mapOf("proxyUser" to proxyUser, "proxyPassword" to proxyPassword)
+            )
+        writeFileOnMachine(
+            machineId,
+            "$home/.config/ccproxy-connector/proxy-credential.json",
+            json,
+        )
     }
 
     private fun writeCaCert(machineId: String, caPath: String) {

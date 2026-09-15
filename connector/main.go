@@ -136,6 +136,18 @@ func resident(cfgPath string) service.Runner {
 		if err != nil {
 			return err
 		}
+		// The local MITM-splitting proxy runs alongside the control connection, not gated on it:
+		// a machine whose network comes up before enrolment finishes control-plane traffic still
+		// wants Anthropic-domain requests split locally the moment settings.json points here. A
+		// failure starting it is logged, not fatal — the resident's job is the control connection.
+		go func() {
+			if err := runLocalProxy(ctx, cfg.APIBase(), func(format string, args ...any) {
+				fmt.Fprintf(os.Stderr, format+"\n", args...)
+			}); err != nil {
+				fmt.Fprintln(os.Stderr, "ccproxy: local proxy stopped:", err)
+			}
+		}()
+
 		conn := ws.New(ctrlURL, cfg.Token, cfg.APIBase())
 		mgr := screen.NewManager(ctx, conn, tm)
 		defer mgr.CloseAll()
