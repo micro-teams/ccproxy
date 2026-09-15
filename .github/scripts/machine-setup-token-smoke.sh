@@ -85,7 +85,6 @@ echo "bootstrapped onto the connector, online OK"
 echo "== start login: bound account has a setup-token, so this must auto-complete (no operator) =="
 LR="$(curl -s -X POST "$GW/machine/$MID/login" -H "Authorization: Bearer $TSEC")"
 echo "$LR"
-LRID="$(printf '%s' "$LR" | jqget "['id']")"
 
 for _ in $(seq 1 30); do
   ls="$(curl -s "$GW/machine/$MID" -H "Authorization: Bearer $TSEC" | jqget "['status']")"
@@ -113,11 +112,16 @@ case "$HTTPS_PROXY_VAL" in
   *@*) echo "FAIL: HTTPS_PROXY still carries embedded credentials: $HTTPS_PROXY_VAL"; exit 1 ;;
 esac
 
-CRED_JSON="$(docker exec "$MACHINE" bash -lc 'cat ~/.config/ccproxy-connector/proxy-credential.json 2>&1')" \
-  || { echo "FAIL: proxy-credential.json was never written: $CRED_JSON"; exit 1; }
+if ! CRED_JSON="$(docker exec "$MACHINE" bash -lc 'cat ~/.config/ccproxy-connector/proxy-credential.json 2>&1')"; then
+  echo "FAIL: proxy-credential.json was never written: $CRED_JSON"
+  exit 1
+fi
 PU="$(printf '%s' "$CRED_JSON" | jqget "['proxyUser']")"
 PP="$(printf '%s' "$CRED_JSON" | jqget "['proxyPassword']")"
-[ -n "$PU" ] && [ -n "$PP" ] || { echo "FAIL: proxy-credential.json missing proxyUser/proxyPassword: $CRED_JSON"; exit 1; }
+if [ -z "$PU" ] || [ -z "$PP" ]; then
+  echo "FAIL: proxy-credential.json missing proxyUser/proxyPassword: $CRED_JSON"
+  exit 1
+fi
 echo "PASS: proxy-credential.json present with proxyUser=$PU"
 
 echo "ALL PASS [setup-token fast path]"
