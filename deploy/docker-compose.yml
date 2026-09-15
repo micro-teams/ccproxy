@@ -6,6 +6,9 @@
 #                 machines' HTTPS_PROXY points. The standalone Python proxy-engine container is
 #                 gone (cutover 2026-09-14) — there is no separate MITM service anymore.
 #   egress-proxy  the default upstream proxy accounts point at (:7890, host network egress)
+#   origin        the MultiPath substrate's server end (2026-09-15): splices to backend:3128
+#                 unchanged — a transport swap, not a protocol change. Optional: a machine not on
+#                 multipath still dials backend:3128 directly, same as before.
 #   postgres      CCProxy's DB (schema "ccproxy")
 #
 # Secrets come from .env (generate it with `bash gen-env.sh`). All state lives in ./app_data/ as
@@ -96,11 +99,42 @@ services:
       retries: 20
       start_period: 10s
 
+  # The MultiPath origin: the server end of the substrate, and the only thing in this deployment
+  # that knows more than one path to it exists (mirrors micro-teams' origin service).
+  #
+  # It splices straight to backend:3128 — the SAME port a machine reaches today by dialling
+  # directly — so a request carried over the substrate lands exactly where the same CONNECT +
+  # Proxy-Authorization bytes would over a plain socket. This process never parses any of it.
+  origin:
+    image: ghcr.io/micro-teams/eclipse-temurin:21-jre
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    working_dir: /app
+    command: ["java", "-jar", "/app/origin.jar"]
+    environment:
+      CCPROXY_ORIGIN_PORT: "9444"
+      CCPROXY_PROXY_HOST: "backend"
+      CCPROXY_PROXY_PORT: "3128"
+      CCPROXY_LINK_PATH: "/mt/link"
+    volumes:
+      - ./origin/origin.jar:/app/origin.jar:ro
+    healthcheck:
+      # A TCP connect: what this port speaks is the substrate's own framing, not HTTP.
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9444' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
   nginx:
     image: nginx:1.27-alpine
     restart: unless-stopped
     depends_on:
       backend:
+        condition: service_healthy
+      origin:
         condition: service_healthy
     ports:
       - "${NGINX_HTTP_PORT:-80}:80"

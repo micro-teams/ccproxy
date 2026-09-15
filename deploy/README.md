@@ -5,12 +5,15 @@ build artifacts **bind-mounted** in — no custom images to build. The MITM data
 backend jar now (no standalone proxy-engine container; cutover 2026-09-14).
 
 ```
-docker-compose.yml     four services (nginx, backend, egress-proxy, postgres)
-nginx.conf             domain-independent gateway (SPA + /ccproxy -> backend)
+docker-compose.yml     five services (nginx, backend, origin, egress-proxy, postgres)
+nginx.conf             domain-independent gateway (SPA + /ccproxy -> backend, /mt/link -> origin)
 gen-env.sh             generates .env (secrets) + app_data/ + keys/ (operator SSH keypair + MITM CA)
 init/                  postgres first-init SQL (creates the "ccproxy" schema)
 CREATE.sql             the DB schema this release expects (for ops; hand-write migrations from diffs)
 backend/backend.jar    the backend + MITM dataplane (CI fills this in the shipped bundle)
+origin/origin.jar      the MultiPath substrate's server end; splices to backend:3128 unchanged
+                        (2026-09-15 — CI fills this in; optional, a machine not on multipath still
+                        dials backend:3128 directly)
 frontend/dist/         built test SPA (CI fills this in the shipped bundle)
 egress/                the default egress proxy (stdlib Python; run on a stock python image)
 keys/                  not shipped; gen-env.sh creates it (operator SSH keypair + ca.crt/ca.key)
