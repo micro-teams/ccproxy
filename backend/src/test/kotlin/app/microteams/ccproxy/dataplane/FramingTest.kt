@@ -43,7 +43,7 @@ class FramingTest {
         val src = ByteArrayInputStream(payload.toByteArray())
         val dst = ByteArrayOutputStream()
         val headers = mapOf("Content-Length" to payload.length.toString())
-        val result = relayBody(src, dst, headers, streamBlock = 37, teeCap = 0, allowEof = false)
+        val result = relayBody(src, dst, headers, streamBlock = 37, tee = false, allowEof = false)
         assertEquals(payload, dst.toByteArray().toString(Charsets.UTF_8))
         assertEquals(false, result.eofUsed)
         assertNull(result.teeBytes)
@@ -62,7 +62,7 @@ class FramingTest {
                 dst,
                 headers,
                 streamBlock = 3,
-                teeCap = 100,
+                tee = true,
                 allowEof = false,
                 tap = { tapped.write(it) },
             )
@@ -78,22 +78,19 @@ class FramingTest {
         val payload = "stream to EOF"
         val src = ByteArrayInputStream(payload.toByteArray())
         val dst = ByteArrayOutputStream()
-        val result = relayBody(src, dst, emptyMap(), streamBlock = 4, teeCap = 0, allowEof = true)
+        val result = relayBody(src, dst, emptyMap(), streamBlock = 4, tee = false, allowEof = true)
         assertEquals(payload, dst.toByteArray().toString(Charsets.UTF_8))
         assertTrue(result.eofUsed)
     }
 
     @Test
-    fun `relayBody tee respects its cap and marks truncated`() {
+    fun `relayBody tee captures the full body, byte-exact, uncapped`() {
         val payload = "x".repeat(500)
         val src = ByteArrayInputStream(payload.toByteArray())
         val dst = ByteArrayOutputStream()
         val headers = mapOf("Content-Length" to "500")
-        val result = relayBody(src, dst, headers, streamBlock = 64, teeCap = 100, allowEof = false)
-        // full body still forwarded to dst...
+        val result = relayBody(src, dst, headers, streamBlock = 64, tee = true, allowEof = false)
         assertEquals(500, dst.size())
-        // ...but the tee stops at its cap.
-        assertEquals(100, result.teeBytes!!.size)
-        assertTrue(result.truncated)
+        assertEquals(500, result.teeBytes!!.size)
     }
 }

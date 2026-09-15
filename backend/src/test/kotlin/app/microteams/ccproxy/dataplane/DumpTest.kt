@@ -36,11 +36,9 @@ class DumpTest {
                         "Content-Type" to "application/json",
                     ),
                 reqBody = """{"model":"claude-sonnet-5"}""".toByteArray(),
-                reqBodyTruncated = false,
                 statusLine = "HTTP/1.1 200 OK",
                 respHeaders = linkedMapOf("anthropic-ratelimit-unified-7d-utilization" to "0.42"),
                 respBody = "data: {\"type\":\"message_start\"}\n\n".toByteArray(),
-                respBodyTruncated = false,
             )
             dump.writeAsync(
                 machine = "m1",
@@ -49,11 +47,9 @@ class DumpTest {
                 host = "api.anthropic.com",
                 reqHeaders = emptyMap(),
                 reqBody = null,
-                reqBodyTruncated = false,
                 statusLine = "404 Not Found",
                 respHeaders = emptyMap(),
                 respBody = null,
-                respBodyTruncated = false,
             )
 
             val file = waitForFile(dir, "m1")
@@ -82,10 +78,11 @@ class DumpTest {
     }
 
     @Test
-    fun `marks truncated bodies and records their captured size, not the true size`() {
+    fun `captures a body far past the old truncation cap, whole and byte-exact`() {
         val dir = Files.createTempDirectory("dump-test").toFile()
         try {
             val dump = Dump(dir.absolutePath, mapper)
+            val bigBody = "x".repeat(1024 * 1024) // 1MB, well past the old 256KB cap
             dump.writeAsync(
                 machine = "m2",
                 method = "POST",
@@ -93,18 +90,16 @@ class DumpTest {
                 host = "api.anthropic.com",
                 reqHeaders = emptyMap(),
                 reqBody = "short".toByteArray(),
-                reqBodyTruncated = false,
                 statusLine = "HTTP/1.1 200 OK",
                 respHeaders = emptyMap(),
-                respBody = "0123456789".toByteArray(), // capped tee simulated as already-truncated
-                respBodyTruncated = true,
+                respBody = bigBody.toByteArray(),
             )
 
             val file = waitForFile(dir, "m2")
             val lines = waitForLines(file, 1)
             val entry = mapper.readValue(lines[0], DumpEntry::class.java)
-            assertTrue(entry.response.content!!.truncated)
-            assertEquals(10, entry.response.content.size)
+            assertEquals(bigBody.length, entry.response.content!!.size)
+            assertEquals(bigBody, entry.response.content.text)
         } finally {
             dir.deleteRecursively()
         }
@@ -122,11 +117,9 @@ class DumpTest {
                 host = "api.anthropic.com",
                 reqHeaders = emptyMap(),
                 reqBody = null,
-                reqBodyTruncated = false,
                 statusLine = "200 OK",
                 respHeaders = emptyMap(),
                 respBody = null,
-                respBodyTruncated = false,
             )
             val deadline = System.currentTimeMillis() + 3000
             var found: File? = null

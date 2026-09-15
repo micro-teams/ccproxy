@@ -318,10 +318,9 @@ These are real behaviours discovered while validating the flow — worth knowing
   format) entry-shaped JSON object per line, rolling per machine per day: standard (widely parseable,
   not a private format), comprehensive (every header recorded unclipped), and far more compressible
   (fewer, larger files with near-identical structure per line, vs. hundreds of thousands of small
-  files) than the old layout. Bodies are capped (`dataplane.dumpBodyCap`, default 256KB) via the same
-  capped-tee mechanism `relayBody` already uses for metering — the dump can never cause a full-body
-  buffer, even for a long SSE stream. Set `ENGINE_DUMP_DIR=` (empty) in `.env` to disable; it can grow
-  large — prune it.
+  files) than the old layout. Bodies are captured whole, byte-exact, no cap — every byte of traffic
+  through ccproxy is archived unmodified (2026-09-15). Set `ENGINE_DUMP_DIR=` (empty) in `.env` to
+  disable; it can grow large — prune it.
 - **The dataplane streams both request and response bodies** chunk-by-chunk (never buffers a whole
   body) for every non-oauth-token exchange, including `/v1/messages` — an improvement over the old
   Python engine's history (it started fully-buffered and only later got a true streaming pass; the
