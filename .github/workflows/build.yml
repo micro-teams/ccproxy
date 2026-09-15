@@ -437,6 +437,45 @@ jobs:
         working-directory: ccproxy-deploy
         run: docker compose down
 
+  # Bound account has a setup-token stored server-side: startForMachine takes the automatic
+  # prepareViaSetupToken path (no operator, no OAuth URL) — a fully separate code path from
+  # machine-login-compat's interactive /login. Asserts the MultiPath local-proxy config actually
+  # lands on the machine: settings.json's HTTPS_PROXY must be the credential-free local split-proxy
+  # URL, and proxy-credential.json must exist for the local proxy to read.
+  machine-setup-token:
+    needs: [package-zip]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: ccproxy-deploy
+          path: ccproxy-deploy
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Bring the cluster up
+        working-directory: ccproxy-deploy
+        run: |
+          bash gen-env.sh
+          docker compose up -d --wait --wait-timeout 360
+      - name: Setup-token fast-login path
+        working-directory: ccproxy-deploy
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/machine-setup-token-smoke.sh"
+      - name: Dump logs on failure
+        if: failure()
+        working-directory: ccproxy-deploy
+        run: docker compose logs --no-color --tail 200
+      - name: Tear down
+        if: always()
+        working-directory: ccproxy-deploy
+        run: docker compose down
+
   # A machine ccproxy cannot SSH into installs the connector from the served install.sh, dials OUT to
   # the control plane, and is recognised online — the whole enrolment + WebSocket transport + hub
   # stack, live, on a real machine container. No Claude / no account needed.
@@ -519,7 +558,7 @@ jobs:
     # Only the leaves of the dependency DAG: everything else (build-jar, build-origin,
     # build-frontend, lint, build-connector, build-tmux, build-applet, package-zip) is already
     # required transitively by these four, and a failure/skip anywhere upstream skips them too.
-    needs: [test-compose, machine-login-compat, machine-connector-dialin, machine-revoke]
+    needs: [test-compose, machine-login-compat, machine-setup-token, machine-connector-dialin, machine-revoke]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All required CI jobs passed."
