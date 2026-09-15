@@ -26,6 +26,7 @@ class MitmHandler(
     private val controlService: DataplaneControlService,
 ) {
     private val log = LoggerFactory.getLogger(MitmHandler::class.java)
+    private val dump = Dump(config.dumpDir, mapper)
 
     fun isOauthTokenPath(path: String): Boolean = "oauth/token" in path.lowercase()
 
@@ -73,7 +74,7 @@ class MitmHandler(
                 val headers = parseHeaders(input) ?: break
                 if (isOauthTokenPath(path)) {
                     val body = readBodyFully(input, headers)
-                    val resp = forward(::getUpstream, method, path, headers, body, sess, user)
+                    val resp = forward(::getUpstream, method, path, headers, body, sess, user, host)
                     if (resp == null) break
                     output.write(resp)
                     output.flush()
@@ -89,6 +90,7 @@ class MitmHandler(
                             clientTls,
                             sess,
                             user,
+                            host,
                         )
                     if (!keepAlive) break
                 }
@@ -114,6 +116,7 @@ class MitmHandler(
         body: ByteArray?,
         sess: Session,
         user: String,
+        host: String,
     ): ByteArray? {
         val bodyText = body?.toString(StandardCharsets.UTF_8)
         val statusHeadersBody: Triple<String, MutableMap<String, String>, String>
@@ -155,6 +158,24 @@ class MitmHandler(
         val (status, rh, outBody) = statusHeadersBody
         val outBytes = outBody.toByteArray(StandardCharsets.UTF_8)
         rh["Content-Length"] = outBytes.size.toString()
+        if (dump.enabled) {
+            // Client's (fake-credential) view: the pre-swap headers/body this method was called
+            // with, never the swapped/real ones — same invariant as the old engine's dump_exchange.
+            val cap = config.dumpBodyCap
+            dump.writeAsync(
+                machine = user,
+                method = method,
+                path = path,
+                host = host,
+                reqHeaders = headers,
+                reqBody = body?.copyOf(minOf(body.size, cap)),
+                reqBodyTruncated = (body?.size ?: 0) > cap,
+                statusLine = status,
+                respHeaders = rh,
+                respBody = outBytes.copyOf(minOf(outBytes.size, cap)),
+                respBodyTruncated = outBytes.size > cap,
+            )
+        }
         val head = StringBuilder("HTTP/1.1 $status\r\n")
         for ((k, v) in rh) head.append(k).append(": ").append(v).append("\r\n")
         head.append("\r\n")
@@ -237,9 +258,14 @@ class MitmHandler(
         clientTls: SSLSocket,
         sess: Session,
         user: String,
+        host: String,
     ): Boolean {
         val isMessages = "/v1/messages" in path
         val workingHeaders = LinkedHashMap(headers)
+        // Client's (fake-credential, pre-swap) view for the optional dump — captured before
+        // Authorization gets swapped to the real token below.
+        val dumpReqHeaders = if (dump.enabled) LinkedHashMap(headers) else null
+        val dumpCap = if (dump.enabled) config.dumpBodyCap else 0
 
         // Model gate (item 10): peek the body prefix BEFORE opening any upstream connection.
         var bodyPrefix = ByteArray(0)
@@ -311,27 +337,47 @@ class MitmHandler(
         }
 
         // Forward the request body: the peeked prefix (if any) first, then the rest via relayBody.
+        // teeCap (dumpCap) captures up to the cap for the optional dump WITHOUT buffering the full
+        // body — same capped-tee mechanism the response side uses, coexisting with SseUsage's O(1)
+        // tap on that side.
+        var reqTee: ByteArray? = null
+        var reqTruncated = false
         if (bodyPrefixRemaining == null) {
-            relayBody(
-                clientTls.inputStream,
-                up.outputStream,
-                workingHeaders,
-                config.streamBlock,
-                allowEof = false,
-            )
-        } else {
-            up.outputStream.write(bodyPrefix)
-            up.outputStream.flush()
-            if (bodyPrefixRemaining > 0) {
-                val restHeaders = LinkedHashMap(workingHeaders)
-                restHeaders["Content-Length"] = bodyPrefixRemaining.toString()
+            val r =
                 relayBody(
                     clientTls.inputStream,
                     up.outputStream,
-                    restHeaders,
+                    workingHeaders,
                     config.streamBlock,
+                    teeCap = dumpCap,
                     allowEof = false,
                 )
+            reqTee = r.teeBytes
+            reqTruncated = r.truncated
+        } else {
+            up.outputStream.write(bodyPrefix)
+            up.outputStream.flush()
+            if (dumpCap > 0) {
+                reqTee = bodyPrefix.copyOf(minOf(bodyPrefix.size, dumpCap))
+                reqTruncated = bodyPrefix.size > dumpCap
+            }
+            if (bodyPrefixRemaining > 0) {
+                val restHeaders = LinkedHashMap(workingHeaders)
+                restHeaders["Content-Length"] = bodyPrefixRemaining.toString()
+                val remainingCap = if (dumpCap > 0) maxOf(0, dumpCap - (reqTee?.size ?: 0)) else 0
+                val r =
+                    relayBody(
+                        clientTls.inputStream,
+                        up.outputStream,
+                        restHeaders,
+                        config.streamBlock,
+                        teeCap = remainingCap,
+                        allowEof = false,
+                    )
+                if (dumpCap > 0) {
+                    reqTee = (reqTee ?: ByteArray(0)) + (r.teeBytes ?: ByteArray(0))
+                    reqTruncated = reqTruncated || r.truncated
+                }
             }
         }
 
@@ -361,9 +407,26 @@ class MitmHandler(
                     clientTls.outputStream,
                     rh,
                     config.streamBlock,
+                    teeCap = dumpCap,
                     allowEof = true,
                     tap = meter?.let { { blk: ByteArray -> it.feed(blk) } },
                 )
+
+        if (dump.enabled && dumpReqHeaders != null) {
+            dump.writeAsync(
+                machine = user,
+                method = method,
+                path = path,
+                host = host,
+                reqHeaders = dumpReqHeaders,
+                reqBody = reqTee,
+                reqBodyTruncated = reqTruncated,
+                statusLine = status,
+                respHeaders = rh,
+                respBody = relayResult.teeBytes,
+                respBodyTruncated = relayResult.truncated,
+            )
+        }
 
         if (isMessages && !noBody) {
             DataplaneReporting.extractRateLimit(rh)?.let { reporting.reportRateLimit(user, it) }
