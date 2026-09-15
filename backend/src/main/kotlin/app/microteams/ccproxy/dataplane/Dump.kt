@@ -18,9 +18,9 @@
  *               literally containing the text "HTTP/1.1" once corrupted a naive parser.
  *
  *               Records the CLIENT's view (fake credential, pre-swap) — real tokens are never
- *               written to disk, matching the old engine's invariant. Bodies are capped
- *               (dataplane.dumpBodyCap) via relayBody's teeCap mechanism, so this never buffers a
- *               full SSE stream to build the dump — the capped tee coexists with the O(1) SseUsage
+ *               written to disk, matching the old engine's invariant. Bodies are captured whole,
+ *               byte-exact, no cap (2026-09-15: nictheboy — every byte of traffic through ccproxy
+ *               must be archived unmodified) via relayBody's tee, coexisting with the O(1) SseUsage
  *               tap on the same relayBody call. Best-effort and always off the hot path (a daemon
  *               thread per write): a slow or failing disk must never affect what the client receives.
  *
@@ -44,7 +44,7 @@ import org.slf4j.LoggerFactory
 
 data class DumpHeader(val name: String, val value: String)
 
-data class DumpContent(val size: Int, val text: String, val truncated: Boolean)
+data class DumpContent(val size: Int, val text: String)
 
 data class DumpRequest(
     val method: String,
@@ -88,11 +88,9 @@ class Dump(private val dumpDir: String, private val mapper: ObjectMapper) {
         host: String,
         reqHeaders: Map<String, String>,
         reqBody: ByteArray?,
-        reqBodyTruncated: Boolean,
         statusLine: String,
         respHeaders: Map<String, String>,
         respBody: ByteArray?,
-        respBodyTruncated: Boolean,
     ) {
         if (!enabled) return
         val t = Thread {
@@ -104,11 +102,9 @@ class Dump(private val dumpDir: String, private val mapper: ObjectMapper) {
                     host,
                     reqHeaders,
                     reqBody,
-                    reqBodyTruncated,
                     statusLine,
                     respHeaders,
                     respBody,
-                    respBodyTruncated,
                 )
             } catch (e: Exception) {
                 log.warn("dump write failed for $machine: ${e.message?.take(80)}")
@@ -125,11 +121,9 @@ class Dump(private val dumpDir: String, private val mapper: ObjectMapper) {
         host: String,
         reqHeaders: Map<String, String>,
         reqBody: ByteArray?,
-        reqBodyTruncated: Boolean,
         statusLine: String,
         respHeaders: Map<String, String>,
         respBody: ByteArray?,
-        respBodyTruncated: Boolean,
     ) {
         val now = Instant.now()
         val (status, statusText) = parseStatusLine(statusLine)
@@ -143,7 +137,7 @@ class Dump(private val dumpDir: String, private val mapper: ObjectMapper) {
                         url = "https://$host$path",
                         httpVersion = "HTTP/1.1",
                         headers = reqHeaders.map { (k, v) -> DumpHeader(k, v) },
-                        postData = bodyToContent(reqBody, reqBodyTruncated),
+                        postData = bodyToContent(reqBody),
                     ),
                 response =
                     DumpResponse(
@@ -151,7 +145,7 @@ class Dump(private val dumpDir: String, private val mapper: ObjectMapper) {
                         statusText = statusText,
                         httpVersion = "HTTP/1.1",
                         headers = respHeaders.map { (k, v) -> DumpHeader(k, v) },
-                        content = bodyToContent(respBody, respBodyTruncated),
+                        content = bodyToContent(respBody),
                     ),
             )
         val line = mapper.writeValueAsString(entry) + "\n"
@@ -169,13 +163,9 @@ class Dump(private val dumpDir: String, private val mapper: ObjectMapper) {
         }
     }
 
-    private fun bodyToContent(body: ByteArray?, truncated: Boolean): DumpContent? {
+    private fun bodyToContent(body: ByteArray?): DumpContent? {
         if (body == null) return null
-        return DumpContent(
-            size = body.size,
-            text = String(body, StandardCharsets.UTF_8),
-            truncated = truncated,
-        )
+        return DumpContent(size = body.size, text = String(body, StandardCharsets.UTF_8))
     }
 
     private fun parseStatusLine(statusLine: String): Pair<Int, String> {

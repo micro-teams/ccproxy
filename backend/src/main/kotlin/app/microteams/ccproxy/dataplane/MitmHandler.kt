@@ -161,19 +161,16 @@ class MitmHandler(
         if (dump.enabled) {
             // Client's (fake-credential) view: the pre-swap headers/body this method was called
             // with, never the swapped/real ones — same invariant as the old engine's dump_exchange.
-            val cap = config.dumpBodyCap
             dump.writeAsync(
                 machine = user,
                 method = method,
                 path = path,
                 host = host,
                 reqHeaders = headers,
-                reqBody = body?.copyOf(minOf(body.size, cap)),
-                reqBodyTruncated = (body?.size ?: 0) > cap,
+                reqBody = body,
                 statusLine = status,
                 respHeaders = rh,
-                respBody = outBytes.copyOf(minOf(outBytes.size, cap)),
-                respBodyTruncated = outBytes.size > cap,
+                respBody = outBytes,
             )
         }
         val head = StringBuilder("HTTP/1.1 $status\r\n")
@@ -265,7 +262,6 @@ class MitmHandler(
         // Client's (fake-credential, pre-swap) view for the optional dump — captured before
         // Authorization gets swapped to the real token below.
         val dumpReqHeaders = if (dump.enabled) LinkedHashMap(headers) else null
-        val dumpCap = if (dump.enabled) config.dumpBodyCap else 0
 
         // Model gate (item 10): peek the body prefix BEFORE opening any upstream connection.
         var bodyPrefix = ByteArray(0)
@@ -337,11 +333,9 @@ class MitmHandler(
         }
 
         // Forward the request body: the peeked prefix (if any) first, then the rest via relayBody.
-        // teeCap (dumpCap) captures up to the cap for the optional dump WITHOUT buffering the full
-        // body — same capped-tee mechanism the response side uses, coexisting with SseUsage's O(1)
-        // tap on that side.
+        // The tee (when dump is enabled) captures the full decoded body byte-exact, coexisting with
+        // SseUsage's O(1) tap on the response side.
         var reqTee: ByteArray? = null
-        var reqTruncated = false
         if (bodyPrefixRemaining == null) {
             val r =
                 relayBody(
@@ -349,34 +343,28 @@ class MitmHandler(
                     up.outputStream,
                     workingHeaders,
                     config.streamBlock,
-                    teeCap = dumpCap,
+                    tee = dump.enabled,
                     allowEof = false,
                 )
             reqTee = r.teeBytes
-            reqTruncated = r.truncated
         } else {
             up.outputStream.write(bodyPrefix)
             up.outputStream.flush()
-            if (dumpCap > 0) {
-                reqTee = bodyPrefix.copyOf(minOf(bodyPrefix.size, dumpCap))
-                reqTruncated = bodyPrefix.size > dumpCap
-            }
+            if (dump.enabled) reqTee = bodyPrefix
             if (bodyPrefixRemaining > 0) {
                 val restHeaders = LinkedHashMap(workingHeaders)
                 restHeaders["Content-Length"] = bodyPrefixRemaining.toString()
-                val remainingCap = if (dumpCap > 0) maxOf(0, dumpCap - (reqTee?.size ?: 0)) else 0
                 val r =
                     relayBody(
                         clientTls.inputStream,
                         up.outputStream,
                         restHeaders,
                         config.streamBlock,
-                        teeCap = remainingCap,
+                        tee = dump.enabled,
                         allowEof = false,
                     )
-                if (dumpCap > 0) {
+                if (dump.enabled) {
                     reqTee = (reqTee ?: ByteArray(0)) + (r.teeBytes ?: ByteArray(0))
-                    reqTruncated = reqTruncated || r.truncated
                 }
             }
         }
@@ -400,14 +388,14 @@ class MitmHandler(
             else null
 
         val relayResult =
-            if (noBody) RelayResult(null, false, false)
+            if (noBody) RelayResult(null, false)
             else
                 relayBody(
                     up.inputStream,
                     clientTls.outputStream,
                     rh,
                     config.streamBlock,
-                    teeCap = dumpCap,
+                    tee = dump.enabled,
                     allowEof = true,
                     tap = meter?.let { { blk: ByteArray -> it.feed(blk) } },
                 )
@@ -420,11 +408,9 @@ class MitmHandler(
                 host = host,
                 reqHeaders = dumpReqHeaders,
                 reqBody = reqTee,
-                reqBodyTruncated = reqTruncated,
                 statusLine = status,
                 respHeaders = rh,
                 respBody = relayResult.teeBytes,
-                respBodyTruncated = relayResult.truncated,
             )
         }
 

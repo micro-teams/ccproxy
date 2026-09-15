@@ -111,42 +111,34 @@ fun sendHead(dst: OutputStream, firstLine: String, headers: Map<String, String>)
 }
 
 /**
- * Result of a streamed relay: teeBytes (up to teeCap of the decoded body, or null if teeCap==0),
- * truncated (tee hit its cap), eofUsed (body ran to connection close — caller must not keep-alive).
+ * Result of a streamed relay: teeBytes (the full decoded body, byte-exact, or null if tee==false),
+ * eofUsed (body ran to connection close — caller must not keep-alive).
  */
-data class RelayResult(val teeBytes: ByteArray?, val truncated: Boolean, val eofUsed: Boolean)
+data class RelayResult(val teeBytes: ByteArray?, val eofUsed: Boolean)
 
 /**
  * Relay a message body src->dst preserving its framing (chunked / Content-Length / EOF-delimited),
  * never holding more than [streamBlock] bytes in flight. [tap], if given, is called with every
  * decoded block for unbounded incremental metering (SseUsage) — memory there stays O(1), unlike the
- * capped tee. Direct Kotlin analogue of ccproxy_engine.py's relay_body.
+ * tee (which holds the whole decoded body, for callers that need a byte-exact copy, e.g. the dump).
+ * Direct Kotlin analogue of ccproxy_engine.py's relay_body.
  */
 fun relayBody(
     src: InputStream,
     dst: OutputStream,
     headers: Map<String, String>,
     streamBlock: Int,
-    teeCap: Int = 0,
+    tee: Boolean = false,
     allowEof: Boolean = false,
     tap: ((ByteArray) -> Unit)? = null,
 ): RelayResult {
-    val teeBuf = if (teeCap > 0) ByteArrayOutputStream() else null
-    var truncated = false
+    val teeBuf = if (tee) ByteArrayOutputStream() else null
 
     fun teeAdd(data: ByteArray, len: Int) {
-        if (teeBuf == null) return
-        val remaining = teeCap - teeBuf.size()
-        if (remaining <= 0) {
-            truncated = true
-            return
-        }
-        val take = minOf(remaining, len)
-        teeBuf.write(data, 0, take)
-        if (take < len) truncated = true
+        teeBuf?.write(data, 0, len)
     }
 
-    fun result(eof: Boolean) = RelayResult(teeBuf?.toByteArray(), truncated, eof)
+    fun result(eof: Boolean) = RelayResult(teeBuf?.toByteArray(), eof)
 
     val te = headerIgnoreCase(headers, "Transfer-Encoding")?.lowercase() ?: ""
     if ("chunked" in te) {

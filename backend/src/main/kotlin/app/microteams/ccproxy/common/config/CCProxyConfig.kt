@@ -75,8 +75,6 @@ class CCProxyConfig {
          * blocks the relay (best-effort, off the hot path).
          */
         var dumpDir: String = ""
-        /** Cap on each captured body (request and response) mirrored into the dump. */
-        var dumpBodyCap: Int = 256 * 1024
     }
 
     class Provisioning {
