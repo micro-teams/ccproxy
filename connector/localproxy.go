@@ -117,13 +117,20 @@ func runLocalProxy(ctx context.Context, apiBase string, logf func(format string,
 	}
 }
 
-func (lp *localProxy) handle(ctx context.Context, conn net.Conn, logf func(format string, args ...any)) {
-	defer conn.Close()
-	br := bufio.NewReader(conn)
+func (lp *localProxy) handle(ctx context.Context, rawConn net.Conn, logf func(format string, args ...any)) {
+	defer rawConn.Close()
+	br := bufio.NewReader(rawConn)
 	req, err := http.ReadRequest(br)
 	if err != nil {
 		return
 	}
+	// http.ReadRequest's bufio.Reader can read (and buffer) bytes past the CONNECT headers in the
+	// same syscall — e.g. a client that pipelines its TLS ClientHello right behind the CONNECT
+	// without waiting for "200 Connection Established". Splicing the raw conn from here on would
+	// silently drop whatever br already buffered, leaving the TLS handshake missing its first
+	// bytes and hanging forever with no error on either side. conn wraps rawConn so every read
+	// downstream goes through br first (draining anything buffered), then the underlying socket.
+	conn := &bufConn{Conn: rawConn, r: br}
 	if req.Method != http.MethodConnect {
 		// The machine's HTTPS_PROXY is only ever used for CONNECT (TLS) traffic; anything else is
 		// not a shape this proxy exists to handle.
@@ -141,6 +148,15 @@ func (lp *localProxy) handle(ctx context.Context, conn net.Conn, logf func(forma
 	}
 	handleDirect(conn, req.Host, logf)
 }
+
+// bufConn is rawConn with reads routed through br (which may already hold buffered bytes read past
+// the parsed request) instead of the socket directly. Write/Close still go straight to rawConn.
+type bufConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
 // handleDirect dials the target straight from this machine's own network — no server involved at
 // all, matching what a client outside any proxy would do.
