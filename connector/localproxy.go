@@ -227,8 +227,8 @@ func (lp *localProxy) handleAnthropic(ctx context.Context, conn net.Conn, req *h
 		return
 	}
 	logf("ccproxy: local proxy: %s riding the substrate", req.Host)
-	splice(conn, st)
-	logf("ccproxy: local proxy: %s stream closed", req.Host)
+	toOrigin, fromOrigin := splice(conn, st)
+	logf("ccproxy: local proxy: %s stream closed (%d bytes to origin, %d bytes from origin)", req.Host, toOrigin, fromOrigin)
 }
 
 // substrate returns a live client, dialling one if none exists yet or the last one died.
@@ -310,12 +310,13 @@ func sameOriginLines(apiBase string) []multipath.Line {
 }
 
 // splice pumps both directions until either side closes, mirroring ProxyServer.tunnel's shape.
-func splice(a io.ReadWriteCloser, b io.ReadWriteCloser) {
+func splice(a io.ReadWriteCloser, b io.ReadWriteCloser) (aToB, bToA int64) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(b, a)
+		n, _ := io.Copy(b, a)
+		aToB = n
 		// One direction going EOF does not mean the other has nothing left to say (e.g. a server
 		// still streaming a response after the client half-closed) — but neither side here
 		// reliably supports a half-close (multipath.MuxStream does not), so close both once
@@ -326,9 +327,11 @@ func splice(a io.ReadWriteCloser, b io.ReadWriteCloser) {
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(a, b)
+		n, _ := io.Copy(a, b)
+		bToA = n
 		_ = a.Close()
 		_ = b.Close()
 	}()
 	wg.Wait()
+	return
 }
