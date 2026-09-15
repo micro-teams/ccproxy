@@ -101,6 +101,17 @@ class CCProxyConfig {
          */
         var proxyEndpoint: String = "backend:3128"
         /**
+         * The port the connector's local MITM-splitting proxy listens on (127.0.0.1 only), on every
+         * machine (2026-09-15). A machine's HTTPS_PROXY now points HERE instead of directly at
+         * [proxyEndpoint] — the connector locally splits Anthropic-domain traffic over MultiPath to
+         * this same backend, and lets everything else (npm, git, WebFetch, any tool call) straight
+         * out the machine's own network, never touching the server. No credentials in this URL: the
+         * connector holds proxyUser/proxyPassword itself (written to its own machine-local file,
+         * see ConnectorLoginOrchestrator.writeProxyCredential) rather than the env every child
+         * process of Claude Code can read. Must match the connector's own hardcoded listen port.
+         */
+        var localProxyPort: Int = 38091
+        /**
          * Comma-separated hosts a machine must reach WITHOUT going through the MITM proxy, written
          * as NO_PROXY/no_proxy in the machine's settings.json env. Loopback is the safe default so
          * local services (MCP servers, the connector's own endpoints, health checks) aren't routed

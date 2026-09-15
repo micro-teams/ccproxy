@@ -110,6 +110,18 @@ func runCmd(cfgPath *string) *cobra.Command {
 		Short:  "Run the resident connector in the foreground (used by the service)",
 		Hidden: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Redirect this process's own stdout/stderr to a log file beside the config,
+			// regardless of how it was launched (a real service manager's own logging, the
+			// detached fallback with no service manager, or interactively). Reassigning os.Stdout/
+			// os.Stderr here — rather than relying on whoever exec'd this process to have wired
+			// fd 1/2 somewhere useful — is the one place that is guaranteed to run no matter which
+			// path started it, so it is the only place log visibility can be made to not depend on
+			// getting that wiring right in every launcher.
+			if logPath := filepath.Join(filepath.Dir(*cfgPath), "run.log"); logPath != "" {
+				if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
+					os.Stdout, os.Stderr = f, f
+				}
+			}
 			return service.RunForeground(*cfgPath, resident(*cfgPath))
 		},
 	}
@@ -136,6 +148,18 @@ func resident(cfgPath string) service.Runner {
 		if err != nil {
 			return err
 		}
+		// The local MITM-splitting proxy runs alongside the control connection, not gated on it:
+		// a machine whose network comes up before enrolment finishes control-plane traffic still
+		// wants Anthropic-domain requests split locally the moment settings.json points here. A
+		// failure starting it is logged, not fatal — the resident's job is the control connection.
+		go func() {
+			if err := runLocalProxy(ctx, cfg.APIBase(), func(format string, args ...any) {
+				fmt.Fprintf(os.Stderr, format+"\n", args...)
+			}); err != nil {
+				fmt.Fprintln(os.Stderr, "ccproxy: local proxy stopped:", err)
+			}
+		}()
+
 		conn := ws.New(ctrlURL, cfg.Token, cfg.APIBase())
 		mgr := screen.NewManager(ctx, conn, tm)
 		defer mgr.CloseAll()
@@ -311,6 +335,8 @@ func startDetached(cfgPath string) error {
 	}
 	c := exec.Command(self, "run", "--config", cfgPath)
 	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	// runCmd itself redirects its own stdout/stderr to run.log on startup, so this process's fd
+	// 1/2 wiring doesn't matter — nil is fine, nothing is lost.
 	c.Stdin, c.Stdout, c.Stderr = nil, nil, nil
 	if err := c.Start(); err != nil {
 		return err
