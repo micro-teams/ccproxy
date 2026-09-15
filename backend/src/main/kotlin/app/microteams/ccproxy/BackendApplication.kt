@@ -9,6 +9,7 @@
 
 package app.microteams.ccproxy
 
+import app.microteams.ccproxy.transport.LineRegistryProperties
 import org.rucca.cheese.common.config.ApplicationConfig
 import org.slf4j.LoggerFactory
 import org.springframework.boot.SpringApplication
@@ -24,7 +25,7 @@ import org.springframework.context.annotation.Bean
 // so they can one day be extracted independently; everything else lives under
 // app.microteams.ccproxy. Component scan must therefore cover both roots.
 @SpringBootApplication(scanBasePackages = ["app.microteams.ccproxy", "org.rucca.cheese"])
-@EnableConfigurationProperties(ApplicationConfig::class)
+@EnableConfigurationProperties(ApplicationConfig::class, LineRegistryProperties::class)
 class BackendApplication(private val applicationConfig: ApplicationConfig) {
     // This listener calls SpringApplication.exit(), which closes the context synchronously
     // mid-multicast. Any other ApplicationReadyEvent listener (e.g. dataplane's ProxyServer) must
