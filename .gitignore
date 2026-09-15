@@ -9,8 +9,10 @@ deploy/app_data/
 frontend/node_modules/
 frontend/dist/
 
-# backend build output
+# backend/origin build output
 backend/target/
+origin/target/
+origin/dependency-reduced-pom.xml
 
 # python bytecode
 __pycache__/
