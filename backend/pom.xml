@@ -100,7 +100,7 @@
                  (replaces proxy-engine's `openssl` shell-outs). -->
             <groupId>org.bouncycastle</groupId>
             <artifactId>bcpkix-jdk18on</artifactId>
-            <version>1.79</version>
+            <version>1.86</version>
         </dependency>
         <dependency>
             <groupId>javax.servlet</groupId>
