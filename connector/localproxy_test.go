@@ -32,9 +32,18 @@ func TestAnthropicDomainsMatchesDataplaneMitmDomains(t *testing.T) {
 	}
 }
 
+// withHomeDir points credentialPath at dir for the duration of the test, without touching the real
+// HOME env — production intentionally ignores HOME (it runs unset; see homeDir's doc comment).
+func withHomeDir(t *testing.T, dir string) {
+	t.Helper()
+	orig := homeDir
+	homeDir = func() string { return dir }
+	t.Cleanup(func() { homeDir = orig })
+}
+
 func TestReadCredentialRoundTrips(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("HOME", dir)
+	withHomeDir(t, dir)
 	credDir := filepath.Join(dir, ".config", "ccproxy-connector")
 	if err := os.MkdirAll(credDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -53,9 +62,20 @@ func TestReadCredentialRoundTrips(t *testing.T) {
 }
 
 func TestReadCredentialMissingFile(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	withHomeDir(t, t.TempDir())
 	if _, err := readCredential(); err == nil {
 		t.Fatal("expected an error for a missing credential file")
+	}
+}
+
+// TestCredentialPathIgnoresHOMEEnv guards the actual CI failure this was debugging: the connector
+// runs with HOME unset, so os.UserHomeDir() (which just reads $HOME) silently produced a RELATIVE
+// path (".config/ccproxy-connector/proxy-credential.json") that never matched where the backend
+// wrote the file. credentialPath must resolve via the passwd database, not the environment.
+func TestCredentialPathIgnoresHOMEEnv(t *testing.T) {
+	t.Setenv("HOME", "")
+	if !filepath.IsAbs(credentialPath()) {
+		t.Fatalf("credentialPath() = %q, want an absolute path even with HOME unset", credentialPath())
 	}
 }
 

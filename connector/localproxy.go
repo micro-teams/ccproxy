@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -47,12 +48,24 @@ var anthropicDomains = map[string]bool{
 
 // credentialPath is where ConnectorLoginOrchestrator.writeProxyCredential writes proxyUser/
 // proxyPassword — a machine-local file, never the env Claude Code's child processes inherit.
+//
+// Resolved via the passwd database, NOT $HOME: this process runs with HOME unset (see
+// ConnectorLoginOrchestrator's own comments on the same fact, and BackendApplication's
+// resolveHome(), which gets the machine's real home from a LOGIN shell for exactly this reason).
+// os.UserHomeDir falls back to $HOME on error, which is equally empty here — that previously
+// resolved to the relative path ".config/ccproxy-connector/proxy-credential.json", silently never
+// matching where the backend actually wrote the file.
 func credentialPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = os.Getenv("HOME")
+	return filepath.Join(homeDir(), ".config", "ccproxy-connector", "proxy-credential.json")
+}
+
+// homeDir is a var, not a plain call, so tests can override it without touching the real HOME env
+// or the actual current user's home directory.
+var homeDir = func() string {
+	if u, err := user.Current(); err == nil && u.HomeDir != "" {
+		return u.HomeDir
 	}
-	return filepath.Join(home, ".config", "ccproxy-connector", "proxy-credential.json")
+	return os.Getenv("HOME")
 }
 
 type proxyCredential struct {
