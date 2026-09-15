@@ -101,7 +101,7 @@ jobs:
   # shipped build artifact — the control plane serves these binaries to real machines — so CI vets
   # it, cross-compiles the published targets, and uploads them for the bundle. The Go version comes
   # from go.mod (in lockstep with the shared library).
-  connector:
+  build-connector:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -204,7 +204,7 @@ jobs:
           path: applet-dist
 
   package-zip:
-    needs: [build-jar, build-frontend, lint, connector, build-tmux, build-applet]
+    needs: [build-jar, build-frontend, lint, build-connector, build-tmux, build-applet]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -463,7 +463,7 @@ jobs:
   # in branch protection / auto-merge rules instead of listing each job.
   ci-success:
     name: CI success
-    needs: [build-jar, build-frontend, lint, connector, build-tmux, build-applet, package-zip, test-compose, machine-login-compat, machine-connector-dialin, machine-revoke]
+    needs: [build-jar, build-frontend, lint, build-connector, build-tmux, build-applet, package-zip, test-compose, machine-login-compat, machine-connector-dialin, machine-revoke]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All required CI jobs passed."
