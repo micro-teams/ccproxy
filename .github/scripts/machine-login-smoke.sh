@@ -26,7 +26,21 @@ PUBKEY="$(cat keys/operator.pub)"
 
 jqget() { python3 -c "import sys,json;print(json.load(sys.stdin)$1)"; }
 
-cleanup() { docker rm -f "$MACHINE" >/dev/null 2>&1 || true; }
+cleanup() {
+  local ec=$?
+  if [ "$ec" -ne 0 ]; then
+    echo "== [debug] connector-side diagnostics (exit $ec) =="
+    docker exec "$MACHINE" bash -lc '
+      echo "-- run.log --"; cat ~/.config/ccproxy-connector/run.log 2>&1 || echo "(no run.log)"
+      echo "-- proxy-credential.json --"; cat ~/.config/ccproxy-connector/proxy-credential.json 2>&1 || echo "(none)"
+      echo "-- settings.json (ongoing) --"; cat ~/.claude/settings.json 2>&1 || echo "(none)"
+      echo "-- login settings --"; cat ~/.claude/ccproxy-login.json 2>&1 || echo "(none)"
+      echo "-- listening sockets --"; (ss -tlnp 2>&1 || netstat -tlnp 2>&1) || echo "(no ss/netstat)"
+      echo "-- connector processes --"; ps aux 2>&1 | grep -i ccproxy-connector || echo "(none running)"
+    ' 2>&1 || echo "(docker exec for diagnostics itself failed)"
+  fi
+  docker rm -f "$MACHINE" >/dev/null 2>&1 || true
+}
 trap cleanup EXIT
 
 echo "== [$INSTALL] spin machine container on $NET =="

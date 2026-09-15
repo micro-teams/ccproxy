@@ -323,7 +323,14 @@ func startDetached(cfgPath string) error {
 	}
 	c := exec.Command(self, "run", "--config", cfgPath)
 	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	c.Stdin, c.Stdout, c.Stderr = nil, nil, nil
+	c.Stdin = nil
+	// A machine with no service manager has no other way to see what the resident connector logs
+	// (the local proxy's errors among them) — nil stdio silently discarded everything. Append to a
+	// file beside the config instead; small, and the only way this failure mode is diagnosable.
+	logPath := filepath.Join(filepath.Dir(cfgPath), "run.log")
+	if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
+		c.Stdout, c.Stderr = f, f
+	}
 	if err := c.Start(); err != nil {
 		return err
 	}
