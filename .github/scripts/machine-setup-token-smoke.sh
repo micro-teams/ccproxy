@@ -43,7 +43,7 @@ docker run -d --name "$MACHINE" --hostname "$MACHINE" --network "$NET" debian:13
 docker exec "$MACHINE" bash -c '
   set -e; export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq openssh-server ca-certificates curl procps python3 >/dev/null
+  apt-get install -y -qq openssh-server tmux ca-certificates curl procps python3 >/dev/null
   mkdir -p /run/sshd /root/.ssh
   printf "%s\n" "'"$PUBKEY"'" > /root/.ssh/authorized_keys
   chmod 600 /root/.ssh/authorized_keys
@@ -51,7 +51,11 @@ docker exec "$MACHINE" bash -c '
   ssh-keygen -A >/dev/null 2>&1
   /usr/sbin/sshd
 '
-# No Claude Code install needed: prepareViaSetupToken never launches an interactive session.
+# prepareViaSetupToken never launches an interactive Claude session, but the connector's own
+# bootstrap preflight (connect --token) still requires claude to be present on the machine.
+docker exec "$MACHINE" bash -lc 'curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1'
+docker exec "$MACHINE" bash -lc 'PATH="$HOME/.local/bin:$PATH" claude --version' ||
+  { echo "claude not installed"; exit 1; }
 
 echo "== configure super-admin resources =="
 SUPER="$(grep -E '^SUPERADMIN_PASSWORD=' .env | cut -d= -f2)"
