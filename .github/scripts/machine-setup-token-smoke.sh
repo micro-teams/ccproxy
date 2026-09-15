@@ -86,6 +86,16 @@ online="$(curl -s "$GW/machine/$MID" -H "Authorization: Bearer $TSEC" | jqget "[
 [ "$online" = "True" ] || { echo "FAIL: connector never dialed in (online=$online)"; exit 1; }
 echo "bootstrapped onto the connector, online OK"
 
+# Reproduces the actual prod scenario (found 2026-09-15): a machine that was ALREADY provisioned
+# before this MultiPath local-proxy scheme existed, with an old-style settings.json (proxy
+# credentials embedded straight in HTTPS_PROXY). A fresh machine with no settings.json at all did
+# NOT reproduce the bug — configureOfficialProxy's read-modify-write over an EXISTING file is the
+# path that matters.
+echo "== seed an old-style settings.json (pre-MultiPath direct-proxy-with-credentials) =="
+docker exec -i "$MACHINE" bash -lc 'mkdir -p ~/.claude; cat > ~/.claude/settings.json' <<'JSON'
+{"theme":"dark","env":{"HTTPS_PROXY":"http://oldm:oldpw@old-ccproxy-host:3128","https_proxy":"http://oldm:oldpw@old-ccproxy-host:3128","HTTP_PROXY":"http://oldm:oldpw@old-ccproxy-host:3128","http_proxy":"http://oldm:oldpw@old-ccproxy-host:3128","CLAUDE_CODE_OAUTH_TOKEN":"sk-ant-oat01-preexisting-fake-token"}}
+JSON
+
 echo "== start login: bound account has a setup-token, so this must auto-complete (no operator) =="
 LR="$(curl -s -X POST "$GW/machine/$MID/login" -H "Authorization: Bearer $TSEC")"
 echo "$LR"
