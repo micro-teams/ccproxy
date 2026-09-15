@@ -79,6 +79,39 @@ func TestCredentialPathIgnoresHOMEEnv(t *testing.T) {
 	}
 }
 
+// TestReadOriginConnectResponse guards the actual CI failure this was debugging: ProxyServer, on
+// the other end of the substrate, speaks the same CONNECT protocol the local client does — it
+// replies with its own "HTTP/1.1 200 Connection Established\r\n\r\n" before any TLS bytes. Splicing
+// that literal text straight through as if it were TLS data broke the handshake instantly (visible
+// in prod/CI as ~39 bytes back from origin and an immediate stream close). This must be read and
+// consumed, not forwarded.
+func TestReadOriginConnectResponse(t *testing.T) {
+	t.Run("200 is consumed, leaving TLS bytes untouched", func(t *testing.T) {
+		r := bufio.NewReader(strings.NewReader("HTTP/1.1 200 Connection Established\r\n\r\n\x16\x03\x01tls-bytes-follow"))
+		if err := readOriginConnectResponse(r); err != nil {
+			t.Fatal(err)
+		}
+		rest, _ := io.ReadAll(r)
+		if string(rest) != "\x16\x03\x01tls-bytes-follow" {
+			t.Fatalf("got %q, want the TLS bytes untouched by the status-line read", rest)
+		}
+	})
+
+	t.Run("non-200 is an error, not silently spliced through", func(t *testing.T) {
+		r := bufio.NewReader(strings.NewReader("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		if err := readOriginConnectResponse(r); err == nil {
+			t.Fatal("expected an error for a non-200 origin response")
+		}
+	})
+
+	t.Run("EOF before a status line is an error", func(t *testing.T) {
+		r := bufio.NewReader(strings.NewReader(""))
+		if err := readOriginConnectResponse(r); err == nil {
+			t.Fatal("expected an error for an empty response")
+		}
+	})
+}
+
 func TestFetchLinesResolvesSameOriginAgainstApiBase(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/mt/lines" {

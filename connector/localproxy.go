@@ -173,6 +173,15 @@ type bufConn struct {
 
 func (c *bufConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
+// bufReadWriteCloser is the io.ReadWriteCloser analogue of bufConn, for wrapping a *multipath.
+// MuxStream (which is not a net.Conn) once a bufio.Reader has already read past a framing line.
+type bufReadWriteCloser struct {
+	io.ReadWriteCloser
+	r *bufio.Reader
+}
+
+func (c *bufReadWriteCloser) Read(p []byte) (int, error) { return c.r.Read(p) }
+
 // handleDirect dials the target straight from this machine's own network — no server involved at
 // all, matching what a client outside any proxy would do.
 func handleDirect(conn net.Conn, targetHostPort string, logf func(format string, args ...any)) {
@@ -223,12 +232,49 @@ func (lp *localProxy) handleAnthropic(ctx context.Context, conn net.Conn, req *h
 		logf("ccproxy: local proxy: write CONNECT: %v", err)
 		return
 	}
+	// ProxyServer on the other end of this stream speaks the same CONNECT protocol our own local
+	// client does — it replies with its OWN status line (normally "HTTP/1.1 200 Connection
+	// Established\r\n\r\n") before any TLS bytes. That response has to be read and consumed here,
+	// not forwarded: splicing it straight through (as if st were a raw target socket, the way
+	// handleDirect's target is) would inject those literal ASCII bytes into what the local client
+	// expects to be the start of a TLS record, breaking the handshake instantly. Read origin's
+	// status line, and only echo our own 200 to the local client once we know it actually got one.
+	stBr := bufio.NewReader(st)
+	if err := readOriginConnectResponse(stBr); err != nil {
+		logf("ccproxy: local proxy: origin response for %s: %v", req.Host, err)
+		_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return
+	}
 	if _, err := conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		return
 	}
 	logf("ccproxy: local proxy: %s riding the substrate", req.Host)
-	toOrigin, fromOrigin := splice(conn, st)
+	// stConn wraps st so any bytes stBr already buffered past the status line (e.g. the start of
+	// origin's TLS bytes, read in the same syscall as the status line) aren't lost — same reasoning
+	// as bufConn above, mirrored for the origin side of this relay.
+	stConn := &bufReadWriteCloser{ReadWriteCloser: st, r: stBr}
+	toOrigin, fromOrigin := splice(conn, stConn)
 	logf("ccproxy: local proxy: %s stream closed (%d bytes to origin, %d bytes from origin)", req.Host, toOrigin, fromOrigin)
+}
+
+// readOriginConnectResponse reads and validates the CONNECT status line ProxyServer sends before
+// any TLS bytes, then drains the blank line terminating it (there are no other headers today, but
+// draining to the blank line is what correctly frames any CONNECT response). Returns an error if
+// the status line can't be read or doesn't report success.
+func readOriginConnectResponse(r *bufio.Reader) error {
+	statusLine, err := r.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read status line: %w", err)
+	}
+	if !strings.Contains(statusLine, "200") {
+		return fmt.Errorf("refused: %s", strings.TrimSpace(statusLine))
+	}
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil || line == "\r\n" || line == "\n" {
+			return nil
+		}
+	}
 }
 
 // substrate returns a live client, dialling one if none exists yet or the last one died.
