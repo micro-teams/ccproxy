@@ -135,8 +135,10 @@ func (lp *localProxy) handle(ctx context.Context, rawConn net.Conn, logf func(fo
 	br := bufio.NewReader(rawConn)
 	req, err := http.ReadRequest(br)
 	if err != nil {
+		logf("ccproxy: local proxy: read request: %v", err)
 		return
 	}
+	logf("ccproxy: local proxy: %s %s", req.Method, req.Host)
 	// http.ReadRequest's bufio.Reader can read (and buffer) bytes past the CONNECT headers in the
 	// same syscall — e.g. a client that pipelines its TLS ClientHello right behind the CONNECT
 	// without waiting for "200 Connection Established". Splicing the raw conn from here on would
@@ -176,6 +178,7 @@ func (c *bufConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 func handleDirect(conn net.Conn, targetHostPort string, logf func(format string, args ...any)) {
 	up, err := net.DialTimeout("tcp", targetHostPort, 15*time.Second)
 	if err != nil {
+		logf("ccproxy: local proxy: direct dial %s: %v", targetHostPort, err)
 		_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
@@ -223,7 +226,9 @@ func (lp *localProxy) handleAnthropic(ctx context.Context, conn net.Conn, req *h
 	if _, err := conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		return
 	}
+	logf("ccproxy: local proxy: %s riding the substrate", req.Host)
 	splice(conn, st)
+	logf("ccproxy: local proxy: %s stream closed", req.Host)
 }
 
 // substrate returns a live client, dialling one if none exists yet or the last one died.
@@ -238,12 +243,14 @@ func (lp *localProxy) substrate(ctx context.Context, logf func(format string, ar
 		logf("ccproxy: local proxy: line registry unavailable, falling back to same-origin: %v", err)
 		lines = sameOriginLines(lp.apiBase)
 	}
+	logf("ccproxy: local proxy: dialling substrate over %d line(s), apiBase=%s", len(lines), lp.apiBase)
 	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	client, err := multipath.Dial(dialCtx, multipath.ClientOptions{Lines: lines})
 	if err != nil {
 		return nil, err
 	}
+	logf("ccproxy: local proxy: substrate up")
 	lp.client = client
 	return client, nil
 }
