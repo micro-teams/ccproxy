@@ -114,7 +114,7 @@ func TestReadOriginConnectResponse(t *testing.T) {
 
 func TestFetchLinesResolvesSameOriginAgainstApiBase(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/mt/lines" {
+		if r.URL.Path != "/lines" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}

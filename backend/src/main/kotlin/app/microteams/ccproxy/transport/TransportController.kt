@@ -1,5 +1,5 @@
 /*
- *  Description: GET /mt/lines — the network paths (MultiPath lines) a connector may dial the
+ *  Description: GET /lines — the network paths (MultiPath lines) a connector may dial the
  *               MultiPath origin over. Public: a connector needs this before it can even bring up
  *               the substrate, and it describes routes rather than anything about a tenant.
  *
@@ -12,7 +12,7 @@
 
 package app.microteams.ccproxy.transport
 
-import app.microteams.ccproxy.api.MtApi
+import app.microteams.ccproxy.api.LinesApi
 import app.microteams.ccproxy.model.LineDTO
 import app.microteams.ccproxy.model.LineRegistryDTO
 import jakarta.servlet.http.HttpServletRequest
@@ -23,7 +23,7 @@ import org.springframework.web.context.request.RequestContextHolder
 import org.springframework.web.context.request.ServletRequestAttributes
 
 @RestController
-class TransportController(private val lines: LineRegistryProperties) : MtApi {
+class TransportController(private val lines: LineRegistryProperties) : LinesApi {
 
     /**
      * The configured lines, or the single same-origin line that means "however a connector already

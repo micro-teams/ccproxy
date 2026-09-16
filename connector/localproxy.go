@@ -317,7 +317,7 @@ func (lp *localProxy) dropSubstrate(dead *multipath.Client) {
 func fetchLines(ctx context.Context, apiBase string) ([]multipath.Line, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, strings.TrimRight(apiBase, "/")+"/mt/lines", nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, strings.TrimRight(apiBase, "/")+"/lines", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -327,7 +327,7 @@ func fetchLines(ctx context.Context, apiBase string) ([]multipath.Line, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET /mt/lines: status %d", resp.StatusCode)
+		return nil, fmt.Errorf("GET /lines: status %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

@@ -117,7 +117,7 @@ services:
       CCPROXY_ORIGIN_PORT: "9444"
       CCPROXY_PROXY_HOST: "backend"
       CCPROXY_PROXY_PORT: "3128"
-      CCPROXY_LINK_PATH: "/mt/link"
+      CCPROXY_LINK_PATH: "/link"
     volumes:
       - ./origin/origin.jar:/app/origin.jar:ro
     healthcheck:
