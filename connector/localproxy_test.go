@@ -17,6 +17,17 @@ import (
 	multipath "github.com/micro-teams/multipath/go"
 )
 
+// TestLinkPathMatchesOrigin guards the actual bug this was written for: multipath.ClientOptions's
+// LinkOptions.LinkPath defaults to "/mt/link" inside the library itself, independent of whatever
+// path the origin serves (origin/Main.kt's CCPROXY_LINK_PATH / deploy/docker-compose.yml). Renaming
+// one without the other is a silent "all links failed to connect" at dial time, not a compile error
+// — kept in sync by hand, same convention as TestAnthropicDomainsMatchesDataplaneMitmDomains below.
+func TestLinkPathMatchesOrigin(t *testing.T) {
+	if linkPath != "/link" {
+		t.Fatalf("linkPath = %q, want \"/link\" (must match origin/Main.kt's CCPROXY_LINK_PATH default and deploy/docker-compose.yml)", linkPath)
+	}
+}
+
 func TestAnthropicDomainsMatchesDataplaneMitmDomains(t *testing.T) {
 	// Kept in sync by hand with backend's CCProxyConfig.Dataplane.mitmDomains default — this test
 	// exists so a change to one without the other fails loudly instead of quietly un-splitting
