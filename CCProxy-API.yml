@@ -52,7 +52,7 @@ paths:
   # =====================================================================
   # TRANSPORT (MultiPath line registry)
   # =====================================================================
-  /mt/lines:
+  /lines:
     get:
       tags: [transport]
       operationId: listLines

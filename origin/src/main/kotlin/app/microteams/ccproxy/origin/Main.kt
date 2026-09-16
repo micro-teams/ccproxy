@@ -29,7 +29,7 @@ fun main() {
     val port = env("CCPROXY_ORIGIN_PORT", "9444").toInt()
     val proxyHost = env("CCPROXY_PROXY_HOST", "backend")
     val proxyPort = env("CCPROXY_PROXY_PORT", "3128").toInt()
-    val linkPath = env("CCPROXY_LINK_PATH", "/mt/link")
+    val linkPath = env("CCPROXY_LINK_PATH", "/link")
 
     // The MAXIMUM number of links one client may attach — not the number of lines this deployment
     // publishes. See micro-teams' Main.kt for why this wants to be generous rather than exact.

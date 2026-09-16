@@ -6,7 +6,7 @@ backend jar now (no standalone proxy-engine container; cutover 2026-09-14).
 
 ```
 docker-compose.yml     five services (nginx, backend, origin, egress-proxy, postgres)
-nginx.conf             domain-independent gateway (SPA + /ccproxy -> backend, /mt/link -> origin)
+nginx.conf             domain-independent gateway (SPA + /ccproxy -> backend, /link -> origin)
 gen-env.sh             generates .env (secrets) + app_data/ + keys/ (operator SSH keypair + MITM CA)
 init/                  postgres first-init SQL (creates the "ccproxy" schema)
 CREATE.sql             the DB schema this release expects (for ops; hand-write migrations from diffs)

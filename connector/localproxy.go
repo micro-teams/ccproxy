@@ -37,6 +37,11 @@ const localProxyPort = 38091
 // proxyService is the name the backend's origin registers (see origin/src/main/kotlin/.../Main.kt).
 const proxyService = "proxy"
 
+// linkPath must match the origin's CCPROXY_LINK_PATH (see deploy/docker-compose.yml /
+// origin/Main.kt's default) — the multipath library's own default ("/mt/link") is a leftover from
+// microteams and doesn't match ccproxy's route.
+const linkPath = "/link"
+
 // anthropicDomains mirrors dataplane.Dataplane.mitmDomains — the exact set ProxyServer MITMs on the
 // server side. Anything outside this set was always tunnelled DIRECT server-side too; splitting it
 // locally instead just moves where that direct tunnel happens, so behavior is unchanged, only
@@ -292,7 +297,10 @@ func (lp *localProxy) substrate(ctx context.Context, logf func(format string, ar
 	logf("ccproxy: local proxy: dialling substrate over %d line(s), apiBase=%s", len(lines), lp.apiBase)
 	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	client, err := multipath.Dial(dialCtx, multipath.ClientOptions{Lines: lines})
+	client, err := multipath.Dial(dialCtx, multipath.ClientOptions{
+		Lines: lines,
+		Link:  multipath.LinkOptions{LinkPath: linkPath},
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -317,7 +325,7 @@ func (lp *localProxy) dropSubstrate(dead *multipath.Client) {
 func fetchLines(ctx context.Context, apiBase string) ([]multipath.Line, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, strings.TrimRight(apiBase, "/")+"/mt/lines", nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, strings.TrimRight(apiBase, "/")+"/lines", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -327,7 +335,7 @@ func fetchLines(ctx context.Context, apiBase string) ([]multipath.Line, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET /mt/lines: status %d", resp.StatusCode)
+		return nil, fmt.Errorf("GET /lines: status %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

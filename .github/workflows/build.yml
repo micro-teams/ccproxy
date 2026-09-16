@@ -365,7 +365,7 @@ jobs:
             --proxy "http://ci:ci@localhost:$PORT" https://example.com/)"
           [ "$CODE" = 200 ] || { echo "FAIL: CONNECT-tunnelled request to example.com got $CODE, want 200"; exit 1; }
           echo "dataplane MITM listener OK (direct-tunnel path verified end to end)"
-      - name: MultiPath origin is up and nginx routes /mt/link to it
+      - name: MultiPath origin is up and nginx routes /link to it
         working-directory: ccproxy-deploy
         run: |
           set -eu
@@ -375,8 +375,8 @@ jobs:
           # A plain GET (no Upgrade header) to a WebSocket-only location the origin serves gets
           # rejected by the origin's own link handshake, not by nginx — a 404/502 here would mean
           # nginx never reached the origin at all. Any non-000 status proves the round trip worked.
-          CODE="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 "http://localhost:$PORT/mt/link")"
-          [ "$CODE" != "000" ] || { echo "FAIL: /mt/link unreachable through nginx"; exit 1; }
+          CODE="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 "http://localhost:$PORT/link")"
+          [ "$CODE" != "000" ] || { echo "FAIL: /link unreachable through nginx"; exit 1; }
           echo "nginx -> origin routing OK (got HTTP $CODE)"
       - name: Cluster status
         if: always()

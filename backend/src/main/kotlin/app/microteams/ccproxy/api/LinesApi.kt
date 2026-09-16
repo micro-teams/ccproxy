@@ -17,7 +17,7 @@ import org.springframework.web.bind.annotation.*
 
 @RestController
 @Validated
-interface MtApi {
+interface LinesApi {
 
     @Operation(
         tags = ["transport"],
@@ -36,7 +36,7 @@ interface MtApi {
     )
     @RequestMapping(
         method = [RequestMethod.GET],
-        // "/mt/lines"
+        // "/lines"
         value = [PATH_LIST_LINES],
         produces = ["application/json"],
     )
@@ -46,6 +46,6 @@ interface MtApi {
 
     companion object {
         // for your own safety never directly reuse these path definitions in tests
-        const val PATH_LIST_LINES: String = "/mt/lines"
+        const val PATH_LIST_LINES: String = "/lines"
     }
 }
