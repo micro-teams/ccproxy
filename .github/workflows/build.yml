@@ -593,15 +593,34 @@ jobs:
         working-directory: ccproxy-deploy
         run: docker compose down
 
-  # A machine ccproxy cannot SSH into installs the connector from the served install.sh, dials OUT to
-  # the control plane, and is recognised online — the whole enrolment + WebSocket transport + hub
-  # stack, live, on a real machine container. No Claude / no account needed.
+  # A machine ccproxy cannot SSH into installs the connector from the served install.sh/install.ps1,
+  # dials OUT to the control plane, and is recognised online — the whole enrolment + WebSocket
+  # transport + hub stack, live. This is the one machine-* smoke test that genuinely differs by
+  # client OS (a different install script, a different binary path, no SSH/Debian-container
+  # standing in for the target) so it is the one converted to a real 3-platform matrix:
+  #   - linux: unchanged — a Debian container on THIS job's own runner, install.sh over the
+  #     compose network, exactly as before.
+  #   - windows / macos: no cross-runner Docker networking exists between jobs (macOS runners have
+  #     no Docker at all; Windows/macOS GitHub-hosted runners can't reach another job's containers
+  #     either way), so the backend can't move to those runners. Instead this job keeps the
+  #     compose backend on ubuntu and punches a temporary public URL to it with a cloudflared
+  #     quick tunnel (no account/token needed for the ephemeral trycloudflare.com hostname); the
+  #     windows-latest/macos-latest legs then run the REAL installCommand/installCommandWindows
+  #     against that URL, natively, on their own real OS — a stronger test than a same-OS
+  #     container ever was for these two platforms.
+  # The server leg has to stay up (compose containers only live as long as its job process does)
+  # while the client legs run against it — GitHub Actions has no job-to-job "still open" signal, so
+  # it holds the tunnel with a bounded sleep sized to comfortably outlast the client legs, then
+  # tears down regardless.
   machine-connector-dialin:
     needs: [package-zip]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: read
+    outputs:
+      tunnel-url: ${{ steps.tunnel.outputs.url }}
+      superadmin-password: ${{ steps.tunnel.outputs.superadmin-password }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
@@ -618,9 +637,36 @@ jobs:
         run: |
           bash gen-env.sh
           docker compose up -d --wait --wait-timeout 360
-      - name: Connector dial-in
+      - name: Connector dial-in (linux, same-runner container)
         working-directory: ccproxy-deploy
         run: bash "$GITHUB_WORKSPACE/.github/scripts/connector-dialin-smoke.sh"
+      - name: Open a cloudflared quick tunnel for the windows/macos legs
+        id: tunnel
+        working-directory: ccproxy-deploy
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /usr/local/bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /usr/local/bin/cloudflared
+          PORT="$(grep -E '^NGINX_HTTP_PORT=' .env | cut -d= -f2 || echo 80)"
+          cloudflared tunnel --url "http://localhost:$PORT" --no-autoupdate >cloudflared.log 2>&1 &
+          echo "$!" > cloudflared.pid
+          url=""
+          for _ in $(seq 1 30); do
+            url="$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cloudflared.log | head -1 || true)"
+            [ -n "$url" ] && break
+            sleep 2
+          done
+          [ -n "$url" ] || { echo "FAIL: cloudflared never printed a tunnel URL"; cat cloudflared.log; exit 1; }
+          echo "tunnel URL: $url"
+          # Prove the tunnel actually reaches nginx before handing it to the client legs.
+          code="$(curl -s -o /dev/null -w '%{http_code}' "$url/ccproxy/install.sh")"
+          [ "$code" = 200 ] || { echo "FAIL: tunnel returned $code for install.sh"; exit 1; }
+          echo "url=$url/ccproxy" >> "$GITHUB_OUTPUT"
+          echo "superadmin-password=$(grep -E '^SUPERADMIN_PASSWORD=' .env | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+      - name: Hold the tunnel open for the windows/macos client legs
+        working-directory: ccproxy-deploy
+        run: sleep 480
       - name: Dump logs on failure
         if: failure()
         working-directory: ccproxy-deploy
@@ -628,7 +674,51 @@ jobs:
       - name: Tear down
         if: always()
         working-directory: ccproxy-deploy
-        run: docker compose down
+        run: |
+          kill "$(cat cloudflared.pid)" >/dev/null 2>&1 || true
+          docker compose down
+
+  machine-connector-dialin-native:
+    needs: [machine-connector-dialin]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows
+            runner: windows-latest
+          - os: macos
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: "Install the connector natively (windows): irm | iex"
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $env:CCPROXY_CONNECTOR_BASE = "${{ needs.machine-connector-dialin.outputs.tunnel-url }}"
+          $env:CCPROXY_API_BASE = "${{ needs.machine-connector-dialin.outputs.tunnel-url }}"
+          irm "${{ needs.machine-connector-dialin.outputs.tunnel-url }}/install.ps1" | iex
+      - name: "Install the connector natively (macos): curl | sh"
+        if: matrix.os == 'macos'
+        run: |
+          curl -fsSL "${{ needs.machine-connector-dialin.outputs.tunnel-url }}/install.sh" | sh
+      - name: Native connector dial-in
+        env:
+          CCPROXY_SUPERADMIN_PASSWORD: ${{ needs.machine-connector-dialin.outputs.superadmin-password }}
+        run: |
+          set -euo pipefail
+          bin="$HOME/.local/bin/ccproxy-connector"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            bin="$APPDATA/ccproxy-connector/ccproxy-connector.exe"
+          fi
+          bash "$GITHUB_WORKSPACE/.github/scripts/connector-dialin-native-smoke.sh" \
+            "${{ needs.machine-connector-dialin.outputs.tunnel-url }}" "$bin"
 
   # The MultiPath work gave zero code changes to a machine that never re-logs-in: it still dials
   # backend:3128 directly with proxy credentials embedded in HTTPS_PROXY (the pre-2026-09 scheme) —
@@ -717,7 +807,7 @@ jobs:
     # build-frontend, lint, build-connector, build-connector-darwin-amd64, build-tmux,
     # build-tmux-macos, build-applet, package-zip) is already required transitively by these
     # four, and a failure/skip anywhere upstream skips them too.
-    needs: [test-compose, machine-login-compat, machine-setup-token, machine-legacy-restart, machine-connector-dialin, machine-revoke]
+    needs: [test-compose, machine-login-compat, machine-setup-token, machine-legacy-restart, machine-connector-dialin, machine-connector-dialin-native, machine-revoke]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All required CI jobs passed."
