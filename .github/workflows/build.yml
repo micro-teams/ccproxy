@@ -609,18 +609,21 @@ jobs:
   #     against that URL, natively, on their own real OS — a stronger test than a same-OS
   #     container ever was for these two platforms.
   # The server leg has to stay up (compose containers only live as long as its job process does)
-  # while the client legs run against it — GitHub Actions has no job-to-job "still open" signal, so
-  # it holds the tunnel with a bounded sleep sized to comfortably outlast the client legs, then
-  # tears down regardless.
+  # while the client legs run against it — but `needs:` gates on the upstream job's COMPLETION, so
+  # a client job that `needs: [machine-connector-dialin]` can never even start until the server has
+  # already torn everything down (deadlock, caught 2026-09-17 when the first version of this
+  # matrix hung). Instead: both this job and machine-connector-dialin-native need only package-zip,
+  # so they run concurrently; this job uploads the tunnel URL as an artifact partway through (an
+  # upload is visible to other jobs in the same run as soon as it completes, no need to wait for
+  # this job to finish) and the client job polls for that artifact instead of declaring a `needs`
+  # dependency on this job at all. This job then holds the tunnel open with a bounded sleep sized
+  # to comfortably outlast the client legs, and tears down regardless after.
   machine-connector-dialin:
     needs: [package-zip]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: read
-    outputs:
-      tunnel-url: ${{ steps.tunnel.outputs.url }}
-      superadmin-password: ${{ steps.tunnel.outputs.superadmin-password }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
@@ -670,8 +673,14 @@ jobs:
             sleep 2
           done
           [ "$code" = 200 ] || { echo "FAIL: tunnel returned $code for install.sh"; cat cloudflared.log; exit 1; }
-          echo "url=$url/ccproxy" >> "$GITHUB_OUTPUT"
-          echo "superadmin-password=$(grep -E '^SUPERADMIN_PASSWORD=' .env | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          echo "TUNNEL_URL=$url/ccproxy" > tunnel-info.env
+          echo "TUNNEL_SUPERADMIN_PASSWORD=$(grep -E '^SUPERADMIN_PASSWORD=' .env | cut -d= -f2)" >> tunnel-info.env
+      - name: Publish the tunnel info for the concurrently-running client matrix to poll for
+        uses: actions/upload-artifact@v7
+        with:
+          retention-days: 1
+          name: connector-dialin-tunnel-info
+          path: ccproxy-deploy/tunnel-info.env
       - name: Hold the tunnel open for the windows/macos client legs
         working-directory: ccproxy-deploy
         run: sleep 480
@@ -687,7 +696,11 @@ jobs:
           docker compose down
 
   machine-connector-dialin-native:
-    needs: [machine-connector-dialin]
+    # Deliberately NOT `needs: [machine-connector-dialin]` — that job must still be RUNNING (its
+    # tunnel/compose stack alive) while this one runs, and `needs` only unblocks after it fully
+    # completes. Both jobs need only package-zip, so the scheduler can run them side by side; this
+    # job polls for the artifact the server job publishes partway through instead.
+    needs: [package-zip]
     strategy:
       fail-fast: false
       matrix:
@@ -705,20 +718,33 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: Wait for the server leg's tunnel-info artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            if gh run download "${{ github.run_id }}" -n connector-dialin-tunnel-info -D . 2>/dev/null; then
+              break
+            fi
+            sleep 10
+          done
+          test -f tunnel-info.env || { echo "FAIL: server leg's tunnel-info artifact never appeared"; exit 1; }
+          cat tunnel-info.env >> "$GITHUB_ENV"
       - name: "Install the connector natively (windows): irm | iex"
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
-          $env:CCPROXY_CONNECTOR_BASE = "${{ needs.machine-connector-dialin.outputs.tunnel-url }}"
-          $env:CCPROXY_API_BASE = "${{ needs.machine-connector-dialin.outputs.tunnel-url }}"
-          irm "${{ needs.machine-connector-dialin.outputs.tunnel-url }}/install.ps1" | iex
+          $env:CCPROXY_CONNECTOR_BASE = $env:TUNNEL_URL
+          $env:CCPROXY_API_BASE = $env:TUNNEL_URL
+          irm "$env:TUNNEL_URL/install.ps1" | iex
       - name: "Install the connector natively (macos): curl | sh"
         if: matrix.os == 'macos'
         run: |
-          curl -fsSL "${{ needs.machine-connector-dialin.outputs.tunnel-url }}/install.sh" | sh
+          curl -fsSL "$TUNNEL_URL/install.sh" | sh
       - name: Native connector dial-in
         env:
-          CCPROXY_SUPERADMIN_PASSWORD: ${{ needs.machine-connector-dialin.outputs.superadmin-password }}
+          CCPROXY_SUPERADMIN_PASSWORD: ${{ env.TUNNEL_SUPERADMIN_PASSWORD }}
         run: |
           set -euo pipefail
           bin="$HOME/.local/bin/ccproxy-connector"
@@ -726,7 +752,7 @@ jobs:
             bin="$APPDATA/ccproxy-connector/ccproxy-connector.exe"
           fi
           bash "$GITHUB_WORKSPACE/.github/scripts/connector-dialin-native-smoke.sh" \
-            "${{ needs.machine-connector-dialin.outputs.tunnel-url }}" "$bin"
+            "$TUNNEL_URL" "$bin"
 
   # The MultiPath work gave zero code changes to a machine that never re-logs-in: it still dials
   # backend:3128 directly with proxy credentials embedded in HTTPS_PROXY (the pre-2026-09 scheme) —
