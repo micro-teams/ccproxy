@@ -659,9 +659,17 @@ jobs:
           done
           [ -n "$url" ] || { echo "FAIL: cloudflared never printed a tunnel URL"; cat cloudflared.log; exit 1; }
           echo "tunnel URL: $url"
-          # Prove the tunnel actually reaches nginx before handing it to the client legs.
-          code="$(curl -s -o /dev/null -w '%{http_code}' "$url/ccproxy/install.sh")"
-          [ "$code" = 200 ] || { echo "FAIL: tunnel returned $code for install.sh"; exit 1; }
+          # Prove the tunnel actually reaches nginx before handing it to the client legs. The
+          # hostname is printed to cloudflared's log before it's actually routable end to end
+          # (DNS propagation + the edge-to-local-port path both take a moment), so retry rather
+          # than treating the first attempt's failure as final.
+          code="000"
+          for _ in $(seq 1 30); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 "$url/ccproxy/install.sh" || echo 000)"
+            [ "$code" = 200 ] && break
+            sleep 2
+          done
+          [ "$code" = 200 ] || { echo "FAIL: tunnel returned $code for install.sh"; cat cloudflared.log; exit 1; }
           echo "url=$url/ccproxy" >> "$GITHUB_OUTPUT"
           echo "superadmin-password=$(grep -E '^SUPERADMIN_PASSWORD=' .env | cut -d= -f2)" >> "$GITHUB_OUTPUT"
       - name: Hold the tunnel open for the windows/macos client legs

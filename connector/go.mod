@@ -3,7 +3,8 @@ module github.com/micro-teams/ccproxy/connector
 go 1.25.0
 
 require (
-	github.com/micro-teams/micro-connector/cli v0.1.8-0.20260917064945-f3cc4ee4f057
+	github.com/micro-teams/micro-connector/cli v0.1.8-0.20260917075110-b32001300cbf
+	github.com/micro-teams/multipath/go v0.2.0-rc.4
 	github.com/spf13/cobra v1.10.2
 )
 
@@ -16,7 +17,6 @@ require (
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/kardianos/service v1.3.0 // indirect
-	github.com/micro-teams/multipath/go v0.2.0-rc.4 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	golang.org/x/sys v0.34.0 // indirect
 	golang.org/x/text v0.3.8 // indirect
