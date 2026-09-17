@@ -56,7 +56,15 @@ else
   BIN_DIR="$HOME/.local/bin"
   owner="$(id -un)"; home="$HOME"
 fi
-CFG_DIR="$home/.config/$BIN_NAME"
+# Must match exactly what the Go library's own config.DefaultPath() resolves to
+# (os.UserConfigDir() + brand.ConfigDir) — a fresh macOS CI run of this installer against a real
+# native connector caught the divergence: install.sh always wrote ~/.config (the Linux/XDG
+# convention) while os.UserConfigDir() on Darwin is ~/Library/Application Support, so `enroll`
+# read back an empty config on a machine this very script had just configured.
+case "$(uname -s)" in
+  Darwin) CFG_DIR="$home/Library/Application Support/$BIN_NAME" ;;
+  *)      CFG_DIR="$home/.config/$BIN_NAME" ;;
+esac
 CFG="$CFG_DIR/config.json"
 
 # --- pick a downloader -------------------------------------------------------
