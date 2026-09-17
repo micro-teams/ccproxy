@@ -644,11 +644,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail # not -e: grep finding nothing (no client done yet) is expected, not fatal
           want="linux windows macos"
           for _ in $(seq 1 48); do # 48 * 10s = 8min ceiling
             have="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100" \
-              --jq '.artifacts[].name' | grep -oE 'client-done-[a-z]+' | sed 's/client-done-//' | sort -u | tr '\n' ' ')"
+              --jq '.artifacts[].name' 2>/dev/null | { grep -oE 'client-done-[a-z]+' || true; } | sed 's/client-done-//' | sort -u | tr '\n' ' ')"
             echo "done so far: ${have:-(none)}"
             all_in=1
             for w in $want; do echo "$have" | grep -qw "$w" || all_in=0; done
