@@ -46,6 +46,10 @@ data class LinkMsg(
     @get:JsonProperty("stderr") val stderr: String? = null,
     @get:JsonProperty("exit") val exit: Int? = null,
     @get:JsonProperty("truncated") val truncated: Boolean? = null,
+    // Structured, shell-free file access: file.write/file.read/file.remove/homedir. path is the
+    // file operated on for a request; for a homedir.result it carries the resolved directory
+    // instead of a dedicated field, since that's exactly what it is. See docs/protocol.md.
+    @get:JsonProperty("path") val path: String? = null,
 )
 
 data class ExecResult(
@@ -54,3 +58,13 @@ data class ExecResult(
     val exit: Int,
     val truncated: Boolean,
 )
+
+/**
+ * The result of a file.write / file.read / file.remove / homedir. `error` null (or blank) means
+ * success. `data` is base64 file content (file.read only); `path` is the resolved home directory
+ * (homedir only) — see LinkMsg.path's doc comment for why it is reused rather than a new field.
+ */
+data class FileResult(val error: String?, val data: String? = null, val path: String? = null) {
+    val ok: Boolean
+        get() = error.isNullOrBlank()
+}

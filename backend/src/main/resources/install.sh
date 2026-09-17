@@ -56,7 +56,15 @@ else
   BIN_DIR="$HOME/.local/bin"
   owner="$(id -un)"; home="$HOME"
 fi
-CFG_DIR="$home/.config/$BIN_NAME"
+# Must match exactly what the Go library's own config.DefaultPath() resolves to
+# (os.UserConfigDir() + brand.ConfigDir) — a fresh macOS CI run of this installer against a real
+# native connector caught the divergence: install.sh always wrote ~/.config (the Linux/XDG
+# convention) while os.UserConfigDir() on Darwin is ~/Library/Application Support, so `enroll`
+# read back an empty config on a machine this very script had just configured.
+case "$(uname -s)" in
+  Darwin) CFG_DIR="$home/Library/Application Support/$BIN_NAME" ;;
+  *)      CFG_DIR="$home/.config/$BIN_NAME" ;;
+esac
 CFG="$CFG_DIR/config.json"
 
 # --- pick a downloader -------------------------------------------------------
@@ -114,9 +122,11 @@ esac
 # --- 2. private tmux ---------------------------------------------------------
 # The connector runs its screens (the Claude Code login) in a private tmux so it never
 # fights the machine's own. Resolution order: (1) copy the machine's own tmux if it has
-# one — the surest match for the OS; (2) else download the static build the origin
-# publishes (no libevent/ncurses needed on the target); (3) else tell the user to install
-# tmux. macOS gets its tmux here, since only Linux tmux is published.
+# one — the surest match for the OS; (2) else download the build the origin publishes for
+# this target (Linux: fully static, no libevent/ncurses needed at all; macOS: libevent
+# statically linked, ncurses against the system's own — see deploy/tmux/build-macos-tmux.sh
+# for why that is the most "static" a Mac binary can be); (3) else tell the user to install
+# tmux.
 step "Installing private tmux"
 mkdir -p "$CFG_DIR/bin"
 if command -v tmux >/dev/null 2>&1; then

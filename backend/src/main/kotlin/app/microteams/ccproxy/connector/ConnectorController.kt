@@ -7,6 +7,9 @@
  *                     base / API base / ws override baked in from the request's own origin (plus the
  *                     configured gateway prefix), so `curl -fsSL <origin>/ccproxy/install.sh | sh`
  *                     resolves everything against this deployment with nothing configured.
+ *                 GET /install.ps1                           → the same thing for native Windows
+ *                     (`irm <origin>/ccproxy/install.ps1 | iex`) — no tmux, no lingering, otherwise
+ *                     the same placeholders baked the same way.
  *                 GET /connector/latest/{target}/{artifact}  → the `ccproxy-connector` binary or the
  *                     static `tmux` for one <os>-<arch>, streamed from
  *                     application.connector-binaries-dir. This is the endpoint micro-connector's
@@ -57,11 +60,16 @@ class ConnectorController(
     @Value("\${application.connector-binaries-dir:/app/connector}") private val binariesDir: String,
 ) {
 
-    // The only shapes install.sh + the self-updater ever request — Go-style os-arch (amd64/arm64),
-    // NOT uname-style (x86_64/aarch64); install.sh maps uname to these before asking.
-    private val targets = setOf("linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64")
+    // The only shapes install.sh/install.ps1 + the self-updater ever request — Go-style os-arch
+    // (amd64/arm64), NOT uname-style (x86_64/aarch64); install.sh maps uname to these before
+    // asking.
+    private val targets =
+        setOf("linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64", "windows-amd64")
     // The only artifacts published per target. Keeps the served path off the filesystem's leash.
-    private val artifacts = setOf("ccproxy-connector", "tmux")
+    // ccproxy-connector.exe is windows-amd64's only binary name — PATH-based lookup on Windows
+    // needs the extension, so it is a distinct allowlist entry rather than a suffix stripped off
+    // the Unix name.
+    private val artifacts = setOf("ccproxy-connector", "ccproxy-connector.exe", "tmux")
 
     @NoAuth
     @GetMapping("/install.sh", produces = ["text/x-shellscript"])
@@ -81,6 +89,25 @@ class ConnectorController(
         return ResponseEntity.ok()
             .contentType(MediaType.parseMediaType("text/x-shellscript"))
             .body(baked)
+    }
+
+    /**
+     * install.sh's native-Windows counterpart — see install.ps1's own header for what it does and
+     * does not do differently (no tmux, no lingering — none of that applies there).
+     */
+    @NoAuth
+    @GetMapping("/install.ps1", produces = ["text/plain"])
+    fun installScriptWindows(request: HttpServletRequest): ResponseEntity<String> {
+        val script =
+            javaClass.getResourceAsStream("/install.ps1")?.bufferedReader()?.use { it.readText() }
+                ?: return ResponseEntity.notFound().build()
+        val base = origin(request).trimEnd('/') + basePath
+        val baked =
+            script
+                .replace("__CONNECTOR_BASE__", base)
+                .replace("__API_BASE__", base)
+                .replace("__WS_BASE__", wsOverride)
+        return ResponseEntity.ok().contentType(MediaType.parseMediaType("text/plain")).body(baked)
     }
 
     @NoAuth

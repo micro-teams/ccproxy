@@ -12,6 +12,7 @@
 
 package app.microteams.ccproxy.machine.link
 
+import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
@@ -75,8 +76,10 @@ class HubMachine(val machineId: String) {
     val screens: MutableMap<String, HubScreen> = ConcurrentHashMap()
     val execSeq = AtomicInteger(0)
     val callSeq = AtomicInteger(0)
+    val fileSeq = AtomicInteger(0)
     val execPending: MutableMap<String, CompletableFuture<ExecResult>> = ConcurrentHashMap()
     val callPending: MutableMap<String, CompletableFuture<Any?>> = ConcurrentHashMap()
+    val filePending: MutableMap<String, CompletableFuture<FileResult>> = ConcurrentHashMap()
     private val sendLock = ReentrantLock()
 
     fun send(msg: LinkMsg) {
@@ -263,6 +266,75 @@ class MachineHub {
         }
     }
 
+    private fun fileCall(
+        machineId: String,
+        type: String,
+        path: String? = null,
+        data: String? = null,
+        timeoutSeconds: Long = 30,
+    ): FileResult {
+        val machine = machine(machineId)
+        val fid = "f" + machine.fileSeq.incrementAndGet()
+        val fut = CompletableFuture<FileResult>()
+        machine.filePending[fid] = fut
+        machine.send(LinkMsg(t = type, id = fid, path = path, data = data))
+        try {
+            return fut.get(timeoutSeconds, TimeUnit.SECONDS)
+        } finally {
+            machine.filePending.remove(fid)
+        }
+    }
+
+    /**
+     * Write `content` to `path` on the machine — creating parent directories and replacing any
+     * existing file atomically, at 0600 — with no shell involved (see docs/protocol.md's `file.*`
+     * section for why this exists instead of `exec`ing a script). Throws if the machine reports an
+     * error.
+     */
+    fun writeFile(machineId: String, path: String, content: ByteArray, timeoutSeconds: Long = 30) {
+        val res =
+            fileCall(
+                machineId,
+                "file.write",
+                path = path,
+                data = b64(content),
+                timeoutSeconds = timeoutSeconds,
+            )
+        if (!res.ok)
+            throw IllegalStateException("write $path on machine $machineId failed: ${res.error}")
+    }
+
+    /**
+     * Read `path` from the machine. Null if it does not exist there (matches `file.read`'s
+     * contract).
+     */
+    fun readFile(machineId: String, path: String, timeoutSeconds: Long = 30): ByteArray? {
+        val res = fileCall(machineId, "file.read", path = path, timeoutSeconds = timeoutSeconds)
+        if (!res.ok)
+            throw IllegalStateException("read $path on machine $machineId failed: ${res.error}")
+        return res.data?.takeIf { it.isNotEmpty() }?.let { Base64.getDecoder().decode(it) }
+    }
+
+    /** Delete `path` on the machine. Not existing there is success, same as `rm -f`. */
+    fun removeFile(machineId: String, path: String, timeoutSeconds: Long = 30) {
+        val res = fileCall(machineId, "file.remove", path = path, timeoutSeconds = timeoutSeconds)
+        if (!res.ok)
+            throw IllegalStateException("remove $path on machine $machineId failed: ${res.error}")
+    }
+
+    /**
+     * The machine's real home directory, resolved on-machine (os.UserHomeDir, not a shelled-out
+     * $HOME read).
+     */
+    fun homeDir(machineId: String, timeoutSeconds: Long = 30): String {
+        val res = fileCall(machineId, "homedir", timeoutSeconds = timeoutSeconds)
+        if (!res.ok || res.path.isNullOrBlank())
+            throw IllegalStateException("homedir on machine $machineId failed: ${res.error}")
+        return res.path
+    }
+
+    private fun b64(content: ByteArray): String = Base64.getEncoder().encodeToString(content)
+
     // --- inbound --------------------------------------------------------------
 
     fun onMachineMessage(machineId: String, m: LinkMsg) {
@@ -300,6 +372,15 @@ class MachineHub {
                             truncated = m.truncated ?: false,
                         )
                     )
+                }
+            }
+            "file.write.result",
+            "file.read.result",
+            "file.remove.result",
+            "homedir.result" -> {
+                val fut = m.id?.let { machine.filePending[it] }
+                if (fut != null && !fut.isDone) {
+                    fut.complete(FileResult(error = m.error, data = m.data, path = m.path))
                 }
             }
             "var.push" -> {

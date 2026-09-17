@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -144,9 +143,17 @@ func resident(cfgPath string) service.Runner {
 		if err != nil {
 			return err
 		}
+		// A failure here (no tmux on this machine, or — always, on native Windows —
+		// terminal.ErrUnsupported) must not take the whole resident down with it: the control
+		// connection and the local proxy below have nothing to do with screens. Disabled() hands
+		// back a Manager whose every operation fails cleanly through the normal session.error
+		// path instead of nil-panicking, so screen.NewManager below still gets a real Manager —
+		// interactive /login simply reports it cannot open a screen, same as it would for any
+		// other spawn failure.
 		tm, err := terminal.NewManager()
 		if err != nil {
-			return err
+			fmt.Fprintln(os.Stderr, "ccproxy: no screen support on this machine:", err)
+			tm = terminal.Disabled()
 		}
 		// The local MITM-splitting proxy runs alongside the control connection, not gated on it:
 		// a machine whose network comes up before enrolment finishes control-plane traffic still
@@ -334,7 +341,7 @@ func startDetached(cfgPath string) error {
 		return err
 	}
 	c := exec.Command(self, "run", "--config", cfgPath)
-	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	c.SysProcAttr = detachedSysProcAttr()
 	// runCmd itself redirects its own stdout/stderr to run.log on startup, so this process's fd
 	// 1/2 wiring doesn't matter — nil is fine, nothing is lost.
 	c.Stdin, c.Stdout, c.Stderr = nil, nil, nil

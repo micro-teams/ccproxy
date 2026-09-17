@@ -139,7 +139,69 @@ jobs:
   # shipped build artifact — the control plane serves these binaries to real machines — so CI vets
   # it, cross-compiles the published targets, and uploads them for the bundle. The Go version comes
   # from go.mod (in lockstep with the shared library).
+  # One job per platform, on a REAL runner for that platform — not a single ubuntu-latest job cross-
+  # compiling everything. Cross-compiling only proves the code builds; it was already the reason a
+  # real Windows/macOS run of the CLI's own tests was catching things this repo's CI never had (see
+  # micro-connector's go-macos/go-windows jobs, added the same way for the same reason). go vet/test
+  # here run natively on each target, then the single binary that runner's own GOOS/GOARCH matches
+  # is built — no cross-compilation step needed for that part either.
   build-connector:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: darwin
+            arch: arm64
+            runner: macos-latest
+          - os: windows
+            arch: amd64
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: connector
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: connector/go.mod
+          cache-dependency-path: connector/go.sum
+      - name: Vet + test (native)
+        run: |
+          go vet ./...
+          go test ./...
+      - name: Build binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Product version from the repo-root VERSION file, with the short commit as build metadata
+          # for traceability — e.g. 0.2.1+1a2b3c4. cwd is connector/, so VERSION is one level up.
+          VERSION="$(cat ../VERSION)+${GITHUB_SHA::7}"
+          ext=""; [ "${{ matrix.os }}" = windows ] && ext=".exe"
+          name="ccproxy-connector-${{ matrix.os }}-${{ matrix.arch }}$ext"
+          echo "building $name"
+          GOOS="${{ matrix.os }}" GOARCH="${{ matrix.arch }}" CGO_ENABLED=0 \
+            go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "dist/$name" .
+          ls -la dist
+      - name: Upload connector binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: cli-binaries-${{ matrix.os }}-${{ matrix.arch }}
+          path: connector/dist
+
+  # darwin-amd64 has no native runner to build-connector's matrix at all: GitHub retired hosted
+  # Intel macOS runners (macos-13 and earlier), and Go cross-compilation from macos-latest
+  # (arm64) is what's left — proven only by the arm64 leg's own native `go test`, not a native
+  # amd64 run, which nobody can give this binary any more. A separate job because it depends on
+  # nothing macOS-specific: any runner with a Go toolchain can cross-compile this.
+  build-connector-darwin-amd64:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -150,30 +212,18 @@ jobs:
         with:
           go-version-file: connector/go.mod
           cache-dependency-path: connector/go.sum
-      - name: Vet + test
-        run: |
-          go vet ./...
-          go test ./...
-      - name: Build binaries (one per OS/arch)
+      - name: Cross-compile (no native runner exists for this target any more)
         run: |
           set -euo pipefail
           mkdir -p dist
-          # Product version from the repo-root VERSION file, with the short commit as build metadata
-          # for traceability — e.g. 0.2.1+1a2b3c4. cwd is connector/, so VERSION is one level up.
           VERSION="$(cat ../VERSION)+${GITHUB_SHA::7}"
-          # Unix only: the connector drives a pty + tmux, so a machine that runs it is Linux or macOS.
-          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
-            os="${t%/*}"; arch="${t#*/}"
-            echo "building ccproxy-connector-$os-$arch"
-            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
-              go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
-              -o "dist/ccproxy-connector-$os-$arch" .
-          done
+          GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 \
+            go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
+            -o "dist/ccproxy-connector-darwin-amd64" .
           ls -la dist
-      - name: Upload connector binaries
-        uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7
         with:
-          name: cli-binaries
+          name: cli-binaries-darwin-amd64
           path: connector/dist
 
   # A fully static tmux per Linux target, so a fresh machine needs nothing pre-installed: install.sh
@@ -212,6 +262,42 @@ jobs:
           name: tmux-linux-${{ matrix.arch }}
           path: dist/linux-${{ matrix.arch }}
 
+  # macOS's own tmux, one per arch, built natively (see build-macos-tmux.sh for why "static" means
+  # something different there than on Linux). A separate job from build-tmux above because the build
+  # mechanism is unrelated — Homebrew + a real compile, not the Docker/musl recipe Linux's uses.
+  # arm64 only — darwin-amd64 has no native macOS runner to build C code on any more (GitHub
+  # retired hosted Intel macOS runners), and cross-compiling a linked-against-Homebrew build like
+  # this one is a different order of problem than Go's cross-compilation. install.sh's existing
+  # fallback (copy the machine's own tmux when nothing was published for its target) covers Intel
+  # Macs; that is not a functional gap, since it was already every target's first-choice path.
+  build-tmux-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cache the built tmux
+        id: tmux-cache
+        uses: actions/cache@v6
+        with:
+          path: dist/darwin-${{ matrix.arch }}/tmux
+          key: tmux-macos-${{ matrix.arch }}-${{ hashFiles('deploy/tmux/build-macos-tmux.sh') }}
+      - name: Build tmux (native)
+        if: steps.tmux-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          deploy/tmux/build-macos-tmux.sh --arch "${{ matrix.arch }}" --out dist
+          ls -la dist/*/
+      - name: Upload tmux binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: tmux-darwin-${{ matrix.arch }}
+          path: dist/darwin-${{ matrix.arch }}
+
   # The screen-driver applet (claude.js) the backend sends a connector to drive the login screen. It
   # is the shared micro-connector artifact — built from that repo, not vendored here — so a Claude
   # TUI fix reaches all three products from one place. Built from source, but pinned to the released
@@ -242,7 +328,18 @@ jobs:
           path: applet-dist
 
   package-zip:
-    needs: [build-jar, build-origin, build-frontend, lint, build-connector, build-tmux, build-applet]
+    needs:
+      [
+        build-jar,
+        build-origin,
+        build-frontend,
+        lint,
+        build-connector,
+        build-connector-darwin-amd64,
+        build-tmux,
+        build-tmux-macos,
+        build-applet,
+      ]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -277,14 +374,24 @@ jobs:
           for t in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
             os="${t%-*}"; arch="${t#*-}"
             mkdir -p "$CONN/$t"
-            cp "artifacts/cli-binaries/ccproxy-connector-$os-$arch" "$CONN/$t/ccproxy-connector"
+            cp "artifacts/cli-binaries-$os-$arch/ccproxy-connector-$os-$arch" "$CONN/$t/ccproxy-connector"
             chmod +x "$CONN/$t/ccproxy-connector"
           done
-          # Static tmux is Linux-only; macOS uses its own via install.sh's system-tmux fallback.
+          # windows-amd64: the artifact keeps its .exe suffix, matching what install.ps1 downloads
+          # it as and what PATH-based lookup on Windows needs.
+          mkdir -p "$CONN/windows-amd64"
+          cp "artifacts/cli-binaries-windows-amd64/ccproxy-connector-windows-amd64.exe" "$CONN/windows-amd64/ccproxy-connector.exe"
+          # Linux: fully static. macOS: libevent statically linked, ncurses against the system's own
+          # (see deploy/tmux/build-macos-tmux.sh) — both self-contained enough to ship.
           for arch in amd64 arm64; do
             if [ -f "artifacts/tmux-linux-$arch/tmux" ]; then
               cp "artifacts/tmux-linux-$arch/tmux" "$CONN/linux-$arch/tmux"
               chmod +x "$CONN/linux-$arch/tmux"
+            fi
+            if [ -f "artifacts/tmux-darwin-$arch/tmux" ]; then
+              mkdir -p "$CONN/darwin-$arch"
+              cp "artifacts/tmux-darwin-$arch/tmux" "$CONN/darwin-$arch/tmux"
+              chmod +x "$CONN/darwin-$arch/tmux"
             fi
           done
           # The screen-driver applet the backend serves to a connector: a shipped artifact, mounted
@@ -337,9 +444,19 @@ jobs:
           test -s /tmp/ccproxy-connector
           magic="$(head -c4 /tmp/ccproxy-connector | od -An -tx1 | tr -d ' \n')"
           case "$magic" in 7f454c46*) ;; *) echo "not an ELF (magic=$magic)"; exit 1 ;; esac
+          echo "== a published windows binary downloads and is a PE (MZ) =="
+          curl -fsS "$BASE/connector/latest/windows-amd64/ccproxy-connector.exe" -o /tmp/ccproxy-connector.exe
+          test -s /tmp/ccproxy-connector.exe
+          magic="$(head -c2 /tmp/ccproxy-connector.exe | od -An -tx1 | tr -d ' \n')"
+          case "$magic" in 4d5a*) ;; *) echo "not a PE (magic=$magic)"; exit 1 ;; esac
+          echo "== install.ps1 (origin baked from the request) =="
+          curl -fsS "$BASE/install.ps1" -o /tmp/install.ps1
+          grep -q "connector/latest" /tmp/install.ps1
+          ! grep -q "__CONNECTOR_BASE__" /tmp/install.ps1
           echo "== unknown target / off-allowlist artifact is a 404 =="
           [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/connector/latest/linux-amd64/passwd")" = 404 ]
           [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/connector/latest/win-x86/ccproxy-connector")" = 404 ]
+          [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/connector/latest/windows-amd64/ccproxy-connector")" = 404 ]
           echo "connector distribution OK"
           echo "== the claude.js driver applet is mounted for the backend =="
           docker compose exec -T backend sh -c 'test -s /app/applets/claude.js && grep -q screenReady /app/applets/claude.js'
@@ -437,90 +554,27 @@ jobs:
         working-directory: ccproxy-deploy
         run: docker compose down
 
-  # Bound account has a setup-token stored server-side: startForMachine takes the automatic
-  # prepareViaSetupToken path (no operator, no OAuth URL) — a fully separate code path from
-  # machine-login-compat's interactive /login. Asserts the MultiPath local-proxy config actually
-  # lands on the machine: settings.json's HTTPS_PROXY must be the credential-free local split-proxy
-  # URL, and proxy-credential.json must exist for the local proxy to read.
-  machine-setup-token:
-    needs: [package-zip]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
-        with:
-          name: ccproxy-deploy
-          path: ccproxy-deploy
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Bring the cluster up
-        working-directory: ccproxy-deploy
-        run: |
-          bash gen-env.sh
-          docker compose up -d --wait --wait-timeout 360
-      - name: Setup-token fast-login path
-        working-directory: ccproxy-deploy
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/machine-setup-token-smoke.sh"
-      - name: Dump logs on failure
-        if: failure()
-        working-directory: ccproxy-deploy
-        run: docker compose logs --no-color --tail 200
-      - name: Tear down
-        if: always()
-        working-directory: ccproxy-deploy
-        run: docker compose down
-
-  # A machine ccproxy cannot SSH into installs the connector from the served install.sh, dials OUT to
-  # the control plane, and is recognised online — the whole enrolment + WebSocket transport + hub
-  # stack, live, on a real machine container. No Claude / no account needed.
-  machine-connector-dialin:
-    needs: [package-zip]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
-        with:
-          name: ccproxy-deploy
-          path: ccproxy-deploy
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Bring the cluster up
-        working-directory: ccproxy-deploy
-        run: |
-          bash gen-env.sh
-          docker compose up -d --wait --wait-timeout 360
-      - name: Connector dial-in
-        working-directory: ccproxy-deploy
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/connector-dialin-smoke.sh"
-      - name: Dump logs on failure
-        if: failure()
-        working-directory: ccproxy-deploy
-        run: docker compose logs --no-color --tail 200
-      - name: Tear down
-        if: always()
-        working-directory: ccproxy-deploy
-        run: docker compose down
-
-  # The MultiPath work gave zero code changes to a machine that never re-logs-in: it still dials
-  # backend:3128 directly with proxy credentials embedded in HTTPS_PROXY (the pre-2026-09 scheme) —
-  # this is most already-enrolled prod machines. Reproduces the shape of a 2026-09-15 prod incident:
-  # a machine on this exact path saw every request ECONNRESET for several minutes after a backend
-  # restart. Root cause was never pinned down; this guards restart-recovery time from regressing
-  # further unnoticed. No real Anthropic account needed (same planted-credential technique as
-  # machine-revoke below).
-  machine-legacy-restart:
+  # machine-server / machine-client: one server, three identical clients — consolidated 2026-09-17
+  # from what used to be five separate jobs (machine-setup-token, machine-connector-dialin [+ its
+  # -native matrix], machine-legacy-restart, machine-revoke). The client-side scenarios (connector
+  # dial-in, the setup-token fast-login path) genuinely differ only by which install script/binary
+  # path/config directory a platform uses, so they now run as ONE script
+  # (machine-client-smoke.sh) natively on linux/windows/macos alike — no Debian "fake machine"
+  # container standing in for any of them any more. legacy-restart and revoke stay server-side
+  # steps here (not client-matrixed): both need direct Docker/Postgres access (a planted
+  # credential row, a `docker compose restart`) that has nothing to do with what OS a machine
+  # runs — matrixing them would just re-run identical backend assertions three times over.
+  #
+  # Side channel: a GitHub Actions artifact, used in both directions within this one workflow run.
+  #   server -> client: tunnel-info.env (the cloudflared URL + the CI superadmin password)
+  #   client -> server: client-done-<os> (an empty marker, one per client-matrix leg)
+  # `needs:` cannot express "these run concurrently and talk to each other" — it only gates on
+  # full completion, which is exactly what caused the first version of this matrix to deadlock
+  # (caught 2026-09-17: the client job needed the server job, but the server only finishes AFTER
+  # tearing itself down). So neither job `needs` the other; both need only package-zip and the
+  # artifact store is the only thing connecting them. The done-markers let the server shut down as
+  # soon as every client finishes rather than blind-sleeping a fixed window every run.
+  machine-server:
     needs: [package-zip]
     runs-on: ubuntu-latest
     permissions:
@@ -545,43 +599,62 @@ jobs:
       - name: Legacy direct-proxy restart resilience
         working-directory: ccproxy-deploy
         run: bash "$GITHUB_WORKSPACE/.github/scripts/machine-legacy-restart-smoke.sh"
-      - name: Dump logs on failure
-        if: failure()
-        working-directory: ccproxy-deploy
-        run: docker compose logs --no-color --tail 200
-      - name: Tear down
-        if: always()
-        working-directory: ccproxy-deploy
-        run: docker compose down
-
-  # DELETE /machine/{id} must be a RELIABLE revocation: engine session dropped and confirmed,
-  # durable credential gone, restart-proof, and an honest 502 (nothing deleted) when the engine
-  # cannot confirm. Exercised live against the compose cluster; no real account needed.
-  machine-revoke:
-    needs: [package-zip]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
-        with:
-          name: ccproxy-deploy
-          path: ccproxy-deploy
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Bring the cluster up
-        working-directory: ccproxy-deploy
-        run: |
-          bash gen-env.sh
-          docker compose up -d --wait --wait-timeout 360
       - name: Machine revocation
         working-directory: ccproxy-deploy
         run: bash "$GITHUB_WORKSPACE/.github/scripts/machine-revoke-smoke.sh"
+      - name: Open a cloudflared quick tunnel for the client matrix
+        id: tunnel
+        working-directory: ccproxy-deploy
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /usr/local/bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /usr/local/bin/cloudflared
+          PORT="$(grep -E '^NGINX_HTTP_PORT=' .env | cut -d= -f2 || echo 80)"
+          cloudflared tunnel --url "http://localhost:$PORT" --no-autoupdate >cloudflared.log 2>&1 &
+          echo "$!" > cloudflared.pid
+          url=""
+          for _ in $(seq 1 30); do
+            url="$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cloudflared.log | head -1 || true)"
+            [ -n "$url" ] && break
+            sleep 2
+          done
+          [ -n "$url" ] || { echo "FAIL: cloudflared never printed a tunnel URL"; cat cloudflared.log; exit 1; }
+          echo "tunnel URL: $url"
+          # Prove the tunnel actually reaches nginx before handing it to the client legs. The
+          # hostname is printed to cloudflared's log before it's actually routable end to end
+          # (DNS propagation + the edge-to-local-port path both take a moment), so retry rather
+          # than treating the first attempt's failure as final.
+          code="000"
+          for _ in $(seq 1 30); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 "$url/ccproxy/install.sh" || echo 000)"
+            [ "$code" = 200 ] && break
+            sleep 2
+          done
+          [ "$code" = 200 ] || { echo "FAIL: tunnel returned $code for install.sh"; cat cloudflared.log; exit 1; }
+          echo "TUNNEL_URL=$url/ccproxy" > tunnel-info.env
+          echo "TUNNEL_SUPERADMIN_PASSWORD=$(grep -E '^SUPERADMIN_PASSWORD=' .env | cut -d= -f2)" >> tunnel-info.env
+      - name: Publish the tunnel info for the concurrently-running client matrix to poll for
+        uses: actions/upload-artifact@v7
+        with:
+          retention-days: 1
+          name: machine-client-tunnel-info
+          path: ccproxy-deploy/tunnel-info.env
+      - name: Wait for every client leg's done-marker, or time out holding the tunnel open
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail # not -e: grep finding nothing (no client done yet) is expected, not fatal
+          want="linux windows macos"
+          for _ in $(seq 1 48); do # 48 * 10s = 8min ceiling
+            have="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100" \
+              --jq '.artifacts[].name' 2>/dev/null | { grep -oE 'client-done-[a-z]+' || true; } | sed 's/client-done-//' | sort -u | tr '\n' ' ')"
+            echo "done so far: ${have:-(none)}"
+            all_in=1
+            for w in $want; do echo "$have" | grep -qw "$w" || all_in=0; done
+            [ "$all_in" = 1 ] && { echo "all client legs reported done"; break; }
+            sleep 10
+          done
       - name: Dump logs on failure
         if: failure()
         working-directory: ccproxy-deploy
@@ -589,7 +662,75 @@ jobs:
       - name: Tear down
         if: always()
         working-directory: ccproxy-deploy
-        run: docker compose down
+        run: |
+          kill "$(cat cloudflared.pid)" >/dev/null 2>&1 || true
+          docker compose down
+
+  machine-client:
+    # Deliberately NOT `needs: [machine-server]` — see the block comment above machine-server for
+    # why that would deadlock. Both need only package-zip and run concurrently; this job polls for
+    # the artifact machine-server publishes partway through instead of a job-level dependency.
+    needs: [package-zip]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-latest
+          - os: windows
+            runner: windows-latest
+          - os: macos
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Wait for the server leg's tunnel-info artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            if gh run download "${{ github.run_id }}" -n machine-client-tunnel-info -D . 2>/dev/null; then
+              break
+            fi
+            sleep 10
+          done
+          test -f tunnel-info.env || { echo "FAIL: server leg's tunnel-info artifact never appeared"; exit 1; }
+          cat tunnel-info.env >> "$GITHUB_ENV"
+      - name: "Install the connector natively (windows): irm | iex"
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $env:CCPROXY_CONNECTOR_BASE = $env:TUNNEL_URL
+          $env:CCPROXY_API_BASE = $env:TUNNEL_URL
+          irm "$env:TUNNEL_URL/install.ps1" | iex
+      - name: "Install the connector natively (linux/macos): curl | sh"
+        if: matrix.os != 'windows'
+        run: |
+          curl -fsSL "$TUNNEL_URL/install.sh" | sh
+      - name: Client smoke (dial-in + setup-token fast path)
+        env:
+          CCPROXY_SUPERADMIN_PASSWORD: ${{ env.TUNNEL_SUPERADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          bin="$HOME/.local/bin/ccproxy-connector"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            bin="$APPDATA/ccproxy-connector/ccproxy-connector.exe"
+          fi
+          bash "$GITHUB_WORKSPACE/.github/scripts/machine-client-smoke.sh" "$TUNNEL_URL" "$bin"
+      - name: Report done to the server leg
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          retention-days: 1
+          name: client-done-${{ matrix.os }}
+          path: .github/scripts/machine-client-smoke.sh # any small tracked file; content is unused
 
   # Single aggregate gate: succeeds only if every job above succeeded (a job with `needs` runs only
   # when all needed jobs pass; otherwise this is skipped and stays non-green). Require just this check
@@ -597,9 +738,10 @@ jobs:
   ci-success:
     name: CI success
     # Only the leaves of the dependency DAG: everything else (build-jar, build-origin,
-    # build-frontend, lint, build-connector, build-tmux, build-applet, package-zip) is already
-    # required transitively by these four, and a failure/skip anywhere upstream skips them too.
-    needs: [test-compose, machine-login-compat, machine-setup-token, machine-legacy-restart, machine-connector-dialin, machine-revoke]
+    # build-frontend, lint, build-connector, build-connector-darwin-amd64, build-tmux,
+    # build-tmux-macos, build-applet, package-zip) is already required transitively by these
+    # four, and a failure/skip anywhere upstream skips them too.
+    needs: [test-compose, machine-login-compat, machine-server, machine-client]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All required CI jobs passed."
