@@ -81,13 +81,20 @@ cd "tmux-${version}"
 #
 # Forcing the STATIC archive is the part that does not survive configure's own libevent detection
 # — tmux's configure.ac does not honor a LIBEVENT_LIBS env override the way autoconf's
-# PKG_CHECK_MODULES convention would suggest; it re-detects on its own and the final link ends up
-# with plain `-levent_core` (dynamic) regardless of what gets exported here. So: leave configure to
-# do whatever it wants, and instead put the .a file straight into LDFLAGS, which IS always honored
-# verbatim on the final link line. The linker resolves libevent's symbols from that archive before
-# it ever gets to the Makefile's own (now-redundant, harmless) `-levent_core`.
+# PKG_CHECK_MODULES convention would suggest; it re-detects on its own and the Makefile's LIBS still
+# ends with plain `-levent_core` (dynamic). Putting the .a's path directly into LDFLAGS is not
+# enough either: ld64 only pulls an archive's members in for symbols already UNDEFINED at the point
+# it processes that archive, and LDFLAGS lands before the object files on the command line (the
+# usual `$(CC) $(LDFLAGS) -o$@ $(OBJS) $(LIBS)` shape) — so at that point nothing has asked for
+# libevent's symbols yet, the archive contributes nothing, and the dynamic -levent_core at the very
+# end (from LIBS) is what actually resolves them.
+#
+# -Wl,-force_load,<path> sidesteps ordering entirely: it links in the WHOLE archive unconditionally,
+# regardless of where it sits relative to anything else. By the time the Makefile's own trailing
+# -levent_core is processed, those symbols are already defined, so the linker has nothing left to
+# take from the dylib and emits no load-command reference to it at all.
 CPPFLAGS="-I$LIBEVENT_PREFIX/include" \
-LDFLAGS="-L$LIBEVENT_PREFIX/lib $LIBEVENT_STATIC_LIBS" \
+LDFLAGS="-L$LIBEVENT_PREFIX/lib -Wl,-force_load,$LIBEVENT_STATIC_LIBS" \
   ./configure --disable-utf8proc
 make -j"$(sysctl -n hw.ncpu)"
 
