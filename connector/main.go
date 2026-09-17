@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -342,7 +341,7 @@ func startDetached(cfgPath string) error {
 		return err
 	}
 	c := exec.Command(self, "run", "--config", cfgPath)
-	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	c.SysProcAttr = detachedSysProcAttr()
 	// runCmd itself redirects its own stdout/stderr to run.log on startup, so this process's fd
 	// 1/2 wiring doesn't matter — nil is fine, nothing is lost.
 	c.Stdin, c.Stdout, c.Stderr = nil, nil, nil

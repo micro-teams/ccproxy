@@ -20,3 +20,8 @@ __pycache__/
 
 # generated at build time from entity metadata (shipped in the bundle, not versioned)
 backend/CREATE.sql
+
+# a stray local `go build ./...` (windows cross-compile, or plain) with no -o lands one of these
+# in connector/ — never a real, intentional artifact
+connector/connector
+connector/connector.exe

@@ -157,9 +157,6 @@ jobs:
             arch: arm64
             runner: ubuntu-24.04-arm
           - os: darwin
-            arch: amd64
-            runner: macos-13
-          - os: darwin
             arch: arm64
             runner: macos-latest
           - os: windows
@@ -197,6 +194,36 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: cli-binaries-${{ matrix.os }}-${{ matrix.arch }}
+          path: connector/dist
+
+  # darwin-amd64 has no native runner to build-connector's matrix at all: GitHub retired hosted
+  # Intel macOS runners (macos-13 and earlier), and Go cross-compilation from macos-latest
+  # (arm64) is what's left — proven only by the arm64 leg's own native `go test`, not a native
+  # amd64 run, which nobody can give this binary any more. A separate job because it depends on
+  # nothing macOS-specific: any runner with a Go toolchain can cross-compile this.
+  build-connector-darwin-amd64:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: connector
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: connector/go.mod
+          cache-dependency-path: connector/go.sum
+      - name: Cross-compile (no native runner exists for this target any more)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          VERSION="$(cat ../VERSION)+${GITHUB_SHA::7}"
+          GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 \
+            go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
+            -o "dist/ccproxy-connector-darwin-amd64" .
+          ls -la dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-binaries-darwin-amd64
           path: connector/dist
 
   # A fully static tmux per Linux target, so a fresh machine needs nothing pre-installed: install.sh
@@ -238,13 +265,16 @@ jobs:
   # macOS's own tmux, one per arch, built natively (see build-macos-tmux.sh for why "static" means
   # something different there than on Linux). A separate job from build-tmux above because the build
   # mechanism is unrelated — Homebrew + a real compile, not the Docker/musl recipe Linux's uses.
+  # arm64 only — darwin-amd64 has no native macOS runner to build C code on any more (GitHub
+  # retired hosted Intel macOS runners), and cross-compiling a linked-against-Homebrew build like
+  # this one is a different order of problem than Go's cross-compilation. install.sh's existing
+  # fallback (copy the machine's own tmux when nothing was published for its target) covers Intel
+  # Macs; that is not a functional gap, since it was already every target's first-choice path.
   build-tmux-macos:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
-            runner: macos-13
           - arch: arm64
             runner: macos-latest
     runs-on: ${{ matrix.runner }}
@@ -305,6 +335,7 @@ jobs:
         build-frontend,
         lint,
         build-connector,
+        build-connector-darwin-amd64,
         build-tmux,
         build-tmux-macos,
         build-applet,
@@ -683,9 +714,9 @@ jobs:
   ci-success:
     name: CI success
     # Only the leaves of the dependency DAG: everything else (build-jar, build-origin,
-    # build-frontend, lint, build-connector, build-tmux, build-tmux-macos, build-applet,
-    # package-zip) is already required transitively by these four, and a failure/skip anywhere
-    # upstream skips them too.
+    # build-frontend, lint, build-connector, build-connector-darwin-amd64, build-tmux,
+    # build-tmux-macos, build-applet, package-zip) is already required transitively by these
+    # four, and a failure/skip anywhere upstream skips them too.
     needs: [test-compose, machine-login-compat, machine-setup-token, machine-legacy-restart, machine-connector-dialin, machine-revoke]
     runs-on: ubuntu-latest
     steps:
