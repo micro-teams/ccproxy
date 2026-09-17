@@ -44,14 +44,30 @@ repo_root="$(cd "$here/../.." && pwd)"
 if [ -z "$out" ]; then
   out="${CONNECTOR_DIST_DIR:-$repo_root/.connector-dist}"
 fi
-dest_dir="$out/darwin-$arch"
+# Absolute: everything below cd's into a scratch build dir, and a relative dest_dir would then
+# resolve against THAT directory instead of where this script was invoked from — the actual bug
+# that made the first version of this script fail with "cp: dist/darwin-arm64/tmux: No such file
+# or directory" the moment it ran for real.
+mkdir -p "$out"
+dest_dir="$(cd "$out" && pwd)/darwin-$arch"
 mkdir -p "$dest_dir"
 
 command -v brew >/dev/null 2>&1 || { echo "homebrew is required" >&2; exit 1; }
 brew list libevent >/dev/null 2>&1 || brew install libevent >/dev/null
 
 LIBEVENT_PREFIX="$(brew --prefix libevent)"
-[ -f "$LIBEVENT_PREFIX/lib/libevent.a" ] || { echo "no static libevent.a at $LIBEVENT_PREFIX/lib" >&2; exit 1; }
+# Homebrew's static archive layout has varied by version — prefer the split libevent_core.a (what
+# tmux actually links against, per its own -levent_core) if present, else fall back to the combined
+# libevent.a.
+if [ -f "$LIBEVENT_PREFIX/lib/libevent_core.a" ]; then
+  LIBEVENT_STATIC_LIBS="$LIBEVENT_PREFIX/lib/libevent_core.a"
+elif [ -f "$LIBEVENT_PREFIX/lib/libevent.a" ]; then
+  LIBEVENT_STATIC_LIBS="$LIBEVENT_PREFIX/lib/libevent.a"
+else
+  echo "no static libevent .a found under $LIBEVENT_PREFIX/lib" >&2
+  ls -la "$LIBEVENT_PREFIX/lib" >&2 || true
+  exit 1
+fi
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -60,12 +76,18 @@ curl -fsSL -o tmux.tar.gz "https://github.com/tmux/tmux/releases/download/${vers
 tar xzf tmux.tar.gz
 cd "tmux-${version}"
 
-# Point at libevent's headers and its static archive directly (not -levent, which would pick the
-# dylib) — ncurses is left to configure's own defaults, resolving against the system's copy since
-# nothing here points it anywhere else.
+# Point at libevent's headers; ncurses is left to configure's own defaults, resolving against the
+# system's copy since nothing here points it anywhere else.
+#
+# Forcing the STATIC archive is the part that does not survive configure's own libevent detection
+# — tmux's configure.ac does not honor a LIBEVENT_LIBS env override the way autoconf's
+# PKG_CHECK_MODULES convention would suggest; it re-detects on its own and the final link ends up
+# with plain `-levent_core` (dynamic) regardless of what gets exported here. So: leave configure to
+# do whatever it wants, and instead put the .a file straight into LDFLAGS, which IS always honored
+# verbatim on the final link line. The linker resolves libevent's symbols from that archive before
+# it ever gets to the Makefile's own (now-redundant, harmless) `-levent_core`.
 CPPFLAGS="-I$LIBEVENT_PREFIX/include" \
-LDFLAGS="-L$LIBEVENT_PREFIX/lib" \
-LIBEVENT_LIBS="$LIBEVENT_PREFIX/lib/libevent.a" \
+LDFLAGS="-L$LIBEVENT_PREFIX/lib $LIBEVENT_STATIC_LIBS" \
   ./configure --disable-utf8proc
 make -j"$(sysctl -n hw.ncpu)"
 
