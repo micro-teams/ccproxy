@@ -144,9 +144,17 @@ func resident(cfgPath string) service.Runner {
 		if err != nil {
 			return err
 		}
+		// A failure here (no tmux on this machine, or — always, on native Windows —
+		// terminal.ErrUnsupported) must not take the whole resident down with it: the control
+		// connection and the local proxy below have nothing to do with screens. Disabled() hands
+		// back a Manager whose every operation fails cleanly through the normal session.error
+		// path instead of nil-panicking, so screen.NewManager below still gets a real Manager —
+		// interactive /login simply reports it cannot open a screen, same as it would for any
+		// other spawn failure.
 		tm, err := terminal.NewManager()
 		if err != nil {
-			return err
+			fmt.Fprintln(os.Stderr, "ccproxy: no screen support on this machine:", err)
+			tm = terminal.Disabled()
 		}
 		// The local MITM-splitting proxy runs alongside the control connection, not gated on it:
 		// a machine whose network comes up before enrolment finishes control-plane traffic still

@@ -3,7 +3,7 @@ module github.com/micro-teams/ccproxy/connector
 go 1.25.0
 
 require (
-	github.com/micro-teams/micro-connector/cli v0.1.5
+	github.com/micro-teams/micro-connector/cli v0.1.8-0.20260917064945-f3cc4ee4f057
 	github.com/spf13/cobra v1.10.2
 )
 
