@@ -91,10 +91,13 @@ cd "tmux-${version}"
 #
 # -Wl,-force_load,<path> sidesteps ordering entirely: it links in the WHOLE archive unconditionally,
 # regardless of where it sits relative to anything else. By the time the Makefile's own trailing
-# -levent_core is processed, those symbols are already defined, so the linker has nothing left to
-# take from the dylib and emits no load-command reference to it at all.
+# -levent_core is processed, those symbols are already defined... but ld64 still records the dylib
+# itself as a load-command dependency merely because -levent_core was explicitly passed, even though
+# it ends up contributing no symbols. -Wl,-dead_strip_dylibs tells the linker to drop load-command
+# entries for any dylib nothing actually resolved against — exactly libevent_core's dylib here, once
+# force_load already satisfied everything from the static archive.
 CPPFLAGS="-I$LIBEVENT_PREFIX/include" \
-LDFLAGS="-L$LIBEVENT_PREFIX/lib -Wl,-force_load,$LIBEVENT_STATIC_LIBS" \
+LDFLAGS="-L$LIBEVENT_PREFIX/lib -Wl,-force_load,$LIBEVENT_STATIC_LIBS -Wl,-dead_strip_dylibs" \
   ./configure --disable-utf8proc
 make -j"$(sysctl -n hw.ncpu)"
 
