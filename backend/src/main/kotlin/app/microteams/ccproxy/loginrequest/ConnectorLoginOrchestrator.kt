@@ -1,9 +1,13 @@
 /*
  *  Description: The connector-mode login orchestrator — the same OAuth flow as LoginOrchestrator, but
  *               driven over the connector's dial-out link instead of SSH: files are written with the
- *               hub's `exec` (bash on the machine), and Claude Code's login screen is driven by the
- *               shared claude.js applet in `mode:'login'` (which surfaces the OAuth URL and the login
- *               state as mirrored variables) instead of tmux screen-scraping. The engine interaction
+ *               hub's structured file.write/file.read/homedir RPCs (no shell on the machine required
+ *               — see docs/protocol.md in micro-connector), and Claude Code's login screen is driven
+ *               by the shared claude.js applet in `mode:'login'` (which surfaces the OAuth URL and
+ *               the login state as mirrored variables) instead of tmux screen-scraping. The
+ *               interactive login SCREEN itself still launches through a bash -lc command (tmux-
+ *               hosted, Unix/macOS only by construction — see terminal.ErrUnsupported); the
+ *               setup-token fast path below never touches a shell at all. The engine interaction
  *               (register session, prime the token swap, poll for the credential) is identical — the
  *               real token is captured by the engine and never touches the machine.
  *
@@ -31,7 +35,6 @@ import app.microteams.ccproxy.machine.MachineStatus
 import app.microteams.ccproxy.machine.link.MachineHub
 import com.fasterxml.jackson.databind.ObjectMapper
 import java.io.File
-import java.util.Base64
 import org.slf4j.LoggerFactory
 import org.springframework.scheduling.annotation.Async
 import org.springframework.stereotype.Component
@@ -296,7 +299,7 @@ class ConnectorLoginOrchestrator(
             req.status = LoginRequestStatus.COMPLETED
             loginRequestRepository.save(req)
             runCatching { hub.closeScreen(mid, sid) }
-            runCatching { execScript(mid, "rm -f \"$home/.claude/ccproxy-login.json\"") }
+            runCatching { hub.removeFile(mid, "$home/.claude/ccproxy-login.json") }
             log.info("connector login-request {} completed (machine {} ready)", req.id, machine.id)
         } catch (e: Exception) {
             log.warn("connector login-request {} apply failed: {}", loginRequestId, e.message)
@@ -304,28 +307,20 @@ class ConnectorLoginOrchestrator(
         }
     }
 
-    // --- machine-side helpers (over the connector's exec) ---------------------
+    // --- machine-side helpers (over the connector's structured file RPCs) -----
+    // These used to be bash scripts run via hub.exec — which quietly meant "a Unix machine". They
+    // are now file.write/file.read/file.remove/homedir (see docs/protocol.md in micro-connector),
+    // which the connector executes with Go's os package directly: no shell required on the
+    // machine, on any platform.
 
-    private fun execScript(machineId: String, script: String) =
-        hub.exec(machineId, listOf("bash", "-lc", script), timeoutSeconds = 30)
-
-    private fun resolveHome(machineId: String): String {
-        val out = execScript(machineId, "printf %s \"\$HOME\"").stdout.trim()
-        return out.ifBlank { "/root" }
-    }
-
-    private fun b64(content: String): String =
-        Base64.getEncoder().encodeToString(content.toByteArray())
+    private fun resolveHome(machineId: String): String = hub.homeDir(machineId)
 
     private fun writeFileOnMachine(machineId: String, absPath: String, content: String) {
-        val r =
-            execScript(
-                machineId,
-                "mkdir -p \"\$(dirname '$absPath')\" && echo ${b64(content)} | base64 -d > " +
-                    "'$absPath.ccproxy.tmp' && mv -f '$absPath.ccproxy.tmp' '$absPath'",
-            )
-        if (r.exit != 0) throw IllegalStateException("write $absPath failed: ${r.stderr.take(200)}")
+        hub.writeFile(machineId, absPath, content.toByteArray())
     }
+
+    private fun readFileOnMachine(machineId: String, absPath: String): String? =
+        hub.readFile(machineId, absPath)?.toString(Charsets.UTF_8)
 
     /** No credentials in this URL — see CCProxyConfig.Engine.localProxyPort. */
     private fun localProxyUrl(): String = "http://127.0.0.1:${config.engine.localProxyPort}"
@@ -424,9 +419,7 @@ class ConnectorLoginOrchestrator(
     ) {
         val home = resolveHome(machineId)
         val path = "$home/.claude/settings.json"
-        val existing =
-            runCatching { execScript(machineId, "cat '$path' 2>/dev/null || true").stdout }
-                .getOrDefault("")
+        val existing = runCatching { readFileOnMachine(machineId, path) }.getOrNull() ?: ""
         val start = existing.indexOf('{')
         val end = existing.lastIndexOf('}')
         val cfg =
@@ -450,21 +443,21 @@ class ConnectorLoginOrchestrator(
     }
 
     private fun markOnboardingComplete(machineId: String) {
-        val script =
-            """
-            import json, os
-            p = os.path.expanduser("~/.claude.json")
-            d = json.load(open(p)) if os.path.exists(p) and os.path.getsize(p) else {}
-            d["hasCompletedOnboarding"] = True
-            json.dump(d, open(p, "w"))
-            """
-                .trimIndent()
         runCatching {
-            execScript(
-                machineId,
-                "echo ${b64(script)} | base64 -d | python3 || " +
-                    "printf '%s' '{\"hasCompletedOnboarding\":true}' > \"\$HOME/.claude.json\"",
-            )
+            val path = "${resolveHome(machineId)}/.claude.json"
+            val existing = readFileOnMachine(machineId, path)
+            val cfg =
+                existing
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let {
+                        runCatching {
+                                mapper.readTree(it)
+                                    as? com.fasterxml.jackson.databind.node.ObjectNode
+                            }
+                            .getOrNull()
+                    } ?: mapper.createObjectNode()
+            cfg.put("hasCompletedOnboarding", true)
+            writeFileOnMachine(machineId, path, mapper.writeValueAsString(cfg))
         }
     }
 
