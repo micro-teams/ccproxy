@@ -114,9 +114,11 @@ esac
 # --- 2. private tmux ---------------------------------------------------------
 # The connector runs its screens (the Claude Code login) in a private tmux so it never
 # fights the machine's own. Resolution order: (1) copy the machine's own tmux if it has
-# one — the surest match for the OS; (2) else download the static build the origin
-# publishes (no libevent/ncurses needed on the target); (3) else tell the user to install
-# tmux. macOS gets its tmux here, since only Linux tmux is published.
+# one — the surest match for the OS; (2) else download the build the origin publishes for
+# this target (Linux: fully static, no libevent/ncurses needed at all; macOS: libevent
+# statically linked, ncurses against the system's own — see deploy/tmux/build-macos-tmux.sh
+# for why that is the most "static" a Mac binary can be); (3) else tell the user to install
+# tmux.
 step "Installing private tmux"
 mkdir -p "$CFG_DIR/bin"
 if command -v tmux >/dev/null 2>&1; then

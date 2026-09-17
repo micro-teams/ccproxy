@@ -1000,7 +1000,11 @@ components:
         installCommand:
           type: string
           nullable: true
-          description: "connector-mode: the one-line install + connect command for this machine (create response only)"
+          description: "connector-mode: the one-line install + connect command for this machine, Unix (Linux/macOS) — `curl | sh` (create response only)"
+        installCommandWindows:
+          type: string
+          nullable: true
+          description: "connector-mode: the one-line install + connect command for this machine, native Windows — `irm | iex` (create response only). Interactive /login does not work on native Windows (no screen/tmux backend there); the setup-token path and everything else does."
         # INTERNAL — populated only for super-admin callers; never returned to tenants.
         boundAccountId: { type: integer, format: int64, nullable: true, description: "internal; super-admin only" }
         boundAccountEmail: { type: string, nullable: true, description: "internal; super-admin only" }

@@ -59,15 +59,21 @@ class MachineController(
                 createMachineRequestDTO,
             )
         // For a connector-mode machine, hand back the exact one-line command to install + connect
-        // it,
-        // with the base derived from this request's origin (correct behind any proxy).
+        // it, with the base derived from this request's origin (correct behind any proxy). Both
+        // platforms' commands are returned together — the caller (a human copy-pasting, or a UI
+        // that knows which OS it is targeting) picks the one that applies, rather than ccproxy
+        // guessing the operator's platform from anything in the request.
         val withCmd =
             if (created.connector == true && created.deviceToken != null) {
                 val base = currentOrigin() + "/ccproxy"
                 created.copy(
                     installCommand =
                         "curl -fsSL $base/install.sh | sh && " +
-                            "ccproxy-connector connect $base --token ${created.deviceToken}"
+                            "ccproxy-connector connect $base --token ${created.deviceToken}",
+                    installCommandWindows =
+                        "irm $base/install.ps1 | iex; " +
+                            "& \"\$env:APPDATA\\ccproxy-connector\\ccproxy-connector.exe\" " +
+                            "connect $base --token ${created.deviceToken}",
                 )
             } else {
                 created

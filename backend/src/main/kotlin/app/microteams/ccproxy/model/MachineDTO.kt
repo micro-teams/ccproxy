@@ -29,8 +29,12 @@ import javax.validation.Valid
  * @param createdAt
  * @param deviceToken connector-mode credential the machine presents to dial in (`ccproxy-connector
  *   connect --token <deviceToken>`). Returned to the owning tenant so it can connect the machine.
- * @param installCommand connector-mode: the one-line install + connect command for this machine
- *   (create response only)
+ * @param installCommand connector-mode: the one-line install + connect command for this machine,
+ *   Unix (Linux/macOS) — `curl | sh` (create response only)
+ * @param installCommandWindows connector-mode: the one-line install + connect command for this
+ *   machine, native Windows — `irm | iex` (create response only). Interactive /login does not work
+ *   on native Windows (no screen/tmux backend there); the setup-token path and everything else
+ *   does.
  * @param boundAccountId internal; super-admin only
  * @param boundAccountEmail internal; super-admin only
  */
@@ -121,11 +125,18 @@ data class MachineDTO(
     val deviceToken: kotlin.String? = null,
     @Schema(
         description =
-            "connector-mode: the one-line install + connect command for this machine (create response only)"
+            "connector-mode: the one-line install + connect command for this machine, Unix (Linux/macOS) — `curl | sh` (create response only)"
     )
     @param:JsonProperty("installCommand")
     @get:JsonProperty("installCommand")
     val installCommand: kotlin.String? = null,
+    @Schema(
+        description =
+            "connector-mode: the one-line install + connect command for this machine, native Windows — `irm | iex` (create response only). Interactive /login does not work on native Windows (no screen/tmux backend there); the setup-token path and everything else does."
+    )
+    @param:JsonProperty("installCommandWindows")
+    @get:JsonProperty("installCommandWindows")
+    val installCommandWindows: kotlin.String? = null,
     @Schema(description = "internal; super-admin only")
     @param:JsonProperty("boundAccountId")
     @get:JsonProperty("boundAccountId")

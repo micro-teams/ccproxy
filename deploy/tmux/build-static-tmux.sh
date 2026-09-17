@@ -12,8 +12,9 @@
 #              default: $CONNECTOR_DIST_DIR, else <repo>/.connector-dist
 #   --version  tmux release to build (default: 3.5a)
 #
-# macOS is deliberately not built here: static libc does not exist on Darwin, so install.sh falls
-# back to copying the machine's own tmux for darwin targets.
+# macOS is not built here: static libc does not exist on Darwin, so a fully static tmux like this
+# one has no Darwin equivalent — see build-macos-tmux.sh for the (statically-links-libevent-only,
+# dynamic-against-the-system's-own-ncurses) portable build that stands in for it there.
 set -euo pipefail
 
 arch="amd64"

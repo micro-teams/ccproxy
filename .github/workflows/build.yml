@@ -139,41 +139,64 @@ jobs:
   # shipped build artifact — the control plane serves these binaries to real machines — so CI vets
   # it, cross-compiles the published targets, and uploads them for the bundle. The Go version comes
   # from go.mod (in lockstep with the shared library).
+  # One job per platform, on a REAL runner for that platform — not a single ubuntu-latest job cross-
+  # compiling everything. Cross-compiling only proves the code builds; it was already the reason a
+  # real Windows/macOS run of the CLI's own tests was catching things this repo's CI never had (see
+  # micro-connector's go-macos/go-windows jobs, added the same way for the same reason). go vet/test
+  # here run natively on each target, then the single binary that runner's own GOOS/GOARCH matches
+  # is built — no cross-compilation step needed for that part either.
   build-connector:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: darwin
+            arch: amd64
+            runner: macos-13
+          - os: darwin
+            arch: arm64
+            runner: macos-latest
+          - os: windows
+            arch: amd64
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
     defaults:
       run:
         working-directory: connector
+        shell: bash
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: connector/go.mod
           cache-dependency-path: connector/go.sum
-      - name: Vet + test
+      - name: Vet + test (native)
         run: |
           go vet ./...
           go test ./...
-      - name: Build binaries (one per OS/arch)
+      - name: Build binary
         run: |
           set -euo pipefail
           mkdir -p dist
           # Product version from the repo-root VERSION file, with the short commit as build metadata
           # for traceability — e.g. 0.2.1+1a2b3c4. cwd is connector/, so VERSION is one level up.
           VERSION="$(cat ../VERSION)+${GITHUB_SHA::7}"
-          # Unix only: the connector drives a pty + tmux, so a machine that runs it is Linux or macOS.
-          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
-            os="${t%/*}"; arch="${t#*/}"
-            echo "building ccproxy-connector-$os-$arch"
-            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
-              go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
-              -o "dist/ccproxy-connector-$os-$arch" .
-          done
+          ext=""; [ "${{ matrix.os }}" = windows ] && ext=".exe"
+          name="ccproxy-connector-${{ matrix.os }}-${{ matrix.arch }}$ext"
+          echo "building $name"
+          GOOS="${{ matrix.os }}" GOARCH="${{ matrix.arch }}" CGO_ENABLED=0 \
+            go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "dist/$name" .
           ls -la dist
-      - name: Upload connector binaries
+      - name: Upload connector binary
         uses: actions/upload-artifact@v7
         with:
-          name: cli-binaries
+          name: cli-binaries-${{ matrix.os }}-${{ matrix.arch }}
           path: connector/dist
 
   # A fully static tmux per Linux target, so a fresh machine needs nothing pre-installed: install.sh
@@ -212,6 +235,39 @@ jobs:
           name: tmux-linux-${{ matrix.arch }}
           path: dist/linux-${{ matrix.arch }}
 
+  # macOS's own tmux, one per arch, built natively (see build-macos-tmux.sh for why "static" means
+  # something different there than on Linux). A separate job from build-tmux above because the build
+  # mechanism is unrelated — Homebrew + a real compile, not the Docker/musl recipe Linux's uses.
+  build-tmux-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: macos-13
+          - arch: arm64
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cache the built tmux
+        id: tmux-cache
+        uses: actions/cache@v6
+        with:
+          path: dist/darwin-${{ matrix.arch }}/tmux
+          key: tmux-macos-${{ matrix.arch }}-${{ hashFiles('deploy/tmux/build-macos-tmux.sh') }}
+      - name: Build tmux (native)
+        if: steps.tmux-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          deploy/tmux/build-macos-tmux.sh --arch "${{ matrix.arch }}" --out dist
+          ls -la dist/*/
+      - name: Upload tmux binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: tmux-darwin-${{ matrix.arch }}
+          path: dist/darwin-${{ matrix.arch }}
+
   # The screen-driver applet (claude.js) the backend sends a connector to drive the login screen. It
   # is the shared micro-connector artifact — built from that repo, not vendored here — so a Claude
   # TUI fix reaches all three products from one place. Built from source, but pinned to the released
@@ -242,7 +298,17 @@ jobs:
           path: applet-dist
 
   package-zip:
-    needs: [build-jar, build-origin, build-frontend, lint, build-connector, build-tmux, build-applet]
+    needs:
+      [
+        build-jar,
+        build-origin,
+        build-frontend,
+        lint,
+        build-connector,
+        build-tmux,
+        build-tmux-macos,
+        build-applet,
+      ]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -277,14 +343,24 @@ jobs:
           for t in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
             os="${t%-*}"; arch="${t#*-}"
             mkdir -p "$CONN/$t"
-            cp "artifacts/cli-binaries/ccproxy-connector-$os-$arch" "$CONN/$t/ccproxy-connector"
+            cp "artifacts/cli-binaries-$os-$arch/ccproxy-connector-$os-$arch" "$CONN/$t/ccproxy-connector"
             chmod +x "$CONN/$t/ccproxy-connector"
           done
-          # Static tmux is Linux-only; macOS uses its own via install.sh's system-tmux fallback.
+          # windows-amd64: the artifact keeps its .exe suffix, matching what install.ps1 downloads
+          # it as and what PATH-based lookup on Windows needs.
+          mkdir -p "$CONN/windows-amd64"
+          cp "artifacts/cli-binaries-windows-amd64/ccproxy-connector-windows-amd64.exe" "$CONN/windows-amd64/ccproxy-connector.exe"
+          # Linux: fully static. macOS: libevent statically linked, ncurses against the system's own
+          # (see deploy/tmux/build-macos-tmux.sh) — both self-contained enough to ship.
           for arch in amd64 arm64; do
             if [ -f "artifacts/tmux-linux-$arch/tmux" ]; then
               cp "artifacts/tmux-linux-$arch/tmux" "$CONN/linux-$arch/tmux"
               chmod +x "$CONN/linux-$arch/tmux"
+            fi
+            if [ -f "artifacts/tmux-darwin-$arch/tmux" ]; then
+              mkdir -p "$CONN/darwin-$arch"
+              cp "artifacts/tmux-darwin-$arch/tmux" "$CONN/darwin-$arch/tmux"
+              chmod +x "$CONN/darwin-$arch/tmux"
             fi
           done
           # The screen-driver applet the backend serves to a connector: a shipped artifact, mounted
@@ -337,9 +413,19 @@ jobs:
           test -s /tmp/ccproxy-connector
           magic="$(head -c4 /tmp/ccproxy-connector | od -An -tx1 | tr -d ' \n')"
           case "$magic" in 7f454c46*) ;; *) echo "not an ELF (magic=$magic)"; exit 1 ;; esac
+          echo "== a published windows binary downloads and is a PE (MZ) =="
+          curl -fsS "$BASE/connector/latest/windows-amd64/ccproxy-connector.exe" -o /tmp/ccproxy-connector.exe
+          test -s /tmp/ccproxy-connector.exe
+          magic="$(head -c2 /tmp/ccproxy-connector.exe | od -An -tx1 | tr -d ' \n')"
+          case "$magic" in 4d5a*) ;; *) echo "not a PE (magic=$magic)"; exit 1 ;; esac
+          echo "== install.ps1 (origin baked from the request) =="
+          curl -fsS "$BASE/install.ps1" -o /tmp/install.ps1
+          grep -q "connector/latest" /tmp/install.ps1
+          ! grep -q "__CONNECTOR_BASE__" /tmp/install.ps1
           echo "== unknown target / off-allowlist artifact is a 404 =="
           [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/connector/latest/linux-amd64/passwd")" = 404 ]
           [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/connector/latest/win-x86/ccproxy-connector")" = 404 ]
+          [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/connector/latest/windows-amd64/ccproxy-connector")" = 404 ]
           echo "connector distribution OK"
           echo "== the claude.js driver applet is mounted for the backend =="
           docker compose exec -T backend sh -c 'test -s /app/applets/claude.js && grep -q screenReady /app/applets/claude.js'
@@ -597,8 +683,9 @@ jobs:
   ci-success:
     name: CI success
     # Only the leaves of the dependency DAG: everything else (build-jar, build-origin,
-    # build-frontend, lint, build-connector, build-tmux, build-applet, package-zip) is already
-    # required transitively by these four, and a failure/skip anywhere upstream skips them too.
+    # build-frontend, lint, build-connector, build-tmux, build-tmux-macos, build-applet,
+    # package-zip) is already required transitively by these four, and a failure/skip anywhere
+    # upstream skips them too.
     needs: [test-compose, machine-login-compat, machine-setup-token, machine-legacy-restart, machine-connector-dialin, machine-revoke]
     runs-on: ubuntu-latest
     steps:
