@@ -554,12 +554,27 @@ jobs:
         working-directory: ccproxy-deploy
         run: docker compose down
 
-  # Bound account has a setup-token stored server-side: startForMachine takes the automatic
-  # prepareViaSetupToken path (no operator, no OAuth URL) — a fully separate code path from
-  # machine-login-compat's interactive /login. Asserts the MultiPath local-proxy config actually
-  # lands on the machine: settings.json's HTTPS_PROXY must be the credential-free local split-proxy
-  # URL, and proxy-credential.json must exist for the local proxy to read.
-  machine-setup-token:
+  # machine-server / machine-client: one server, three identical clients — consolidated 2026-09-17
+  # from what used to be five separate jobs (machine-setup-token, machine-connector-dialin [+ its
+  # -native matrix], machine-legacy-restart, machine-revoke). The client-side scenarios (connector
+  # dial-in, the setup-token fast-login path) genuinely differ only by which install script/binary
+  # path/config directory a platform uses, so they now run as ONE script
+  # (machine-client-smoke.sh) natively on linux/windows/macos alike — no Debian "fake machine"
+  # container standing in for any of them any more. legacy-restart and revoke stay server-side
+  # steps here (not client-matrixed): both need direct Docker/Postgres access (a planted
+  # credential row, a `docker compose restart`) that has nothing to do with what OS a machine
+  # runs — matrixing them would just re-run identical backend assertions three times over.
+  #
+  # Side channel: a GitHub Actions artifact, used in both directions within this one workflow run.
+  #   server -> client: tunnel-info.env (the cloudflared URL + the CI superadmin password)
+  #   client -> server: client-done-<os> (an empty marker, one per client-matrix leg)
+  # `needs:` cannot express "these run concurrently and talk to each other" — it only gates on
+  # full completion, which is exactly what caused the first version of this matrix to deadlock
+  # (caught 2026-09-17: the client job needed the server job, but the server only finishes AFTER
+  # tearing itself down). So neither job `needs` the other; both need only package-zip and the
+  # artifact store is the only thing connecting them. The done-markers let the server shut down as
+  # soon as every client finishes rather than blind-sleeping a fixed window every run.
+  machine-server:
     needs: [package-zip]
     runs-on: ubuntu-latest
     permissions:
@@ -581,69 +596,13 @@ jobs:
         run: |
           bash gen-env.sh
           docker compose up -d --wait --wait-timeout 360
-      - name: Setup-token fast-login path
+      - name: Legacy direct-proxy restart resilience
         working-directory: ccproxy-deploy
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/machine-setup-token-smoke.sh"
-      - name: Dump logs on failure
-        if: failure()
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/machine-legacy-restart-smoke.sh"
+      - name: Machine revocation
         working-directory: ccproxy-deploy
-        run: docker compose logs --no-color --tail 200
-      - name: Tear down
-        if: always()
-        working-directory: ccproxy-deploy
-        run: docker compose down
-
-  # A machine ccproxy cannot SSH into installs the connector from the served install.sh/install.ps1,
-  # dials OUT to the control plane, and is recognised online — the whole enrolment + WebSocket
-  # transport + hub stack, live. This is the one machine-* smoke test that genuinely differs by
-  # client OS (a different install script, a different binary path, no SSH/Debian-container
-  # standing in for the target) so it is the one converted to a real 3-platform matrix:
-  #   - linux: unchanged — a Debian container on THIS job's own runner, install.sh over the
-  #     compose network, exactly as before.
-  #   - windows / macos: no cross-runner Docker networking exists between jobs (macOS runners have
-  #     no Docker at all; Windows/macOS GitHub-hosted runners can't reach another job's containers
-  #     either way), so the backend can't move to those runners. Instead this job keeps the
-  #     compose backend on ubuntu and punches a temporary public URL to it with a cloudflared
-  #     quick tunnel (no account/token needed for the ephemeral trycloudflare.com hostname); the
-  #     windows-latest/macos-latest legs then run the REAL installCommand/installCommandWindows
-  #     against that URL, natively, on their own real OS — a stronger test than a same-OS
-  #     container ever was for these two platforms.
-  # The server leg has to stay up (compose containers only live as long as its job process does)
-  # while the client legs run against it — but `needs:` gates on the upstream job's COMPLETION, so
-  # a client job that `needs: [machine-connector-dialin]` can never even start until the server has
-  # already torn everything down (deadlock, caught 2026-09-17 when the first version of this
-  # matrix hung). Instead: both this job and machine-connector-dialin-native need only package-zip,
-  # so they run concurrently; this job uploads the tunnel URL as an artifact partway through (an
-  # upload is visible to other jobs in the same run as soon as it completes, no need to wait for
-  # this job to finish) and the client job polls for that artifact instead of declaring a `needs`
-  # dependency on this job at all. This job then holds the tunnel open with a bounded sleep sized
-  # to comfortably outlast the client legs, and tears down regardless after.
-  machine-connector-dialin:
-    needs: [package-zip]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
-        with:
-          name: ccproxy-deploy
-          path: ccproxy-deploy
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Bring the cluster up
-        working-directory: ccproxy-deploy
-        run: |
-          bash gen-env.sh
-          docker compose up -d --wait --wait-timeout 360
-      - name: Connector dial-in (linux, same-runner container)
-        working-directory: ccproxy-deploy
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/connector-dialin-smoke.sh"
-      - name: Open a cloudflared quick tunnel for the windows/macos legs
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/machine-revoke-smoke.sh"
+      - name: Open a cloudflared quick tunnel for the client matrix
         id: tunnel
         working-directory: ccproxy-deploy
         run: |
@@ -679,11 +638,23 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           retention-days: 1
-          name: connector-dialin-tunnel-info
+          name: machine-client-tunnel-info
           path: ccproxy-deploy/tunnel-info.env
-      - name: Hold the tunnel open for the windows/macos client legs
-        working-directory: ccproxy-deploy
-        run: sleep 480
+      - name: Wait for every client leg's done-marker, or time out holding the tunnel open
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          want="linux windows macos"
+          for _ in $(seq 1 48); do # 48 * 10s = 8min ceiling
+            have="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100" \
+              --jq '.artifacts[].name' | grep -oE 'client-done-[a-z]+' | sed 's/client-done-//' | sort -u | tr '\n' ' ')"
+            echo "done so far: ${have:-(none)}"
+            all_in=1
+            for w in $want; do echo "$have" | grep -qw "$w" || all_in=0; done
+            [ "$all_in" = 1 ] && { echo "all client legs reported done"; break; }
+            sleep 10
+          done
       - name: Dump logs on failure
         if: failure()
         working-directory: ccproxy-deploy
@@ -695,16 +666,17 @@ jobs:
           kill "$(cat cloudflared.pid)" >/dev/null 2>&1 || true
           docker compose down
 
-  machine-connector-dialin-native:
-    # Deliberately NOT `needs: [machine-connector-dialin]` — that job must still be RUNNING (its
-    # tunnel/compose stack alive) while this one runs, and `needs` only unblocks after it fully
-    # completes. Both jobs need only package-zip, so the scheduler can run them side by side; this
-    # job polls for the artifact the server job publishes partway through instead.
+  machine-client:
+    # Deliberately NOT `needs: [machine-server]` — see the block comment above machine-server for
+    # why that would deadlock. Both need only package-zip and run concurrently; this job polls for
+    # the artifact machine-server publishes partway through instead of a job-level dependency.
     needs: [package-zip]
     strategy:
       fail-fast: false
       matrix:
         include:
+          - os: linux
+            runner: ubuntu-latest
           - os: windows
             runner: windows-latest
           - os: macos
@@ -724,7 +696,7 @@ jobs:
         run: |
           set -euo pipefail
           for _ in $(seq 1 60); do
-            if gh run download "${{ github.run_id }}" -n connector-dialin-tunnel-info -D . 2>/dev/null; then
+            if gh run download "${{ github.run_id }}" -n machine-client-tunnel-info -D . 2>/dev/null; then
               break
             fi
             sleep 10
@@ -738,11 +710,11 @@ jobs:
           $env:CCPROXY_CONNECTOR_BASE = $env:TUNNEL_URL
           $env:CCPROXY_API_BASE = $env:TUNNEL_URL
           irm "$env:TUNNEL_URL/install.ps1" | iex
-      - name: "Install the connector natively (macos): curl | sh"
-        if: matrix.os == 'macos'
+      - name: "Install the connector natively (linux/macos): curl | sh"
+        if: matrix.os != 'windows'
         run: |
           curl -fsSL "$TUNNEL_URL/install.sh" | sh
-      - name: Native connector dial-in
+      - name: Client smoke (dial-in + setup-token fast path)
         env:
           CCPROXY_SUPERADMIN_PASSWORD: ${{ env.TUNNEL_SUPERADMIN_PASSWORD }}
         run: |
@@ -751,86 +723,14 @@ jobs:
           if [ "${{ matrix.os }}" = "windows" ]; then
             bin="$APPDATA/ccproxy-connector/ccproxy-connector.exe"
           fi
-          bash "$GITHUB_WORKSPACE/.github/scripts/connector-dialin-native-smoke.sh" \
-            "$TUNNEL_URL" "$bin"
-
-  # The MultiPath work gave zero code changes to a machine that never re-logs-in: it still dials
-  # backend:3128 directly with proxy credentials embedded in HTTPS_PROXY (the pre-2026-09 scheme) —
-  # this is most already-enrolled prod machines. Reproduces the shape of a 2026-09-15 prod incident:
-  # a machine on this exact path saw every request ECONNRESET for several minutes after a backend
-  # restart. Root cause was never pinned down; this guards restart-recovery time from regressing
-  # further unnoticed. No real Anthropic account needed (same planted-credential technique as
-  # machine-revoke below).
-  machine-legacy-restart:
-    needs: [package-zip]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
-        with:
-          name: ccproxy-deploy
-          path: ccproxy-deploy
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Bring the cluster up
-        working-directory: ccproxy-deploy
-        run: |
-          bash gen-env.sh
-          docker compose up -d --wait --wait-timeout 360
-      - name: Legacy direct-proxy restart resilience
-        working-directory: ccproxy-deploy
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/machine-legacy-restart-smoke.sh"
-      - name: Dump logs on failure
-        if: failure()
-        working-directory: ccproxy-deploy
-        run: docker compose logs --no-color --tail 200
-      - name: Tear down
+          bash "$GITHUB_WORKSPACE/.github/scripts/machine-client-smoke.sh" "$TUNNEL_URL" "$bin"
+      - name: Report done to the server leg
         if: always()
-        working-directory: ccproxy-deploy
-        run: docker compose down
-
-  # DELETE /machine/{id} must be a RELIABLE revocation: engine session dropped and confirmed,
-  # durable credential gone, restart-proof, and an honest 502 (nothing deleted) when the engine
-  # cannot confirm. Exercised live against the compose cluster; no real account needed.
-  machine-revoke:
-    needs: [package-zip]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ccproxy-deploy
-          path: ccproxy-deploy
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Bring the cluster up
-        working-directory: ccproxy-deploy
-        run: |
-          bash gen-env.sh
-          docker compose up -d --wait --wait-timeout 360
-      - name: Machine revocation
-        working-directory: ccproxy-deploy
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/machine-revoke-smoke.sh"
-      - name: Dump logs on failure
-        if: failure()
-        working-directory: ccproxy-deploy
-        run: docker compose logs --no-color --tail 200
-      - name: Tear down
-        if: always()
-        working-directory: ccproxy-deploy
-        run: docker compose down
+          retention-days: 1
+          name: client-done-${{ matrix.os }}
+          path: .github/scripts/machine-client-smoke.sh # any small tracked file; content is unused
 
   # Single aggregate gate: succeeds only if every job above succeeded (a job with `needs` runs only
   # when all needed jobs pass; otherwise this is skipped and stays non-green). Require just this check
@@ -841,7 +741,7 @@ jobs:
     # build-frontend, lint, build-connector, build-connector-darwin-amd64, build-tmux,
     # build-tmux-macos, build-applet, package-zip) is already required transitively by these
     # four, and a failure/skip anywhere upstream skips them too.
-    needs: [test-compose, machine-login-compat, machine-setup-token, machine-legacy-restart, machine-connector-dialin, machine-connector-dialin-native, machine-revoke]
+    needs: [test-compose, machine-login-compat, machine-server, machine-client]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All required CI jobs passed."
