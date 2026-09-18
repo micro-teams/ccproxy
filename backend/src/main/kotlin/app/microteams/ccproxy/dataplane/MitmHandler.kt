@@ -134,6 +134,9 @@ class MitmHandler(
         } else {
             val swappedBody = TokenSwap.swapRequestBody(bodyText, sess)
             val swappedHeaders = LinkedHashMap(headers)
+            // This path parses the response as JSON to swap the token out, so it must not be
+            // compressed — see forceIdentityEncoding.
+            forceIdentityEncoding(swappedHeaders)
             headerIgnoreCase(headers, "Authorization")?.let { auth ->
                 val key = headers.entries.first { it.key.equals("Authorization", true) }.key
                 swappedHeaders[key] = TokenSwap.swapAuthHeader(auth, sess) ?: auth
@@ -188,6 +191,9 @@ class MitmHandler(
         sess: Session,
     ): Triple<String, MutableMap<String, String>, String>? {
         val swappedHeaders = LinkedHashMap(headers)
+        // Refresh parses the response as JSON too, so it needs the same guarantee the token
+        // exchange does — see forceIdentityEncoding.
+        forceIdentityEncoding(swappedHeaders)
         headerIgnoreCase(headers, "Authorization")?.let { auth ->
             val key = headers.entries.first { it.key.equals("Authorization", true) }.key
             swappedHeaders[key] = TokenSwap.swapAuthHeader(auth, sess) ?: auth
@@ -294,9 +300,7 @@ class MitmHandler(
 
         if (isMessages) {
             // Force an uncompressed upstream response so the streaming meter can parse the SSE.
-            val toRemove = workingHeaders.keys.filter { it.equals("Accept-Encoding", true) }
-            toRemove.forEach { workingHeaders.remove(it) }
-            workingHeaders["Accept-Encoding"] = "identity"
+            forceIdentityEncoding(workingHeaders)
         }
         headerIgnoreCase(workingHeaders, "Authorization")?.let { auth ->
             val key = workingHeaders.entries.first { it.key.equals("Authorization", true) }.key

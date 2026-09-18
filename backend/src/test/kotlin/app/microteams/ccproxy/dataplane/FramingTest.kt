@@ -93,4 +93,23 @@ class FramingTest {
         assertEquals(500, dst.size())
         assertEquals(500, result.teeBytes!!.size)
     }
+
+    @Test
+    fun `forceIdentityEncoding replaces the client's Accept-Encoding whatever its casing`() {
+        // The real request that broke /login carried "br" under a lower-case key; a filter that
+        // only matched the canonical spelling would leave it in place and the response would come
+        // back Brotli-compressed.
+        val headers = linkedMapOf("Host" to "api.anthropic.com", "accept-encoding" to "gzip, br")
+        forceIdentityEncoding(headers)
+        assertEquals("identity", headerIgnoreCase(headers, "Accept-Encoding"))
+        assertEquals(1, headers.keys.count { it.equals("Accept-Encoding", ignoreCase = true) })
+        assertEquals("api.anthropic.com", headers["Host"])
+    }
+
+    @Test
+    fun `forceIdentityEncoding adds the header when the client sent none`() {
+        val headers = linkedMapOf("Host" to "api.anthropic.com")
+        forceIdentityEncoding(headers)
+        assertEquals("identity", headerIgnoreCase(headers, "Accept-Encoding"))
+    }
 }

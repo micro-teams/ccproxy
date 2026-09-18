@@ -69,6 +69,20 @@ fun headerIgnoreCase(headers: Map<String, String>, name: String): String? =
     headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
 
 /**
+ * Force an uncompressed upstream response.
+ *
+ * Every path that rewrites a response body must call this, because none of them decompress: the
+ * meter parses the SSE as text, and the oauth/token path parses the body as JSON. Leave the
+ * client's `Accept-Encoding` in place and upstream may answer gzip/br/zstd, which those paths then
+ * handle as if it were text — and the rewritten result is both corrupt and still labelled with the
+ * original `Content-Encoding`.
+ */
+fun forceIdentityEncoding(headers: MutableMap<String, String>) {
+    headers.keys.filter { it.equals("Accept-Encoding", ignoreCase = true) }.forEach(headers::remove)
+    headers["Accept-Encoding"] = "identity"
+}
+
+/**
  * Fully read a (small) body per its framing — only used on the tiny, fully-buffered oauth/token
  * path; everything else uses [relayBody].
  */
