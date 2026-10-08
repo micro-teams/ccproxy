@@ -246,7 +246,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: artifacts
       - name: Assemble the deployment bundle
@@ -305,7 +305,7 @@ jobs:
       contents: read
       packages: read
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: ccproxy-deploy
           path: ccproxy-deploy
@@ -411,7 +411,7 @@ jobs:
         claude: ["installer", "npm:2.1.222", "npm:2.1.233", "npm:2.1.251"]
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: ccproxy-deploy
           path: ccproxy-deploy
@@ -450,7 +450,7 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: ccproxy-deploy
           path: ccproxy-deploy
@@ -487,7 +487,7 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: ccproxy-deploy
           path: ccproxy-deploy
@@ -528,7 +528,7 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: ccproxy-deploy
           path: ccproxy-deploy
@@ -565,7 +565,7 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: ccproxy-deploy
           path: ccproxy-deploy
